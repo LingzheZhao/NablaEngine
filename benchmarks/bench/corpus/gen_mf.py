@@ -69,7 +69,9 @@ COM_LIM = np.array([0.025, 0.05, 0.05])
 FRICTION = (0.3, 1.2)
 TERM_HEIGHT, TERM_TILT = 0.25, 0.8
 SOFT = 0.9  # setpoints and joint reset noise stay within this share of the joint range
-CAPACITY = (64, 192)  # contacts / constraint rows per world of NablaEngine (reported, not filtered)
+# contacts / constraint rows per world (reported, not filtered): the capacity at which the committed corpora and
+# their statistics were computed (release 0.1.0, 192 rows)
+CAPACITY = (64, 192)
 BAD_WARNINGS = (int(mujoco.mjtWarning.mjWARN_BADQPOS), int(mujoco.mjtWarning.mjWARN_BADQVEL),
                 int(mujoco.mjtWarning.mjWARN_BADQACC))
 PICKS = ("prefall", "self_contact", "uniform")

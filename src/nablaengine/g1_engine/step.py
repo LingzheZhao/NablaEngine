@@ -40,7 +40,7 @@ import warnings
 import mujoco
 import numpy as np
 
-NEFC = 288  # candidate: 64 pyramid contacts + 29 hinge limits (NFLOSS == 0) fit
+NEFC = 288  # 64 pyramidal contacts (4 rows each) + 29 hinge limits (NFLOSS == 0) fit
 PROF_PHASES = ("smooth", "qacc_smooth", "collision", "contact_jac", "rows", "newton_init", "newton_grad",
                "newton_hessian", "newton_chol", "newton_linesearch", "newton_update", "integrate", "ls_jv_Mp",
                "count_ls_steps",

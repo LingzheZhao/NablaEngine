@@ -8,7 +8,8 @@ corpus inputs (float32), with the per-world DR as the mjw adapter sets it (put_m
 "body_ipos"}) filled with problem.DR.batched in float32), at --iterations (default 50, the reference iteration count;
 the tolerance is MuJoCo Warp's own max(tol, 1e-6), recorded), opt.warn_overflow without ITERATIONS and LS_ITERATIONS
 (as upstream's own benchmarks/unitree_g1 sets it), capacity 64 contacts and 192 rows per world (naconmax = 64 nworld;
-any capacity overflow is an error), opt.deterministic as put_model sets it (NONE). MuJoCo Warp's atomics make a rerun
+the capacity at which the committed labels were computed, NablaEngine release 0.1.0; any capacity overflow is an
+error), opt.deterministic as put_model sets it (NONE). MuJoCo Warp's atomics make a rerun
 differ in the last bits, so the model check of a few borderline states per corpus (0 to 2 of 4096 seen) can flip
 between runs; DeterminismType.ALL did not make 3.17.0's outputs bitwise reproducible on the V100 either. The truth
 tools cache the labels, and the truth file records the run it used. After every substep (its contacts, rows and
@@ -37,7 +38,7 @@ from benchmarks.bench import problem as P
 from benchmarks.bench.truth import common
 
 ITERATIONS = 50
-NCONMAX, NJMAX = 64, 192
+NCONMAX, NJMAX = 64, 192  # the capacity at which the committed labels were computed (release 0.1.0, 192 rows)
 LIMIT_JOINT = 3  # mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT (MuJoCo Warp's ConstraintType.LIMIT_JOINT)
 QUADRATIC = 1  # ConstraintState.QUADRATIC
 PLANE, CAPSULE = 0, 3  # mujoco.mjtGeom

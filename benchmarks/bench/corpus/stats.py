@@ -5,7 +5,8 @@ Every state of every corpus runs one control step in MuJoCo C float64 (corpus/la
 substeps and per-state DR) at 10 and at 50 solver iterations; per corpus it reports contacts and constraint rows per
 world (the most in any substep, and at the input state), solver iterations, |qvel| of the inputs, the pre-fall share
 (the generator's label), and the shares of states with a self contact, a clamped actuator, a joint-limit row, the
-iteration limit reached, and more than 64 contacts or 192 rows (NablaEngine's capacity), with histograms.
+iteration limit reached, and more than 64 contacts or 192 rows (the capacity at which the committed statistics were
+computed: NablaEngine release 0.1.0, 192 rows), with histograms.
 The same code labels every corpus, so the numbers compare like with like (they are MuJoCo C's). With --ref, for each
 Track A benchmark corpus it lists the compared statistics (COMPARED) outside the range the reference corpora span,
 and outside that range widened by 10% of a bound (5 percentage points for shares); the lists inform, they do not fail
@@ -34,7 +35,7 @@ from benchmarks.bench.corpus import format as corpus_format
 from benchmarks.bench.corpus.labels import Labeller
 
 REPO = Path(__file__).resolve().parents[3]
-CAPACITY = (64, 192)
+CAPACITY = (64, 192)  # the capacity at which the committed statistics were computed (release 0.1.0, 192 rows)
 ITERATIONS = (10, 50)
 QUANTILES = (0.5, 0.9, 0.99)
 # statistics compared against the range of the reference corpora (path in the corpus entry)

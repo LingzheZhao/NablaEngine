@@ -26,7 +26,7 @@ CON_NONE = 0xFFFF  # contact table entry past ncon
 
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
 _FIELDS = (
-    ("hdr", "OFF_HDR", 1),  # ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24 (candidate format)
+    ("hdr", "OFF_HDR", 1),  # ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24
     ("flags", "OFF_FLAGS", 1),  # FLAG_*
     ("min_nu", "OFF_MIN_NU", 1),  # float: smallest centre / axis distance of a sphere or capsule self contact, else +inf
     ("reserved", "OFF_RESERVED", 1),
@@ -61,7 +61,8 @@ def _table(m, max_contacts=None):
 
 
 def layout(m, max_contacts=None):
-    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 192, L_Q at 832, 1472 words)."""
+    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 192, L_Q at 832, 1472 words; the
+    same at 192 and 288 constraint rows, since the zone field's three extra words fall in the alignment padding)."""
     return {name: (off, n) for name, _, off, n in _table(m, max_contacts)[0]}
 
 

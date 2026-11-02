@@ -53,7 +53,7 @@ diag extra build_label ("default" or "non-default: ..."); only a library that ca
 Diagnostics (of one forward with the tape and one backward of cotangent 0 from the loaded states, after the timing):
 contacts and constraint rows per world and substep and Newton iterations per world and substep from the tape records'
 headers (niter_hist counts worlds by their largest substep iteration count), overflow (worlds whose contacts exceeded
-the 64-contact capacity or whose rows exceeded 192: unsupported bits 4 / 16 of the forward's info), unsupported (bits
+the 64-contact capacity or whose rows exceeded 288: unsupported bits 4 / 16 of the forward's info), unsupported (bits
 1 / 2 / 8: a geometry case outside the engine's scope), and jax_ffi.read_diagnostics()'s counters of those two calls
 (iteration-limit worlds, refactored / non-converged / singular tape records, non-finite gradient rows, replay
 mismatches).

@@ -6,6 +6,10 @@
   29 hinge limits of the G1 fit without dropping rows; the tape header packs the contact count in 7 bits and the row
   count in 9 bits, the zone field grows from 6 to 9 words, and the readers in the JAX and PyTorch interfaces, the
   adjoint and the benchmark adapter decode the new layout. Libraries built before this change must be rebuilt.
+  The record length of the mjlab model stays 1472 words. The PyTorch artifact metadata records the capacity as
+  `nefc`, and the matched MuJoCo Warp benchmark capacity follows the engine (`njmax` 288). 288 is not among
+  MuJoCo Warp's listed sizes (192, 256, 384), so whether MuJoCo Warp accepts, rounds or rejects it must be checked in
+  an environment with `mujoco_warp` before a matched benchmark is reported.
 
 ## 0.1.0
 

@@ -6,7 +6,8 @@ Per state of the corpus (benchmarks/data/<corpus>.npz):
   - one control step at --iterations (default 50) with benchmarks.bench.truth.mjw_labels.run, the settings of the
     benchmark truth's model check: 4 x mjw.step with ctrl held, the per-world foot friction and torso COM offset
     through put_model(batch_sizes={"pair_friction", "body_ipos"}) filled in float32, 64 contacts and 192 rows per
-    world, opt.warn_overflow without ITERATIONS and LS_ITERATIONS (a capacity overflow is an error);
+    world (the capacity at which the committed reference was computed, NablaEngine release 0.1.0), opt.warn_overflow
+    without ITERATIONS and LS_ITERATIONS (a capacity overflow is an error);
   - the contacts of MuJoCo Warp's collision at the input state (mjw.forward on the same model and inputs).
 
 Output, a compressed npz written with fixed timestamps (default fixtures/mjlab/mjw317_<corpus>.npz, which
