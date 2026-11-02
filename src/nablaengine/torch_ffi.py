@@ -10,11 +10,11 @@ Arguments and outputs as jax_ffi.step / jax_ffi.kinematics (see that module's do
 device, contiguous, leading dimension B (the worlds): qpos (B, nq), qvel (B, nv), warm (B, nv), ctrl (B, nu), friction
 (B,), com (B, 3) (mjlab G1: nq 36, nv 35, nu 29). Other dtypes, devices or shapes raise TypeError; nothing is cast or
 copied implicitly. step is differentiable (torch.autograd): when any input requires grad, the forward also writes the
-tape (B, substeps * REC_WORDS float32, 5888 B per world and substep) and keeps it for the backward (the analytic
+tape (B, substeps * REC_WORDS float32, 6016 B per world and substep) and keeps it for the backward (the analytic
 adjoint, deterministic), which returns d/dqpos (36-dimensional qpos form), d/dqvel and d/dctrl, no gradient for warm,
 friction and com. The outputs and gradients are bitwise those of jax_ffi on the same GPU (scripts/torch_ffi_check.py).
 
-A rollout is a Python loop: every differentiated step keeps its tape until the backward (tape_bytes(); 6 GB for
+A rollout is a Python loop: every differentiated step keeps its tape until the backward (tape_bytes(); 6.3 GB for
 4096 worlds x 64 steps). torch.utils.checkpoint may rerun a step: the forward is deterministic, so a recomputed tape
 is bitwise the first one.
 
@@ -714,7 +714,7 @@ def warn_overflow(d, where="nablaengine"):
     import warnings
     nc, nr = d.get("fwd_contact_overflow_worlds", 0), d.get("fwd_row_overflow_worlds", 0)
     if nc or nr:
-        warnings.warn(f"{where}: {nc} world-steps exceeded the contact capacity (64 per world) and {nr} the constraint-"
+        warnings.warn(f"{where}: {nc} world-steps exceeded the configured contact capacity and {nr} the constraint-"
                       f"row capacity; their extra contacts / rows were dropped, so those worlds miss support and "
                       f"friction forces (e.g. deep interpenetration). See docs/api_torch.md, Diagnostics.",
                       RuntimeWarning, stacklevel=3)

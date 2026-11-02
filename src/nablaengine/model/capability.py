@@ -367,8 +367,8 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     kdof = step.max_support(m) if m.npair and gen else 0
     maxcon = step.maxcon(m)
     npset = len(step.pair_param_sets(m)[0])
-    add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and maxcon <= 64 and m.npair < 65536, "error",
-        "<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, MAXCON <= 64",
+    add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and 1 <= maxcon <= step.MAX_CONTACTS and m.npair < 65536, "error",
+        f"<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, 1 <= MAXCON <= {step.MAX_CONTACTS}",
         dict(ngeomc=len(cg), param_sets=npset, kdof=kdof, maxcon=maxcon))
     add("H26b", m.npair <= 512, "error", "at most 512 contact pairs (the tape's 9-bit pair index)", int(m.npair),
         ("adjoint",))
@@ -391,7 +391,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "a corpus", nv, ("forward", "adjoint"))
     add("U2", not gen or kdof == 16, "warn", "KDOF = 16 (the G1's): otherwise DK_JV_VEC's 128-bit con_jv loads are off and the "
         "scalar path, never run on a corpus, is used", kdof)
-    add("U3", maxcon == 64, "warn", "MAXCON 64 in the adjoint (npair > 64; the adjoint never ran with MAXCON 32)",
+    add("U3", maxcon == 64, "warn", "the original adjoint corpus covered MAXCON 64; other capacities need matched validation",
         maxcon, ("adjoint",))
     worst = 0
     dr = ([int(p) for p in np.asarray(foot_pairs).ravel()] if foot_pairs is not None

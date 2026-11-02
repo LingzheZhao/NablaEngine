@@ -9,7 +9,7 @@ one control step (substeps engine substeps of h = 5 ms) for B worlds; all float3
 (B, nu), (B,), (B, 3) (mjlab G1: nq 36, nv 35, nu 29); warm is the Newton warm start (warm' = the last substep's
 acceleration, for the next call); friction is each world's foot-floor friction, com its torso COM offset. B is read
 from the arrays at run time: one library serves every batch size, and JAX traces once per shape. jax.custom_vjp: the
-forward under differentiation (dk_step_fwd) also writes the tape, (B, substeps * REC_WORDS) float32 (5888 B per world
+forward under differentiation (dk_step_fwd) also writes the tape, (B, substeps * REC_WORDS) float32 (6016 B per world
 and substep), kept with friction and com as the residuals; the backward (dk_step_bwd, the analytic adjoint k_adjoint,
 deterministic) returns d/dqpos (36-dimensional qpos form, as MuJoCo Warp), d/dqvel and d/dctrl (summed over the
 substeps), zeros for warm, friction and com; the cotangent of warm' is ignored. Without differentiation step runs
@@ -187,7 +187,7 @@ DIAG = ("fwd_calls", "fwd_worlds", "fwd_unsupported_worlds", "fwd_iteration_limi
         "nonfinite_qpos_rows", "nonfinite_qvel_rows", "nonfinite_ctrl_rows", "nonfinite_cotangent_rows",
         "replay_mismatch_worlds", "fwd_contact_overflow_worlds", "fwd_row_overflow_worlds")
 # info[:, 3] bits of a forward (the step kernels' s.unsupported, over the call's substeps): a world had more contacts
-# than MAXCON (64) or more constraint rows than NEFC (192); the ones beyond are dropped (their forces are missing)
+# than MAXCON or more constraint rows than NEFC; the ones beyond are dropped (their forces are missing)
 OVERFLOW_CONTACTS, OVERFLOW_ROWS = 4, 16
 _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # set_overflow_warnings
 # the last forward call's record (k_last_fwd; EnginePhysics.stats): worlds, contacts summed over the worlds, contacts
@@ -1097,7 +1097,7 @@ def init(model_dir=None, model=None, foot_pairs=None):
 
 
 def rec_words():
-    """Words (float32) per tape record (one world, one substep): 1472 for the mjlab model."""
+    """Words (float32) per tape record (one world, one substep): 1504 for the mjlab model."""
     return init()["rec_words"]
 
 
@@ -1432,12 +1432,12 @@ def decode_diagnostics(arr):
 
 def warn_overflow(d, where="nablaengine"):
     """A RuntimeWarning when the counters d count worlds whose contacts or constraint rows exceeded the per-world
-    capacity (MAXCON = 64 contacts, NEFC = 192 rows): the ones beyond were dropped, so those worlds miss support and
+    configured capacity: the ones beyond were dropped, so those worlds miss support and
     friction forces. The worlds of a call: info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS of forward()."""
     import warnings
     nc, nr = d.get("fwd_contact_overflow_worlds", 0), d.get("fwd_row_overflow_worlds", 0)
     if nc or nr:
-        warnings.warn(f"{where}: {nc} world-steps exceeded the contact capacity (64 per world) and {nr} the constraint-"
+        warnings.warn(f"{where}: {nc} world-steps exceeded the configured contact capacity and {nr} the constraint-"
                       f"row capacity ({g1_step.NEFC}); their extra contacts / rows were dropped, so those worlds miss support and "
                       f"friction forces (e.g. deep interpenetration). See docs/api.md, Diagnostics.", RuntimeWarning,
                       stacklevel=3)
