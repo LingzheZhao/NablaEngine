@@ -11,6 +11,9 @@ step with its gradient from the input state. MuJoCo Warp and MJX simulate the sa
 `docs/results/paper_rtx6000/paper_bench.md`); Isaac Lab runs its own G1 asset with its task defaults (median over
 rounds, `docs/results/physx_rtx6000/physx_bench_results.md`).</sub>
 
+The benchmark figures below describe the original capacity configurations. The current fork's
+96-contact condition has separate [capacity qualification results](docs/contact_capacity.md).
+
 NablaEngine is a differentiable GPU physics engine for the Unitree G1 humanoid. It simulates thousands of worlds per
 call with MuJoCo's physics and returns analytic gradients of every step with respect to the state and the actions,
 for first-order policy learning, trajectory optimization and system identification. It plugs into JAX
@@ -105,9 +108,9 @@ centre-of-mass offset `com (B, 3)` for domain randomization. Each world holds up
 rows; a world beyond them (e.g. deep interpenetration after a fall) drops the extra ones and is flagged and counted
 (`docs/api.md`, Diagnostics).
 
-The 96-contact / 416-row capacity extension is pending matched forward, adjoint and performance validation.
-The published benchmark measurements above used the original capacity; they do not establish the extension's
-accuracy or throughput.
+The 96-contact / 416-row extension passes the bounded native, high-contact, overflow and independent
+Jacobian/Hessian checks described in [capacity qualification](docs/contact_capacity.md). The published benchmark
+measurements above used the original capacity; they do not establish this extension's accuracy or throughput.
 
 ## Documentation
 

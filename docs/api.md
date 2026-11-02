@@ -166,8 +166,9 @@ The 96-contact capacity uses three 32-bit contact-mask tiles. It preserves the o
 all world contacts before self contacts, in ascending tile order. The DOF support masks and the solver equations
 are unchanged. For the mjlab G1, a tape record has 1504 float32 words (6016 bytes), including 13 zone words; its
 7/9/8/8-bit header still holds contact count, row count, limit count and iteration count. Old libraries must be
-rebuilt, and old tapes have a different layout. Matched forward, adjoint, overflow and performance validation of
-this extension is pending; the original benchmark readings do not establish those properties.
+rebuilt, and old tapes have a different layout. [Capacity qualification](contact_capacity.md) records matched
+old/new execution, high-contact interface/VJP, overflow and independent Jacobian/Hessian checks. These bounded
+conditions do not make 96 contacts a universal upper bound or establish the original benchmark throughput.
 
 ## `EnginePhysics`
 
