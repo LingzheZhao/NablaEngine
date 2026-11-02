@@ -1438,7 +1438,7 @@ def warn_overflow(d, where="nablaengine"):
     nc, nr = d.get("fwd_contact_overflow_worlds", 0), d.get("fwd_row_overflow_worlds", 0)
     if nc or nr:
         warnings.warn(f"{where}: {nc} world-steps exceeded the contact capacity (64 per world) and {nr} the constraint-"
-                      f"row capacity (192); their extra contacts / rows were dropped, so those worlds miss support and "
+                      f"row capacity ({g1_step.NEFC}); their extra contacts / rows were dropped, so those worlds miss support and "
                       f"friction forces (e.g. deep interpenetration). See docs/api.md, Diagnostics.", RuntimeWarning,
                       stacklevel=3)
     return nc + nr

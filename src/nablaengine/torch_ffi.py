@@ -709,13 +709,13 @@ def read_diagnostics(device=None, reset=True):
 
 def warn_overflow(d, where="nablaengine"):
     """A RuntimeWarning when the counters d count worlds whose contacts or constraint rows exceeded the per-world
-    capacity (64 contacts, 192 rows): the ones beyond were dropped, so those worlds miss support and friction forces
+    configured capacity: the ones beyond were dropped, so those worlds miss support and friction forces
     (as jax_ffi.warn_overflow). The worlds of a call: info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS of forward()."""
     import warnings
     nc, nr = d.get("fwd_contact_overflow_worlds", 0), d.get("fwd_row_overflow_worlds", 0)
     if nc or nr:
         warnings.warn(f"{where}: {nc} world-steps exceeded the contact capacity (64 per world) and {nr} the constraint-"
-                      f"row capacity (192); their extra contacts / rows were dropped, so those worlds miss support and "
+                      f"row capacity; their extra contacts / rows were dropped, so those worlds miss support and "
                       f"friction forces (e.g. deep interpenetration). See docs/api_torch.md, Diagnostics.",
                       RuntimeWarning, stacklevel=3)
     return nc + nr

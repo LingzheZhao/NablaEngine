@@ -256,7 +256,7 @@ struct Adj {
   unsigned clamp[(NV + 31) / 32];  // the record's actuator clamp mask (dof bits)
   unsigned zone[(NEFC + 31) / 32];  // the record's quadratic-zone bits of the constraint rows (forward row order)
   unsigned con[(MAXCON + 1) / 2];  // the record's contact table: pair | slot << 9 per 16 bits
-  int hdr;  // the record's header: ncon | nefc << 8 | nlim << 16 | niter << 24
+  int hdr;  // the record's header: ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
   // bodies, lane b = body b (body 0: the world, at rest). Forward quantities (A3) read up to A7:
   float Q[NB][4], X[NB][3], z[NB][3];  // pose (X_b: origin = hinge anchor), hinge axis z_b = R_b axis_b (b >= 2)
@@ -1051,7 +1051,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
   // ncon through votes (uniform_int, step.py), and UNIFORM for the per-contact branches: the batch loops and the
   // shuffles in them are then uniform for the compiler (no divergence checks; see step.py UNIFORM). Without the votes
   // the shuffles cost 5% of k_adjoint (RTX 3090, at 6 worlds per SM)
-  const int ncon = uniform_int(s.hdr & 255, 8), nlim = ((unsigned)s.hdr >> 16) & 255;
+  const int ncon = uniform_int(s.hdr & 127, 7), nlim = ((unsigned)s.hdr >> 16) & 255;
   for (int g = lane; g < NGEOMC; g += 32) {  // geom_poses (step.py)
     const int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
@@ -1226,7 +1226,7 @@ __device__ void adj_residual(Adj& s, const float* ctrl, float* dbg, int lane) {
 // adj_contacts (written by other lanes before the caller's __syncwarp): the limit row's sigma f, and s_i col_i . F_c
 // of every contact c whose support holds the dof (F_c: its force sum_e -D x_e u_e at its point)
 __device__ void adj_jtf(Adj& s, const float* dbg, int lane) {
-  const int ncon = s.hdr & 255;
+  const int ncon = s.hdr & 127;
   for (int i = lane; i < NV; i += 32) {
     const int bi = c_dofbody[i];
     float acc = 0.f;

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Constraint-row capacity raised from 192 to 288 rows per world, so 64 pyramidal contacts (four rows each) and the
+  29 hinge limits of the G1 fit without dropping rows; the tape header packs the contact count in 7 bits and the row
+  count in 9 bits, the zone field grows from 6 to 9 words, and the readers in the JAX and PyTorch interfaces, the
+  adjoint and the benchmark adapter decode the new layout. Libraries built before this change must be rebuilt.
+
 ## 0.1.0
 
 First release.

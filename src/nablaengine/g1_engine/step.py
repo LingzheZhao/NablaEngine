@@ -40,7 +40,7 @@ import warnings
 import mujoco
 import numpy as np
 
-NEFC = 192
+NEFC = 288  # candidate: 64 pyramid contacts + 29 hinge limits (NFLOSS == 0) fit
 PROF_PHASES = ("smooth", "qacc_smooth", "collision", "contact_jac", "rows", "newton_init", "newton_grad",
                "newton_hessian", "newton_chol", "newton_linesearch", "newton_update", "integrate", "ls_jv_Mp",
                "count_ls_steps",
@@ -1392,7 +1392,7 @@ __device__ __forceinline__ int row_zone(const S& s, int r, float x) {
 template <class S>
 __device__ __noinline__ unsigned zone_word(const S& s, int lane) {
   unsigned z = 0u;
-  const int nefc = uniform_int(s.nefc, 8);
+  const int nefc = uniform_int(s.nefc, 9);
   for (int r0 = 0; r0 < nefc; r0 += 32) {
     int r = r0 + lane;
     unsigned b = __ballot_sync(0xffffffffu, r < nefc && row_zone(s, r, s.efc_jar[r]) == 1);
@@ -2167,7 +2167,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
 #ifdef DK_TAPE_VERIFY
       if (vdiff) fl |= TAPE_VERIFY_DIFF;
 #endif
-      unsigned hd = (unsigned)ncon | (unsigned)s.nefc << 8 | (unsigned)(s.nefc_dof - NFLOSS) << 16
+      unsigned hd = (unsigned)ncon | (unsigned)s.nefc << 7 | (unsigned)(s.nefc_dof - NFLOSS) << 16
                     | (unsigned)min(it, 255) << 24;
       __stcs(rec + OFF_HDR, __uint_as_float(hd));
       __stcs(rec + OFF_FLAGS, __uint_as_float(fl));

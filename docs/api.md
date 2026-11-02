@@ -152,7 +152,7 @@ iteration), `tape_records`, `refact_records`, `nonconv_records`, `singular_recor
 | `last_forward(nworld=None)` | outside jit | the last forward call's record for that batch size: `worlds`, `contacts` (summed over the worlds), `contacts_max`, `rows_max` |
 | `launch_info(device=0)` | outside jit | the adjoint kernel's launch per variant: shared memory and worlds per SM |
 
-**Capacity.** Each world holds at most 64 contacts and 192 constraint rows (a frictional contact takes 4 rows, a joint
+**Capacity.** Each world holds at most 64 contacts and 288 constraint rows (a frictional contact takes 4 rows, a joint
 limit 1). A world beyond them, typically after deep interpenetration with the floor or between links (a fall), keeps
 the first ones and drops the rest, so it misses part of its support and friction forces; its step is then not the
 model's. Such worlds are flagged in `forward()`'s `info[:, 3]` (`OVERFLOW_CONTACTS = 4`, `OVERFLOW_ROWS = 16`) and
@@ -172,7 +172,7 @@ phys.stats()          # nacon, naconmax, nefc_max, njmax of the last forward cal
 phys.diagnostics()    # read_diagnostics()
 ```
 
-A batched physics object with MuJoCo Warp's capacity names (`nconmax` 64 contacts and `njmax` 192 constraint rows per
+A batched physics object with MuJoCo Warp's capacity names (`nconmax` 64 contacts and `njmax` 288 constraint rows per
 world). The model constants come from the fixtures, and `mjm` must then be the same model (`check_model`), unless
 `use_model=True`: then from `mjm`. Other keyword options of a MuJoCo Warp based physics object are accepted and
 ignored.
