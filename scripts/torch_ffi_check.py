@@ -21,10 +21,13 @@ Sections (all by default; --sections a,b,...):
   artifact   the module's interface constants equal jax_ffi's; a fresh process that cannot import mujoco or jax and
              has no nvcc on PATH loads the current artifact and computes forward with tape + backward bitwise equal to
              this process; an artifact whose recorded source hash differs is refused
-  overflow   states pushed 0.6 m into the floor with scrambled joints (contacts beyond 64 / rows beyond 192 per world):
+  overflow   states pushed 0.6 m into the floor with scrambled joints (contacts beyond the artifact's maxcon per world):
              torch and jax_ffi forward bitwise equal (info's overflow bits included), their overflow counters equal and
-             equal to the info bits; no warning by default, and read_diagnostics() warns in both with
-             set_overflow_warnings(True)
+             equal to the info bits, contact overflow in some world; row overflow in some world only when the model can
+             need more rows than the artifact's nefc (contacts are capped at maxcon before rows are counted, so the most
+             rows a world can need are its frictionloss and hinge-limit rows + 4 x maxcon: 29 + 4 x 64 = 285 for the
+             default model, which cannot overflow 288 rows), else none; no warning by default, and read_diagnostics()
+             warns in both with set_overflow_warnings(True)
   timing     ms per control step at --nworld (interface defaults), torch against jax_ffi in the same process: the
              forward (torch step without grad / jax.jit(step)) and forward + backward (torch autograd of a cotangent
              loss / jax.jit(jax.vjp)), wall time of --reps back-to-back calls ending in one synchronisation, --rounds
@@ -44,6 +47,17 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import numpy as np  # noqa: E402
 
 SECTIONS = ("forward", "backward", "step", "kinematics", "rollout", "diag", "graph", "compile", "multigpu", "artifact", "overflow", "timing")
+
+
+def max_rows_needed(m, maxcon):
+    """The most constraint rows one world of model m can need in the engine (g1_engine/step.py): its frictionloss
+    rows (dofs with frictionloss), one row per limited hinge (the engine's c_jlim: jnt_limited of joints 1..njnt-1 at
+    their dof) and, since contacts are capped at maxcon before rows are counted, maxcon contacts of 4 pyramidal rows
+    each (1 row each when no pair has condim 3). Returns (rows, frictionloss rows, hinge-limit rows)."""
+    nfloss = int((np.asarray(m.dof_frictionloss) > 0).sum())
+    nlimit = int((np.asarray(m.jnt_limited)[1:] != 0).sum())
+    per_contact = 4 if (np.asarray(m.pair_dim) == 3).any() else 1
+    return nfloss + nlimit + per_contact * int(maxcon), nfloss, nlimit
 
 
 def bits_equal(a, b):
@@ -380,9 +394,13 @@ def main():
             torch_ffi.set_overflow_warnings(pt)
             jax_ffi.set_overflow_warnings(pj)
         keys = ("fwd_contact_overflow_worlds", "fwd_row_overflow_worlds")
-        record("overflow", "counters_equal_info_bits", nc > 0 and nr > 0 and
+        need, nfloss, nlimit = max_rows_needed(fixtures.load_model(check=None)[0], info["maxcon"])
+        rows_possible = need > info["nefc"]  # else no world can overflow the rows: their counter must stay 0
+        record("overflow", "counters_equal_info_bits", nc > 0 and (nr > 0 if rows_possible else nr == 0) and
                (td[keys[0]], td[keys[1]]) == (jd[keys[0]], jd[keys[1]]) == (nc, nr),
-               contact_overflow_worlds=nc, row_overflow_worlds=nr, nworld=B)
+               contact_overflow_worlds=nc, row_overflow_worlds=nr, nworld=B, nefc=info["nefc"],
+               maxcon=info["maxcon"], max_rows_needed=need, frictionloss_rows=nfloss, hinge_limit_rows=nlimit,
+               row_overflow_possible=rows_possible)
         warned = lambda ws: any(issubclass(w.category, RuntimeWarning) and "capacity" in str(w.message)  # noqa: E731
                                 for w in ws)
         record("overflow", "warnings", warned(wt) and warned(wj))

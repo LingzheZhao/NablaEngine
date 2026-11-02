@@ -225,7 +225,7 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
     meta = dict(artifact_version=ARTIFACT_VERSION, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
                 arch=arch, version=nablaengine.__version__, sources_sha256=sources_sha256(),
                 consts_sha256=hashlib.sha256(consts.tobytes()).hexdigest(), rec_words=g1_tape.rec_words(m),
-                nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, maxcon=g1_step.maxcon(m),
+                nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
                 off_flags=int(g1_tape.layout(m)["flags"][0]), forward_unit=plan["forward_unit"],
                 variants=[list(v) for v in VARIANTS], kinematics_error=kin_error, timestep=float(m.opt.timestep),
                 foot_pairs=[int(p) for p in fp], arch_flags=plan["arch_flags"],
@@ -709,13 +709,13 @@ def read_diagnostics(device=None, reset=True):
 
 def warn_overflow(d, where="nablaengine"):
     """A RuntimeWarning when the counters d count worlds whose contacts or constraint rows exceeded the per-world
-    capacity (64 contacts, 192 rows): the ones beyond were dropped, so those worlds miss support and friction forces
+    configured capacity: the ones beyond were dropped, so those worlds miss support and friction forces
     (as jax_ffi.warn_overflow). The worlds of a call: info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS of forward()."""
     import warnings
     nc, nr = d.get("fwd_contact_overflow_worlds", 0), d.get("fwd_row_overflow_worlds", 0)
     if nc or nr:
         warnings.warn(f"{where}: {nc} world-steps exceeded the contact capacity (64 per world) and {nr} the constraint-"
-                      f"row capacity (192); their extra contacts / rows were dropped, so those worlds miss support and "
+                      f"row capacity; their extra contacts / rows were dropped, so those worlds miss support and "
                       f"friction forces (e.g. deep interpenetration). See docs/api_torch.md, Diagnostics.",
                       RuntimeWarning, stacklevel=3)
     return nc + nr

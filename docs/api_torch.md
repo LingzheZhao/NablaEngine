@@ -83,7 +83,7 @@ gradients or cotangents, replay mismatches; `jax_ffi.DIAG`) to an int64 tensor o
 only. `diagnostics()` returns that tensor without reading it; `read_diagnostics()` copies it to the host (a
 synchronization) and by default resets it. The backward's `info` carries the same per-world bits as `jax_ffi.backward`.
 
-Contacts or constraint rows beyond a world's capacity (64 contacts, 192 rows) are dropped and flagged as in the JAX
+Contacts or constraint rows beyond a world's capacity (64 contacts, 288 rows) are dropped and flagged as in the JAX
 interface (`docs/api.md`, Diagnostics, Capacity): `info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS` of `forward()`, the
 counters `fwd_contact_overflow_worlds` / `fwd_row_overflow_worlds`, and with `set_overflow_warnings(True)` (or
 `DK_OVERFLOW_WARN=1`; off by default) a `RuntimeWarning` from `read_diagnostics()` and once more at exit for counts

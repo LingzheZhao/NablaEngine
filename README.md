@@ -101,7 +101,7 @@ qpos1, qvel1, warm1 = torch_ffi.step(qpos, qvel, warm, ctrl, friction, com)
 
 Inputs are float32 arrays with the worlds as the leading dimension: `qpos (B, 36)`, `qvel (B, 35)`, the solver's warm
 start `warm (B, 35)`, the position targets `ctrl (B, 29)`, and per-world foot `friction (B,)` and torso
-centre-of-mass offset `com (B, 3)` for domain randomization. Each world holds up to 64 contacts and 192 constraint
+centre-of-mass offset `com (B, 3)` for domain randomization. Each world holds up to 64 contacts and 288 constraint
 rows; a world beyond them (e.g. deep interpenetration after a fall) drops the extra ones and is flagged and counted
 (`docs/api.md`, Diagnostics).
 

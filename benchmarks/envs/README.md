@@ -69,8 +69,9 @@ Each MuJoCo Warp adapter refuses to run on a tree other than its own (checked in
 
 - Contact / constraint capacity: the three engines size it from `benchmarks/data/mjw_capacity.json` (the documented
   procedure in `bench/adapters/mjw_common.py`; remeasure with `python -m benchmarks.bench.adapters.mjw_capacity` in
-  the `mjw-native` environment after a corpus changes), or with the `matched` variant at 64 contacts / 192 rows per
-  world (NablaEngine's capacity).
+  the `mjw-native` environment after a corpus changes), or with the `matched` variant at 64 contacts / 288 rows per
+  world (NablaEngine's capacity; whether MuJoCo Warp accepts `njmax` 288, which is not among its listed sizes, is
+  to be checked in this environment before a matched benchmark is reported).
 - The evidence that MuJoCo Warp 3.17.0 has no backward (`wp.Tape` runs, the step contributes exactly zero):
   `PYTHONPATH=. runs/bench/envs/mjw-native/venv/bin/python -m benchmarks.bench.adapters.mjw --tape-evidence --out
   runs/bench/<dir>/mjw_tape.json`; every `mjw` unit also records it in its diagnostics (`extra.tape_evidence`).

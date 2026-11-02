@@ -26,7 +26,7 @@ CON_NONE = 0xFFFF  # contact table entry past ncon
 
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
 _FIELDS = (
-    ("hdr", "OFF_HDR", 1),  # ncon | nefc << 8 | nlim << 16 | niter << 24 (u8 each)
+    ("hdr", "OFF_HDR", 1),  # ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24
     ("flags", "OFF_FLAGS", 1),  # FLAG_*
     ("min_nu", "OFF_MIN_NU", 1),  # float: smallest centre / axis distance of a sphere or capsule self contact, else +inf
     ("reserved", "OFF_RESERVED", 1),
@@ -48,7 +48,7 @@ _FIELDS = (
 def _table(m, max_contacts=None):
     nc = max_contacts or step.maxcon(m)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    assert nv <= 64 and m.npair <= 512 and nc <= 255 and step.NEFC <= 255, "field widths (clamp u64, pair 9 bits, u8)"
+    assert nv <= 64 and m.npair <= 512 and nc <= 127 and step.NEFC <= 511, "field widths (clamp u64, pair 9 bits, ncon 7 / nefc 9 bits)"
     out, off = [], 0
     for name, define, n in _FIELDS:
         if name is None:
@@ -61,7 +61,8 @@ def _table(m, max_contacts=None):
 
 
 def layout(m, max_contacts=None):
-    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 192, L_Q at 832, 1472 words)."""
+    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 192, L_Q at 832, 1472 words; the
+    same at 192 and 288 constraint rows, since the zone field's three extra words fall in the alignment padding)."""
     return {name: (off, n) for name, _, off, n in _table(m, max_contacts)[0]}
 
 
@@ -101,7 +102,7 @@ def decode(arr, m, max_contacts=None):
     lay = layout(m, max_contacts)
     sl = lambda name: slice(lay[name][0], lay[name][0] + lay[name][1])  # noqa: E731
     hdr, flags = u[..., lay["hdr"][0]].astype(np.int64), u[..., lay["flags"][0]].astype(np.int64)
-    out = dict(ncon=hdr & 255, nefc=(hdr >> 8) & 255, nlim=(hdr >> 16) & 255, niter=hdr >> 24, flags=flags,
+    out = dict(ncon=hdr & 127, nefc=(hdr >> 7) & 511, nlim=(hdr >> 16) & 255, niter=hdr >> 24, flags=flags,
                unsupported=flags & FLAG_UNSUPPORTED, refact=(flags & FLAG_REFACT) != 0,
                nonconv=(flags & FLAG_NONCONV) != 0, singular=(flags & FLAG_SINGULAR) != 0,
                verify_diff=(flags & FLAG_VERIFY_DIFF) != 0, min_nu=a[..., lay["min_nu"][0]])

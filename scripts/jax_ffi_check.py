@@ -897,7 +897,7 @@ def sec_api(args):
     m10 = copy.deepcopy(m)
     m10.opt.iterations, m10.opt.ls_iterations = 10, 20  # the interface's solver options are not model constants
     m10.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
-    phys = {B: F.EnginePhysics(m10, B, fp, torso, graph_mode="warp_staged", nconmax=64, njmax=192)
+    phys = {B: F.EnginePhysics(m10, B, fp, torso, graph_mode="warp_staged", nconmax=64, njmax=288)
             for B in (4096, 160)}
     p4 = phys[4096]
     r = dict(nconmax=p4.nconmax, njmax=p4.njmax, iterations=p4.iterations, stats_before=p4.stats())
@@ -913,13 +913,13 @@ def sec_api(args):
         _, _, _, inf = jax.jit(lambda *x: F.forward(*x, iterations=10))(*a)  # the same forward's info
         inf = np.asarray(inf)
         expect[B] = {"nacon": int(inf[:, 1].sum()), "naconmax": 64 * B, "nefc_max": int(inf[:, 2].max()),
-                     "njmax": 192}
+                     "njmax": 288}
     st = {B: p.stats() for B, p in phys.items()}
     st2 = {B: p.stats() for B, p in phys.items()}  # a read: the same again
     r.update(stats=st, expected_from_forward_info=expect, stats_repeat_equal=st == st2,
              keys_as_warp_physics=all(set(s) == {"nacon", "naconmax", "nefc_max", "njmax"} for s in st.values()),
              json=json.dumps(st[4096]), last_forward_any=F.last_forward(), diagnostics=p4.diagnostics(reset=True))
-    r["pass"] = bool(r["nconmax"] == info["maxcon"] == 64 and r["njmax"] == 192 and r["iterations"] == 10
+    r["pass"] = bool(r["nconmax"] == info["maxcon"] == 64 and r["njmax"] == 288 and r["iterations"] == 10
                      and r["keys_as_warp_physics"] and r["stats_repeat_equal"] and all(st[B] == expect[B] for B in st)
                      and r["diagnostics"]["fwd_calls"] >= 2)
     res["engine_physics"] = r
