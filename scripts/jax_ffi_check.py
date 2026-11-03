@@ -24,7 +24,7 @@ Sections (--sections, default all; each runs in its own process, so its device m
              (jax_ffi.forward(tape=True) / backward, the per-step loss's jax.vjp, cotangents summed as dL/dx_t + the
              next step's VJP): bitwise for the linear loss, the quadratic one reported (XLA rounds its fused dL/dx_t
              differently, BPTT amplifies the ulps); time per window and peak device memory against the tape
-             residuals (5888 B x 4 x H x B); the tape's copy into the stacked residual buffer: forward-only windows
+             residuals (6016 B x 4 x H x B); the tape's copy into the stacked residual buffer: forward-only windows
              that stack the tapes, drop them, or run without the tape, and the tape-sized ops in the compiled
              gradient's HLO. Remat (each mode in its own process, before the rest): the scan body as is,
              jax.checkpoint(body), the policy save_only_these_names("dk_tape") and jax_ffi.remat_policy() (the tape
@@ -897,7 +897,7 @@ def sec_api(args):
     m10 = copy.deepcopy(m)
     m10.opt.iterations, m10.opt.ls_iterations = 10, 20  # the interface's solver options are not model constants
     m10.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
-    phys = {B: F.EnginePhysics(m10, B, fp, torso, graph_mode="warp_staged", nconmax=64, njmax=288)
+    phys = {B: F.EnginePhysics(m10, B, fp, torso, graph_mode="warp_staged", nconmax=info["maxcon"], njmax=info["nefc"])
             for B in (4096, 160)}
     p4 = phys[4096]
     r = dict(nconmax=p4.nconmax, njmax=p4.njmax, iterations=p4.iterations, stats_before=p4.stats())
@@ -912,14 +912,14 @@ def sec_api(args):
             jax.block_until_ready(jax.jit(p.step)(*a))
         _, _, _, inf = jax.jit(lambda *x: F.forward(*x, iterations=10))(*a)  # the same forward's info
         inf = np.asarray(inf)
-        expect[B] = {"nacon": int(inf[:, 1].sum()), "naconmax": 64 * B, "nefc_max": int(inf[:, 2].max()),
-                     "njmax": 288}
+        expect[B] = {"nacon": int(inf[:, 1].sum()), "naconmax": info["maxcon"] * B, "nefc_max": int(inf[:, 2].max()),
+                     "njmax": info["nefc"]}
     st = {B: p.stats() for B, p in phys.items()}
     st2 = {B: p.stats() for B, p in phys.items()}  # a read: the same again
     r.update(stats=st, expected_from_forward_info=expect, stats_repeat_equal=st == st2,
              keys_as_warp_physics=all(set(s) == {"nacon", "naconmax", "nefc_max", "njmax"} for s in st.values()),
              json=json.dumps(st[4096]), last_forward_any=F.last_forward(), diagnostics=p4.diagnostics(reset=True))
-    r["pass"] = bool(r["nconmax"] == info["maxcon"] == 64 and r["njmax"] == 288 and r["iterations"] == 10
+    r["pass"] = bool(r["nconmax"] == info["maxcon"] and r["njmax"] == info["nefc"] and r["iterations"] == 10
                      and r["keys_as_warp_physics"] and r["stats_repeat_equal"] and all(st[B] == expect[B] for B in st)
                      and r["diagnostics"]["fwd_calls"] >= 2)
     res["engine_physics"] = r

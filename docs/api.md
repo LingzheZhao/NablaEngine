@@ -152,7 +152,7 @@ iteration), `tape_records`, `refact_records`, `nonconv_records`, `singular_recor
 | `last_forward(nworld=None)` | outside jit | the last forward call's record for that batch size: `worlds`, `contacts` (summed over the worlds), `contacts_max`, `rows_max` |
 | `launch_info(device=0)` | outside jit | the adjoint kernel's launch per variant: shared memory and worlds per SM |
 
-**Capacity.** Each world holds at most 64 contacts and 288 constraint rows (a frictional contact takes 4 rows, a joint
+**Capacity.** Each world holds at most 96 contacts and 416 constraint rows (a frictional contact takes 4 rows, a joint
 limit 1). A world beyond them, typically after deep interpenetration with the floor or between links (a fall), keeps
 the first ones and drops the rest, so it misses part of its support and friction forces; its step is then not the
 model's. Such worlds are flagged in `forward()`'s `info[:, 3]` (`OVERFLOW_CONTACTS = 4`, `OVERFLOW_ROWS = 16`) and
@@ -160,7 +160,15 @@ counted per call and world in `fwd_contact_overflow_worlds` / `fwd_row_overflow_
 `fwd_unsupported_worlds`). With `set_overflow_warnings(True)` (or `DK_OVERFLOW_WARN=1`; off by default)
 `decode_diagnostics` / `read_diagnostics` issue a `RuntimeWarning` when either count is non-zero (`warn_overflow`),
 and the counts nobody read are reported once more at exit. Mask or reset the flagged worlds
-of a batch before using its results. On the four held-out benchmark corpora (16,384 states) none occur: at most 30 contacts and 114 rows.
+of a batch before using its results. On the four original held-out benchmark corpora (16,384 states) none occur: at most 30 contacts and 114 rows.
+
+The 96-contact capacity uses three 32-bit contact-mask tiles. It preserves the order of Hessian accumulation:
+all world contacts before self contacts, in ascending tile order. The DOF support masks and the solver equations
+are unchanged. For the mjlab G1, a tape record has 1504 float32 words (6016 bytes), including 13 zone words; its
+7/9/8/8-bit header still holds contact count, row count, limit count and iteration count. Old libraries must be
+rebuilt, and old tapes have a different layout. [Capacity qualification](contact_capacity.md) records matched
+old/new execution, high-contact interface/VJP, overflow and independent Jacobian/Hessian checks. These bounded
+conditions do not make 96 contacts a universal upper bound or establish the original benchmark throughput.
 
 ## `EnginePhysics`
 
@@ -172,7 +180,7 @@ phys.stats()          # nacon, naconmax, nefc_max, njmax of the last forward cal
 phys.diagnostics()    # read_diagnostics()
 ```
 
-A batched physics object with MuJoCo Warp's capacity names (`nconmax` 64 contacts and `njmax` 288 constraint rows per
+A batched physics object with MuJoCo Warp's capacity names (`nconmax` 96 contacts and `njmax` 416 constraint rows per
 world). The model constants come from the fixtures, and `mjm` must then be the same model (`check_model`), unless
 `use_model=True`: then from `mjm`. Other keyword options of a MuJoCo Warp based physics object are accepted and
 ignored.

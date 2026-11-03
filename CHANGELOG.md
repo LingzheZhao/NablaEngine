@@ -2,14 +2,23 @@
 
 ## Unreleased
 
+- Contact capacity raised from 64 to 96 and constraint-row capacity from 288 to 416 per world. Contact masks use
+  32-bit tiles; the Hessian retains the original order (all world contacts, then all self contacts). DOF masks,
+  collision geometry, solver equations and overflow flags are unchanged. The 7/9/8/8-bit tape header is unchanged;
+  the mjlab G1 record grows to 1504 float32 words (6016 bytes), including 13 zone words. Libraries must be rebuilt;
+  tapes from the previous capacity are not accepted by the current layout. The extension requires matched
+  forward, adjoint and overflow validation before accepting a new experiment.
+  PyTorch artifact metadata records the row capacity as `nefc`. The current matched MuJoCo Warp benchmark and
+  tape-evidence diagnostic request 96 contacts and 416 rows per world. 416 is not among MuJoCo Warp's listed sizes
+  (384, 512), so acceptance, rounding or rejection must be checked in its environment before reporting either
+  condition. Previously recorded benchmark measurements retain their original capacities.
+
 - Constraint-row capacity raised from 192 to 288 rows per world, so 64 pyramidal contacts (four rows each) and the
   29 hinge limits of the G1 fit without dropping rows; the tape header packs the contact count in 7 bits and the row
   count in 9 bits, the zone field grows from 6 to 9 words, and the readers in the JAX and PyTorch interfaces, the
   adjoint and the benchmark adapter decode the new layout. Libraries built before this change must be rebuilt.
-  The record length of the mjlab model stays 1472 words. The PyTorch artifact metadata records the capacity as
-  `nefc`, and the matched MuJoCo Warp benchmark capacity follows the engine (`njmax` 288). 288 is not among
-  MuJoCo Warp's listed sizes (192, 256, 384), so whether MuJoCo Warp accepts, rounds or rejects it must be checked in
-  an environment with `mujoco_warp` before a matched benchmark is reported.
+  For that 64-contact layout, the record length stayed 1472 words because the extra zone words fit in alignment
+  padding.
 
 ## 0.1.0
 

@@ -39,9 +39,9 @@ the engine's results.
 | `DK_DIGESTS` | unset | `nablaengine.checks` (the forward digest check of `engine_step_check.py` and `jax_ffi_check.py`) | A further manifest of forward digests, read after `fixtures/mjlab/engine_digests.json` (for example entries made on another GPU architecture). | no (which digests a run is compared with) |
 | `DK_CACHE_DIR` | `$XDG_CACHE_HOME/nablaengine`, else `~/.cache/nablaengine` | `jax_ffi.cache_dir()`, `torch_ffi.cache_dir()` | Where the FFI library (`libdk_g1_<arch>_<key>.so`, about 5.5 MB per architecture and key, never pruned) is kept. | no |
 | `DK_TORCH_ARTIFACT` | unset: the cache's `torch_<arch>_current.json` | `torch_ffi.init()` | The PyTorch interface's artifact to load (the `.json` that `python -m nablaengine.torch_ffi build` wrote, next to its library and constants), e.g. one built on another machine. | no (a stale or foreign artifact is refused) |
-| `DK_OVERFLOW_WARN` | `0` (off) | `jax_ffi`, `torch_ffi` (`set_overflow_warnings`) | `1`: `read_diagnostics()` (and `jax_ffi.decode_diagnostics`) warn when worlds exceeded the contact (64) or constraint-row (288) capacity, and the unread counts are reported at exit. The counters are kept either way. | no |
+| `DK_OVERFLOW_WARN` | `0` (off) | `jax_ffi`, `torch_ffi` (`set_overflow_warnings`) | `1`: `read_diagnostics()` (and `jax_ffi.decode_diagnostics`) warn when worlds exceeded the configured contact or constraint-row capacity, and the unread counts are reported at exit. The counters are kept either way. | no |
 | `XDG_CACHE_HOME` | `~/.cache` | `jax_ffi.cache_dir()` | See `DK_CACHE_DIR`. | no |
-| `DK_MAXCON` | 64 for the mjlab model (32 for a model with at most 64 contact pairs) | `g1_engine.step.maxcon()` | Contact capacity per world in every build, the FFI library included. An experiment switch: it warns when set. | yes (capacity and memory layout) |
+| `DK_MAXCON` | 96 for the mjlab model (32 for a model with at most 64 contact pairs) | `g1_engine.step.maxcon()` | Contact capacity per world in every build, the FFI library included. An experiment switch: it warns when set. Integer values outside 1–96 are rejected before code generation. | yes (capacity and memory layout) |
 | `DK_KEEP_WORK` | unset: removed | `nablaengine.workdir` | `1` keeps the scripts' temporary work directories (generated sources, binaries, inputs, outputs; also `--keep-work`). | no |
 | `TMPDIR` | `/tmp` | the scripts' work directories | Where work directories are made (a check binary's run needs a few hundred MB while it runs). | no |
 | `DK_SPLIT_ONLY` | unset | `engine_step_check.py`'s binary | `1` / `2`: the timed launches run only `k_pre` / `k_post` (per-kernel time; results invalid). | timing only |
@@ -86,7 +86,7 @@ generates the header.
 | `DK_TAPE_VERIFY` | undefined | `step.py` | Debug: re-assembles the Newton Hessian at the final zones and flags differences in the tape (bit 11). | debug |
 | `KIN_WPB` | `4` | `kinematics.py` | Worlds per block of the kinematics kernels. | no (layout) |
 
-Generated from the model, not meant to be overridden: `MAXCON` (`step.maxcon`, see `DK_MAXCON`), `NEFC` (288),
+Generated from the model, not meant to be overridden: `MAXCON` (`step.maxcon`, see `DK_MAXCON`), `NEFC` (416),
 `HAS_BOX`, `FLOOR_G`, `DOF_BODY_ROOT6`, `SOLIMP_POW2`, `KDOF` (`step.max_support`: the most dofs a contact Jacobian
 touches, 16 for the G1; the `DK_JV_VEC` loads need 16), `ADJ_SOLIMP_POWER` (defined only when every row has the same
 solimp power, which the adjoint then uses as a constant), `NQ`, `NV`, `NU`, `NB`, the other model sizes (`NPAIR`,

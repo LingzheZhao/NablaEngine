@@ -25,9 +25,10 @@ Sections (all by default; --sections a,b,...):
              torch and jax_ffi forward bitwise equal (info's overflow bits included), their overflow counters equal and
              equal to the info bits, contact overflow in some world; row overflow in some world only when the model can
              need more rows than the artifact's nefc (contacts are capped at maxcon before rows are counted, so the most
-             rows a world can need are its frictionloss and hinge-limit rows + 4 x maxcon: 29 + 4 x 64 = 285 for the
-             default model, which cannot overflow 288 rows), else none; no warning by default, and read_diagnostics()
-             warns in both with set_overflow_warnings(True)
+             rows a world can need are its frictionloss and hinge-limit rows + 4 x maxcon: 29 + 4 x 96 = 413 for the
+             default model, which cannot overflow 416 rows), else none; no warning by default, and read_diagnostics()
+             warns in both with set_overflow_warnings(True). This fixed pose pool must actually exceed maxcon;
+             absence of such worlds fails coverage rather than demonstrating a correct overflow guard.
   timing     ms per control step at --nworld (interface defaults), torch against jax_ffi in the same process: the
              forward (torch step without grad / jax.jit(step)) and forward + backward (torch autograd of a cotangent
              loss / jax.jit(jax.vjp)), wall time of --reps back-to-back calls ending in one synchronisation, --rounds

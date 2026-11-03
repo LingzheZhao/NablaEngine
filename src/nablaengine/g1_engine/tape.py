@@ -46,7 +46,7 @@ _FIELDS = (
 
 
 def _table(m, max_contacts=None):
-    nc = max_contacts or step.maxcon(m)
+    nc = step.maxcon(m) if max_contacts is None else step.validate_maxcon(max_contacts)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
     assert nv <= 64 and m.npair <= 512 and nc <= 127 and step.NEFC <= 511, "field widths (clamp u64, pair 9 bits, ncon 7 / nefc 9 bits)"
     out, off = [], 0
@@ -61,8 +61,7 @@ def _table(m, max_contacts=None):
 
 
 def layout(m, max_contacts=None):
-    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 192, L_Q at 832, 1472 words; the
-    same at 192 and 288 constraint rows, since the zone field's three extra words fall in the alignment padding)."""
+    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 224, L_Q at 864, 1504 words)."""
     return {name: (off, n) for name, _, off, n in _table(m, max_contacts)[0]}
 
 
@@ -113,7 +112,7 @@ def decode(arr, m, max_contacts=None):
     zw = u[..., sl("zone")].astype(np.uint64)
     out["zone"] = ((zw[..., :, None] >> np.arange(32, dtype=np.uint64)) & np.uint64(1)).astype(bool).reshape(
         zw.shape[:-1] + (-1,))[..., :step.NEFC]
-    nc = max_contacts or step.maxcon(m)
+    nc = step.maxcon(m) if max_contacts is None else step.validate_maxcon(max_contacts)
     e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
     past = np.arange(nc) >= out["ncon"][..., None]
     out["pair"], out["slot"] = np.where(past, -1, e & 511), np.where(past, -1, e >> 9)

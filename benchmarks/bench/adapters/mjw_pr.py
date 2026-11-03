@@ -18,8 +18,8 @@ gradient is D[0].qpos.grad, D[0].qvel.grad and the sum of D[k].ctrl.grad over th
 fwd graph + bwd graph, every call from the loaded states. gradient() runs the bwd graph for the given cotangents and
 returns the harness convention (qpos in tangent form via base.qpos_tangent). No Jacobian API (jac not_supported).
 
-Variants: default (capacity "procedure" as mjw), matched (64 contacts / 288 rows per world, NablaEngine's
-capacity), warn_none (opt.warn_overflow = 0, as NablaEngine's reference _Sim).
+Variants: default (capacity "procedure" as mjw), matched (requests 96 contacts / 416 rows per world, NablaEngine's
+capacity; MuJoCo Warp acceptance is unvalidated), warn_none (opt.warn_overflow = 0, as NablaEngine's reference _Sim).
 Options as mjw_common.MjwBase (capacity, capacity_file, nconmax, naconmax, njmax, warn).
 """
 
