@@ -11,7 +11,7 @@ ITERATIONS / LS_ITERATIONS as upstream's benchmarks/unitree_g1, graph_conditiona
 Variants (cell ids <engine>~<variant>; any option also with run --opt mjw.<key>=<value>):
   default    capacity "procedure" (mjw_common: naconmax from the measured mean contacts + margin, njmax the smallest
              valid size >= the most rows over all corpora; benchmarks/data/mjw_capacity.json)
-  matched    capacity 64 contacts / 192 rows per world (NablaEngine's)
+  matched    requests 96 contacts / 416 rows per world (NablaEngine's; MuJoCo Warp acceptance is unvalidated)
   warn_all   put_model's default opt.warn_overflow (every warning on: the iteration-limit warnings print)
 Options: capacity (procedure | matched | explicit), capacity_file, nconmax, naconmax, njmax (explicit), warn (bench |
 all | none), tape_evidence (default true: diagnostics() also records tape_evidence() on the first 8 worlds).
@@ -83,9 +83,10 @@ def tape_evidence(mjw, wp, mjm, prob, states, nworld, substeps):
     tape.backward() runs. Every module of 3.17.0 is built with enable_backward=False, so no adjoint kernel exists:
     the result is d/dctrl = 0 exactly and d/dqpos, d/dqvel = the seeded cotangent itself (the copies' identity; the
     step adds nothing), with no error raised; Warp's Tape.backward warns for every recorded launch whose kernel is
-    built with enable_backward=False (counted here with Warp's own condition, the log silenced). Capacity 64 contacts /
-    192 rows per world (any capacity that holds the worlds gives the same). Returns the tape's launches, the
-    gradients' largest entries and these checks."""
+    built with enable_backward=False (counted here with Warp's own condition, the log silenced). This diagnostic
+    requests mjw_common.MATCHED (96 contacts / 416 rows per world); whether this MuJoCo Warp build accepts, rounds
+    or rejects 416 rows requires validation before reporting this condition. Returns the tape's launches, the
+    gradients' largest entries and these checks; earlier measurements retain their recorded capacities."""
     import mujoco
     n = int(nworld)
     mjd = mujoco.MjData(mjm)

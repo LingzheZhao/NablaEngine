@@ -8,11 +8,17 @@
   the mjlab G1 record grows to 1504 float32 words (6016 bytes), including 13 zone words. Libraries must be rebuilt;
   tapes from the previous capacity are not accepted by the current layout. The extension requires matched
   forward, adjoint and overflow validation before accepting a new experiment.
+  PyTorch artifact metadata records the row capacity as `nefc`. The current matched MuJoCo Warp benchmark and
+  tape-evidence diagnostic request 96 contacts and 416 rows per world. 416 is not among MuJoCo Warp's listed sizes
+  (384, 512), so acceptance, rounding or rejection must be checked in its environment before reporting either
+  condition. Previously recorded benchmark measurements retain their original capacities.
 
 - Constraint-row capacity raised from 192 to 288 rows per world, so 64 pyramidal contacts (four rows each) and the
   29 hinge limits of the G1 fit without dropping rows; the tape header packs the contact count in 7 bits and the row
   count in 9 bits, the zone field grows from 6 to 9 words, and the readers in the JAX and PyTorch interfaces, the
   adjoint and the benchmark adapter decode the new layout. Libraries built before this change must be rebuilt.
+  For that 64-contact layout, the record length stayed 1472 words because the extra zone words fit in alignment
+  padding.
 
 ## 0.1.0
 

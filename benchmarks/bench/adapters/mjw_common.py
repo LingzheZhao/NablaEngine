@@ -39,8 +39,10 @@ option capacity):
                nconmax  = ceil(mu * (1 + MARGIN))                     (per world; MuJoCo Warp's sparse njmax_nnz
                                                                        estimate and CCD capacity read it)
                njmax    = the smallest of MuJoCo Warp's own valid sizes (16, 24, 32, 48, 64, 96, 128, 192, ...) >= r_max
-  matched    64 contacts and 192 rows per world (naconmax = 64 nworld, njmax 192): NablaEngine's fixed
-             capacity
+  matched    requests 96 contacts and 416 rows per world (naconmax = 96 nworld, njmax 416): NablaEngine's current
+             capacity. 416 is not one of MuJoCo Warp's listed sizes (... 256, 384, 512 ...): whether put_data
+             accepts, rounds or rejects it has not been checked, so validate it in an environment with mujoco_warp
+             before reporting a matched benchmark or the tape-evidence diagnostic, which also uses this capacity
   explicit   the options nconmax (per world) / naconmax (total) and njmax
 Overflow (capacity bits of d.overflow, i.e. every bit except ITERATIONS and LS_ITERATIONS) is counted per world in
 diagnostics()["overflow"]; it is never hidden.
@@ -63,7 +65,9 @@ from benchmarks.bench.adapters import base
 REPO = Path(__file__).resolve().parents[3]
 CAPACITY_FILE = "benchmarks/data/mjw_capacity.json"
 CAPACITY_MODES = ("procedure", "matched", "explicit")
-MATCHED = dict(nconmax=64, njmax=192)
+# The requested matched capacity follows NablaEngine's current 96 contacts / 416 rows. 416 is not among the listed
+# MuJoCo Warp sizes (384, 512); acceptance, rounding or rejection remains unvalidated, including tape_evidence().
+MATCHED = dict(nconmax=96, njmax=416)
 MARGIN = 0.25
 # MuJoCo Warp's valid capacity sizes (io._default_nconmax / _default_njmax): 16, 24, 32, 48, ... 8192
 VALID_SIZES = tuple(int(x) for x in (2 + (np.arange(19) % 2)) * (2 ** (np.arange(19) // 2 + 3)))
@@ -103,7 +107,7 @@ def capacity(prob, nworld, corpus=None, mode="procedure", nconmax=None, naconmax
         raise ValueError(f"capacity must be one of {CAPACITY_MODES}, got {mode!r}")
     if mode == "matched":
         return dict(mode=mode, nconmax=MATCHED["nconmax"], naconmax=MATCHED["nconmax"] * nworld,
-                    njmax=MATCHED["njmax"], rule="64 contacts and 192 rows per world (NablaEngine's)")
+                    njmax=MATCHED["njmax"], rule="96 contacts and 416 rows per world requested (NablaEngine's)")
     if mode == "explicit":
         if njmax is None or (nconmax is None and naconmax is None):
             raise ValueError("capacity 'explicit' needs njmax and nconmax (per world) or naconmax (all worlds)")
