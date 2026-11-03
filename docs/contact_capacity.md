@@ -57,6 +57,19 @@ CUDA Graph training check passed 1,923 checks, including 612 bitwise-identical a
 and independent collector-history copy checks. Earlier strict eager/compiler
 failures remain separate and are not reclassified.
 
-These results qualify the declared capacity condition for a fresh learning experiment.
-They do not measure completed three-hour learning, motion fidelity, other GPU models,
+These capacity results qualify the declared condition for a learning experiment.
+A subsequent three-hour Torch run completed 12,640 updates with no recorded native
+invalidations; its policy returns and separate body-fidelity limits are reported in
+[the donor reproduction results](https://github.com/LingzheZhao/NablaMimic/blob/codex/pytorch-nablaengine/REPRODUCTION.md).
+This does not establish every possible state's capacity needs, other GPU models,
 or the original paper's cross-simulator throughput figures.
+
+A later update from the row-capacity branch adds `nefc` to the Torch artifact metadata.
+All eight physics/code-generation files and all 3,376 package string constants,
+including CUDA templates, remain identical to the qualified kernel revision.
+A fresh one-world artifact check passed: interface constants, standalone loading
+without MuJoCo/JAX/NVCC, bitwise forward/backward outputs and refusal of a stale-source
+artifact. Serialized metadata records 96 contacts, 416 rows and 1504 tape words;
+the fixture's conservative row requirement is 413. This is metadata/interface
+validation, not a second training experiment. The optional matched Warp benchmark
+and tape-evidence requests at 96/416 remain unvalidated and carry no new throughput claim.
