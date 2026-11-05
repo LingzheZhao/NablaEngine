@@ -54,6 +54,22 @@ def verify_robot(fixture, model):
         if [mujoco.mj_id2name(fixture, kind, i) for i in range(count)] != [
                 mujoco.mj_id2name(model, kind, i) for i in range(count)]:
             raise ValueError("Terrain construction changed robot names")
+    for index in range(fixture.ngeom):
+        if fixture.geom_bodyid[index] == 0:
+            continue
+        target = model.geom(fixture.geom(index).name).id
+        for field in ("geom_type", "geom_bodyid", "geom_size", "geom_pos", "geom_quat",
+                      "geom_contype", "geom_conaffinity", "geom_condim", "geom_friction",
+                      "geom_solref", "geom_solimp", "geom_margin", "geom_gap"):
+            if not np.allclose(getattr(fixture, field)[index], getattr(model, field)[target], rtol=0, atol=1e-12):
+                raise ValueError(f"Terrain construction changed {fixture.geom(index).name} {field}")
+    for index in range(fixture.npair):
+        if any(fixture.geom_bodyid[g] == 0 for g in (fixture.pair_geom1[index], fixture.pair_geom2[index])):
+            continue
+        target = model.pair(fixture.pair(index).name).id
+        for field in ("pair_dim", "pair_friction", "pair_solref", "pair_solimp", "pair_margin", "pair_gap"):
+            if not np.allclose(getattr(fixture, field)[index], getattr(model, field)[target], rtol=0, atol=1e-12):
+                raise ValueError(f"Terrain construction changed self pair {fixture.pair(index).name} {field}")
     return errors
 
 
