@@ -161,7 +161,7 @@ def main():
     for name in TRACKED_BODIES:
         model.body(name)
     data = mujoco.MjData(model)
-    mujoco.mj_forward(model, data)
+    mujoco.mj_kinematics(model, data)
     frame_errors = []
     for name, expected in zip(hull_names, expected_vertices):
         geom = model.geom(name).id
