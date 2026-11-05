@@ -2,7 +2,7 @@
 
 Run on provisioned compute with CUDA 12 nvcc, a supported NVIDIA GPU, Python,
 NumPy and MuJoCo installed; PYTHONPATH=src python scripts/check_box_contact_gradients.py
---out /absolute/new/output. Builds and all machine-readable results stay there.
+--code-revision COMMITTED_REVISION --out /absolute/new/output. Builds and all machine-readable results stay there.
 
 Forward float32 CUDA replay is compared to float64 C++ evaluation of the SAME
 forward formulas. This is a numerical oracle, not an independent collision model.
@@ -16,6 +16,7 @@ This is primitive evidence only, not a rollout or trainer qualification.
 import argparse
 import ctypes
 import json
+import platform
 import re
 import subprocess
 from pathlib import Path
@@ -250,16 +251,26 @@ def close(actual, expected, atol, rtol):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--code-revision", required=True, help="declared committed revision of the staged source snapshot")
     ap.add_argument("--prepare-only", action="store_true", help="write generated sources; do not compile or run")
     args = ap.parse_args(); out = args.out.resolve()
     if out.is_relative_to(ROOT):
         ap.error("--out must be outside the checkout")
     out.mkdir(parents=True, exist_ok=False)
-    revision = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
-    status = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"], text=True)
-    report = dict(protocol=PROTOCOL, code_revision=revision, code_status=status,
+    report = dict(protocol=PROTOCOL, code_revision=args.code_revision,
                   inputs=[dict(c, x=c["x"].tolist()) for c in cases()], cases=[], pass_=False)
     try:
+        import mujoco
+        report["environment"] = dict(python=platform.python_version(), numpy=np.__version__,
+                                     mujoco=mujoco.__version__, platform=platform.platform())
+        for label, command in (("nvcc", ["nvcc", "--version"]), ("g++", ["g++", "--version"]),
+                               ("gpu", ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"])):
+            try:
+                info = subprocess.run(command, text=True, capture_output=True)
+                report["environment"][label] = dict(returncode=info.returncode,
+                                                     stdout=info.stdout.strip(), stderr=info.stderr.strip())
+            except OSError as exc:
+                report["environment"][label] = dict(error=str(exc))
         build(out, args.prepare_only)
         if args.prepare_only:
             report["status"] = "sources_prepared_without_execution"
