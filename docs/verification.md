@@ -187,10 +187,19 @@ handles signed penetration and emits up to two capsule surface-edge contacts pro
 face. Continuous clipping parameters and the original surface-edge offset retain pose gradients. Invalid
 geometry and invalid slots propagate through the forward status and stop unsupported backward replay.
 
-Tape records use an 11-bit pair index and support 2,048 candidate pairs. Their 16-bit contact entries and record
-length remain unchanged. The reserved word identifies the new encoding, and Torch artifacts declare version 2
-and the matching encoding. Current primitives use slots 0 through 7. Active-contact capacity remains 96 and
-constraint-row capacity 416. Candidate-pair capacity does not change either physical capacity.
+Tape records use a uint32 contact entry: a 16-bit candidate-pair index and a 16-bit slot field. The reserved
+word identifies format 3, and Torch artifacts declare version 3 and the matching encoding. Current primitives
+use slots 0 through 7; the unused-contact sentinel is `0xffffffff`. Pair constants store two uint16 geom indices
+in `c_pgeom` and parameter-set, dimension and flags in `c_pword`. The encoding supports 65,536 candidate pairs
+and collision geoms, with 256 parameter sets. Active-contact capacity remains 96 and constraint-row capacity
+416. These representation limits are separate from measured physical capability.
+
+`PYTHONPATH=src:scripts python scripts/check_contact_encoding.py` checks generated constants with 577 total
+geoms, 542 collision geoms and 15,231 candidate pairs, plus tape boundaries through pair 65,535 and slot 7,
+without stepping physics. On provisioned CUDA compute, `scripts/check_pair_capacity.py --code-revision REV
+--out /new/external/root` compares the large generated sparse-contact model with its 47-pair physical control
+and MuJoCo forward and directional-gradient readings. It records compiled state sizes, tape bytes, timing and
+overflows. This index check does not establish full terrain-task behavior.
 
 The terrain-4 scene contains 40 CoACD hulls and 1,789 explicit pairs. The fixture's robot geometry, self pairs and
 pelvis-root dynamics are retained, with terrain pairs replacing the plane. The physical check used reference

@@ -253,7 +253,7 @@ struct Adj {
   float com[3], fric;
   unsigned clamp[(NV + 31) / 32];  // the record's actuator clamp mask (dof bits)
   unsigned zone[(NEFC + 31) / 32];  // the record's quadratic-zone bits of the constraint rows (forward row order)
-  unsigned con[(MAXCON + 1) / 2];  // the record's contact table: pair | slot << TAPE_PAIR_BITS per 16 bits
+  unsigned con[MAXCON];  // one uint32 pair | slot << 16 per contact
   int hdr;  // the record's header: ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
   // bodies, lane b = body b (body 0: the world, at rest). Forward quantities (A3) read up to A7:
@@ -1101,7 +1101,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
   for (int c0 = 0; c0 < ncon; c0 += 32) {
     const int c = c0 + lane, nb = min(32, ncon - c0);
     const bool on = c < ncon;
-    const unsigned e = on ? (s.con[c >> 1] >> (16 * (c & 1))) & 0xFFFFu : 0u;
+    const unsigned e = on ? s.con[c] : 0u;
     const int pair = e & TAPE_PAIR_MASK, slot = e >> TAPE_PAIR_BITS, dim = on ? PDIM(pair) : 0;
     const unsigned b3 = __ballot_sync(0xffffffffu, dim == 3);
     const int r0 = NFLOSS + nlim + c + 3 * (ntri + __popc(b3 & below));  // the contact's first row
@@ -1252,7 +1252,7 @@ __device__ void adj_jtf(Adj& s, const float* dbg, int lane) {
       acc = (q - c_jrange[2 * i] < c_jrange[2 * i + 1] - q ? 1.f : -1.f) * dbg[DBG_LIM_FORCE + i];
     }
     for (int c = 0; c < ncon; c++) {
-      const int pair = (s.con[c >> 1] >> (16 * (c & 1))) & TAPE_PAIR_MASK;
+      const int pair = s.con[c] & TAPE_PAIR_MASK;
       const unsigned m1 = c_ancmask[c_gbody[PG1(pair)]], m2 = c_ancmask[c_gbody[PG2(pair)]];
       if (!(((m1 ^ m2) >> bi) & 1u)) continue;
       const float sg = (m2 >> bi) & 1u ? 1.f : -1.f, *F = dbg + DBG_CON_FORCE + 3 * c, *p = dbg + DBG_CON_POS + 3 * c;
@@ -1299,7 +1299,7 @@ __device__ void adj_substep(Adj& s, const float* rec, int lane, float* dbg, cons
   }
   if (lane < (NV + 31) / 32) s.clamp[lane] = __float_as_uint(__ldcs(rec + OFF_CLAMP + lane));
   if (lane < (NEFC + 31) / 32) s.zone[lane] = __float_as_uint(__ldcs(rec + OFF_ZONE + lane));
-  for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.con[i] = __float_as_uint(__ldcs(rec + OFF_CON + i));
+  for (int i = lane; i < MAXCON; i += 32) s.con[i] = __float_as_uint(__ldcs(rec + OFF_CON + i));
   if (lane == 0) {
     unsigned hd = __float_as_uint(__ldcs(rec + OFF_HDR));
     s.hdr = (int)hd;

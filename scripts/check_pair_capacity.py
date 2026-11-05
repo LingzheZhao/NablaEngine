@@ -1,21 +1,14 @@
-"""GPU qualification of contact pair IDs above 511 and 1023 on generated G1 models.
+"""GPU qualification of 542 collision geoms and 15,231 candidate pairs.
 
 Run on provisioned CUDA compute with --code-revision REV --out /new/external/root.
-The default runs three independent processes because Torch FFI loads one model
-per process. The original 502-pair fixture retains its full collision selection.
-Two compiled MjSpec models share 181 geoms and the G1 dynamics. Both have 33 old
-floor pairs with the plane lowered to z=-10, plus 14 capsule/box support pairs.
-The 1063-pair model adds 1016 unique, distant box/left-foot capsule pairs. MuJoCo
-compiles pair signature ordering. Real support pairs consequently exceed ID 1023.
-The 47-pair control omits those distant candidates. Every geom pair is unique.
-
-Checks execute forward, tape decoding and backward on the GPU at one and four
-controls. MuJoCo double-precision directional finite differences and the physically
-equivalent 47-pair control check the high-ID backward. Masking actual GPU contact
-IDs to nine or ten bits provides a deliberate corruption control. Positive runs
-require finite results, supported/converged records, active bilateral support,
-and zero contact or row overflow. Timing and memory are measured without a speed
-threshold. Contact-capacity exhaustion is outside this sparse-contact protocol.
+Generated distant boxes expand the candidate table without changing active support.
+The 47-pair control has identical geoms and dynamics. Each model executes forward,
+uint32 tape decoding and backward for one and four controls. MuJoCo double precision
+finite differences and the sparse control compare physical forward and VJP results.
+Masking actual contact IDs to 8 or 11 bits supplies deliberate corruption controls.
+Compiled state sizes, tape bytes, timing and allocation are reported. MAXCON remains
+96 and NEFC 416; zero overflow is required. This is sparse-contact index qualification,
+not qualification of dense terrain contacts or complete task behavior.
 """
 import argparse
 import ctypes
@@ -31,9 +24,10 @@ import check_box_step_gradients as box_check
 from capability_check import spec_from_model
 
 ROOT = Path(__file__).resolve().parents[1]
-PROTOCOL = dict(seed=20261105, conditions=["fixture502", "control47", "capacity1063"],
+PROTOCOL = dict(seed=20261105, conditions=["fixture502", "control47", "capacity15231"],
                 horizons=[1, 4], substeps=4, iterations=50, max_contacts=96,
-                padding_pairs=1016, support_insertion_after_padding_pairs=500, distant_boxes=146, distant_box_start=[100., 20., 0.],
+                padding_pairs=15184, support_insertion_after_padding_pairs=500, distant_boxes=507,
+                noncollision_visual_geoms=35, distant_box_start=[100., 20., 0.],
                 distant_box_stride=1., distant_box_half_size=[.1, .1, .1],
                 active_box_half_size=[10., 10., .1], active_box_position=[0., 0., -.1],
                 old_plane_position=[0., 0., -10.], initial_state="qpos0_asymmetric_contact",
@@ -95,6 +89,10 @@ def generated_model(condition):
             if pair.name not in floor_pair_names:
                 spec.delete(pair)
         spec.geom(floor_name).pos = PROTOCOL["old_plane_position"]
+        for j in range(PROTOCOL["noncollision_visual_geoms"]):
+            spec.worldbody.add_geom(name=f"capacity_visual_{j}", type=mujoco.mjtGeom.mjGEOM_BOX,
+                                    pos=[100., -20., float(j)], size=[.1, .1, .1],
+                                    contype=0, conaffinity=0, mass=0.)
         for j in range(PROTOCOL["distant_boxes"]):
             center = np.array(PROTOCOL["distant_box_start"], float)
             center[0] += j*PROTOCOL["distant_box_stride"]
@@ -112,11 +110,13 @@ def generated_model(condition):
                                  geomname2=name(m, mujoco.mjtObj.mjOBJ_GEOM, g))
             pair_parameters(pair, m, template)
             active_names[index] = pair_name
-        if condition == "capacity1063":
+        if condition == "capacity15231":
             for k in range(PROTOCOL["padding_pairs"]):
-                g, template = left[k % 7]
+                template = floor_pairs[k // PROTOCOL["distant_boxes"] % len(floor_pairs)]
+                g1, g2 = int(m.pair_geom1[template]), int(m.pair_geom2[template])
+                g = g2 if g1 == floor else g1
                 pair = spec.add_pair(name=f"capacity_distant_pair_{k}",
-                                     geomname1=f"capacity_distant_box_{k // 7}",
+                                     geomname1=f"capacity_distant_box_{k % PROTOCOL['distant_boxes']}",
                                      geomname2=name(m, mujoco.mjtObj.mjOBJ_GEOM, g))
                 pair_parameters(pair, m, template)
                 if k+1 == PROTOCOL["support_insertion_after_padding_pairs"]:
@@ -135,18 +135,19 @@ def generated_model(condition):
         m = compiled
         fp = [int(mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_PAIR, p)) for p in active_names]
         selection.update(retained_fixture_pairs=33, removed_fixture_self_pairs=469,
-                         distant_pairs=1016 if condition == "capacity1063" else 0,
+                         distant_pairs=15184 if condition == "capacity15231" else 0,
                          active_support_pairs=fp, selected_pair_names=active_names)
-    expected = dict(fixture502=502, control47=47, capacity1063=1063)[condition]
-    if m.npair != expected or m.ngeom > 255:
+    from nablaengine.g1_engine.step import collision_geoms as step_collision_geoms
+    expected = dict(fixture502=502, control47=47, capacity15231=15231)[condition]
+    if m.npair != expected:
         raise ValueError(f"model has unexpected pair/geom counts {m.npair}/{m.ngeom}")
     unique = {frozenset((int(a), int(b))) for a, b in zip(m.pair_geom1, m.pair_geom2)}
     if len(unique) != m.npair:
         raise ValueError("duplicate geom pairs in generated input")
     if np.any(np.diff(m.pair_signature.astype(np.int64)) < 0):
         raise ValueError("compiled pair signatures are unsorted")
-    if condition == "capacity1063" and not (any(511 < p <= 1023 for p in fp) and any(p > 1023 for p in fp)):
-        raise ValueError("generated support must exercise both the ninth and tenth pair ID bits")
+    if condition == "capacity15231" and not (max(fp) > 2047 and len(step_collision_geoms(m)) == 542):
+        raise ValueError("generated support must exercise pair IDs above 2047 and 542 collision geoms")
     m.opt.iterations = PROTOCOL["iterations"]
     m.pair_friction[fp, :2] = PROTOCOL["friction"]
     report = capability.check(m, fp, scope="engine")
@@ -259,8 +260,7 @@ def run_condition(condition, out, report):
         qv = np.r_[nominal["q"].cpu().numpy()[0], nominal["v"].cpu().numpy()[0]]
         reference = physical(state["q"], state["v"], state["u"], horizon)
         active_pairs = sorted({int(p) for record in nominal["decoded"] for p in record["pair"].ravel() if p >= 0})
-        high_ok = condition != "capacity1063" or (any(511 < p <= 1023 for p in active_pairs)
-                                                   and any(p > 1023 for p in active_pairs))
+        high_ok = condition != "capacity15231" or any(p > 2047 for p in active_pairs)
         support_counts = {side: [np.isin(record["pair"], pairs).sum(axis=-1).tolist()
                                  for record in nominal["decoded"]]
                           for side, pairs in state["foot_pairs_by_side"].items()}
@@ -313,15 +313,15 @@ def run_condition(condition, out, report):
                             gradients=np.stack(gradients), tapes=np.stack([t.cpu().numpy() for t in nominal["tapes"]]))
         report["conditions"].append(row)
         print(condition, horizon, "PASS" if row["pass_"] else "FAIL", flush=True)
-        if condition == "capacity1063":
+        if condition == "capacity15231":
             row["corruption_controls"] = []
-            for mask in (511, 1023):
+            for mask in (255, 2047):
                 corrupted = []
                 changed = 0
                 for saved in nominal["tapes"]:
                     raw = saved.cpu().numpy().copy().reshape(1, PROTOCOL["substeps"], tape.rec_words(m))
                     start, length = tape.layout(m)["con"]
-                    contacts = np.ascontiguousarray(raw[..., start:start+length]).view(np.uint16)
+                    contacts = np.ascontiguousarray(raw[..., start:start+length]).view(np.uint32)
                     active = contacts != tape.CON_NONE
                     original = contacts.copy()
                     contacts[active] = ((contacts[active] & tape.PAIR_MASK & mask)
@@ -391,7 +391,7 @@ def main():
                 report["children"].append(dict(condition=condition, returncode=result.returncode))
             comparisons = []
             for horizon in PROTOCOL["horizons"]:
-                paths = [out / condition / f"{horizon}_controls.npz" for condition in ("control47", "capacity1063")]
+                paths = [out / condition / f"{horizon}_controls.npz" for condition in ("control47", "capacity15231")]
                 if not all(path.exists() for path in paths):
                     comparisons.append(dict(controls=horizon, pass_=False, error="child evidence unavailable"))
                     continue

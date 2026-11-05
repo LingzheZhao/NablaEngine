@@ -20,10 +20,10 @@ qacc_smooth) + sum_rows s(J qacc - aref). The Newton steps use an exact line sea
 piecewise-quadratic cost), so a converged solve matches MuJoCo's unique minimizer. implicitfast: qacc' = (M + h kv)^-1
 M qacc, qvel += h qacc', qpos integrated with the new qvel.
 
-pair_constants(m, foot_pairs) packs, next to source.constants, the contact-pair table (PAIR_LAYOUT: one word per pair with
+pair_constants(m, foot_pairs) packs, next to source.constants, the contact-pair table (PAIR_LAYOUT: two words per pair with
 geom indices, parameter set, condim and foot flag; the parameter sets in c_pset), the collision-geom table (GEOM_LAYOUT: body, type, size, local pose, bounding radius of every geom
 in a pair) and the solver constants (SOLVER_LAYOUT); const_layout(m) gives the symbols and lengths in that order. The
-per-pair geometry lives in the geom table so that the 502 pairs of the mjlab model fit in 64 KB of constant memory.
+per-pair geometry lives in the geom table; large pair tables use the global-memory constants path.
 
 The forward tape (nablaengine.g1_engine.tape): substep(..., rec) writes one tape record when rec is not null (the
 code needs tape.header(m) for the OFF_* offsets); the forward outputs are bitwise the same with and without it.
@@ -53,8 +53,10 @@ PROF_PHASES = ("smooth", "qacc_smooth", "collision", "contact_jac", "rows", "new
                "ls_rowsjv", "ls_matvec",  # newton_linesearch: J p, M p
                "col_geom", "nh_conC", "nh_copy_dof", "col_broad")  # collision, newton_hessian
 PROF_PARTITION = 12  # the first 12 phases partition a substep; then a part of one (cycles) and a count
-PAIR_LAYOUT = (  # (symbol, kind, per-pair width): one packed word per pair, see pair_word()
-    ("c_pword", "u", 1),
+GEOM_CAPACITY = 1 << 16
+PSET_CAPACITY = 1 << 8
+PAIR_LAYOUT = (  # (symbol, kind, per-pair width): geometry indices and contact metadata
+    ("c_pgeom", "u", 1), ("c_pword", "u", 1),
 )
 PSET_WIDTH = 8  # a contact parameter set in c_pset: friction mu, solref[2], solimp[5]
 GEOM_LAYOUT = (  # (symbol, kind, per-geom width)
@@ -105,17 +107,21 @@ def collision_geoms(m):
     return sorted(set(int(g) for g in m.pair_geom1) | set(int(g) for g in m.pair_geom2))
 
 
-def pair_word(g1, g2, pset, dim, foot, plane=0):
-    """A contact pair as one 32-bit word: geom table indices g1, g2 (8 bits each), parameter set (8 bits), condim (4 bits),
-    foot-floor flag (1 bit), plane flag (1 bit: g1 is a plane); decoded on the device by PG1 / PG2 / PSET / PDIM /
-    PFOOT / PPLANE."""
-    assert g1 < 256 and g2 < 256 and pset < 256 and dim < 16
-    return g1 | g2 << 8 | pset << 16 | dim << 24 | foot << 28 | plane << 29
+def pair_geom_word(g1, g2):
+    """Two collision-geom indices, each uint16, decoded by PG1 / PG2."""
+    assert 0 <= g1 < GEOM_CAPACITY and 0 <= g2 < GEOM_CAPACITY
+    return g1 | g2 << 16
+
+
+def pair_word(pset, dim, foot, plane=0):
+    """Contact metadata: parameter set (8 bits), condim (4), foot and plane flags (one each)."""
+    assert 0 <= pset < PSET_CAPACITY and 0 <= dim < 16 and foot in (0, 1) and plane in (0, 1)
+    return pset | dim << 8 | foot << 12 | plane << 13
 
 
 def pair_param_sets(m):
     """(unique (mu, solref, solimp) rows as an (n, PSET_WIDTH) array, index of each pair's row): the 502 mjlab pairs
-    share a handful of parameter sets, so the pair table is one word per pair."""
+    share a handful of parameter sets."""
     keys, index = {}, []
     for i in range(m.npair):
         key = (float(m.pair_friction[i, 0]), *map(float, m.pair_solref[i]), *map(float, m.pair_solimp[i]))
@@ -141,7 +147,7 @@ def pair_constants(m, foot_pairs, convex_hulls=None):
     if convex_hulls is None and any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH for g in geoms):
         raise ValueError("mesh constants require the caller-owned packed convex hulls")
     gid = {g: i for i, g in enumerate(geoms)}
-    sets, words = pair_param_sets(m), []
+    sets, geom_words, words = pair_param_sets(m), [], []
     foot = set(int(x) for x in foot_pairs)
     assert foot <= set(range(m.npair)), f"foot pairs {sorted(foot)}: not all contact pair indices (0..{m.npair - 1})"
     for i in range(m.npair):
@@ -149,10 +155,14 @@ def pair_constants(m, foot_pairs, convex_hulls=None):
         if GEOM_TYPE[int(m.geom_type[g1])] > GEOM_TYPE[int(m.geom_type[g2])]:
             g1, g2 = g2, g1
         assert m.pair_margin[i] == 0 and m.pair_gap[i] == 0 and m.pair_friction[i, 0] == m.pair_friction[i, 1]
-        words.append(pair_word(gid[g1], gid[g2], sets[1][i], int(m.pair_dim[i]), int(i in foot),
+        geom_words.append(pair_geom_word(gid[g1], gid[g2]))
+        words.append(pair_word(sets[1][i], int(m.pair_dim[i]), int(i in foot),
                                int(GEOM_TYPE[int(m.geom_type[g1])] == 0)))
-    words = np.asarray(words, np.int64)
-    out = [np.stack([words & 0xFFFF, words >> 16], 1).ravel(), np.asarray(sets[0], np.float64).ravel()]
+    out = []
+    for values in (geom_words, words):
+        values = np.asarray(values, np.int64)
+        out.append(np.stack([values & 0xFFFF, values >> 16], 1).ravel())
+    out.append(np.asarray(sets[0], np.float64).ravel())
     out += [m.geom_bodyid[geoms], [GEOM_TYPE[int(m.geom_type[g])] for g in geoms], m.geom_size[geoms],
             m.geom_pos[geoms], m.geom_quat[geoms], m.geom_rbound[geoms]]
     jr = np.zeros((m.nv, 2))
@@ -238,14 +248,14 @@ __device__ const unsigned c_hcol[{len(hcol)}] = {{{", ".join(map(str, hcol))}}};
 #define NFLOSS {int((m.dof_frictionloss > 0).sum())}  // dofs with a frictionloss row (the first rows)
 #define SOLIMP_POW2 {int(solimp_pow2(m))}  // every solimp power of the model is 2 (kbimp without the general powers)
 #define NPROF {len(PROF_PHASES)}
-DKC unsigned int c_pword[{p}];  // pair_word(): g1 | g2 << 8 | pset << 16 | dim << 24 | foot << 28 | plane << 29
+DKC unsigned int c_pgeom[{p}], c_pword[{p}];  // uint16 geom indices; parameter set / dimension / flags
 DKC float c_pset[{len(pair_param_sets(m)[0]) * PSET_WIDTH}];  // per parameter set: mu, solref[2], solimp[5]
-#define PG1(pr) ((int)(c_pword[pr] & 255u))
-#define PG2(pr) ((int)((c_pword[pr] >> 8) & 255u))
-#define PSET(pr) ((int)((c_pword[pr] >> 16) & 255u))
-#define PDIM(pr) ((int)((c_pword[pr] >> 24) & 15u))
-#define PFOOT(pr) ((int)((c_pword[pr] >> 28) & 1u))
-#define PPLANE(pr) ((int)((c_pword[pr] >> 29) & 1u))
+#define PG1(pr) ((int)(c_pgeom[pr] & 65535u))
+#define PG2(pr) ((int)((c_pgeom[pr] >> 16) & 65535u))
+#define PSET(pr) ((int)(c_pword[pr] & 255u))
+#define PDIM(pr) ((int)((c_pword[pr] >> 8) & 15u))
+#define PFOOT(pr) ((int)((c_pword[pr] >> 12) & 1u))
+#define PPLANE(pr) ((int)((c_pword[pr] >> 13) & 1u))
 #define PMU(pr) (c_pset[PSET_WIDTH * PSET(pr)])
 #define PSOLREF(pr) (c_pset + PSET_WIDTH * PSET(pr) + 1)
 #define PSOLIMP(pr) (c_pset + PSET_WIDTH * PSET(pr) + 3)
@@ -1888,7 +1898,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, float
   {  // broad phase: the pairs whose bounding test passes (collide_pair's first test, here with a relative slack of 1e-5
      // so that it keeps every pair collide_pair keeps), in pair order into s.cand; then collide_pair on them, one per
      // lane (rather than 16 pairs per lane, most of them rejected and the narrow phases of the others diverging)
-    static_assert(NPAIR < 65536, "candidate pairs as 16-bit indices");
+    static_assert(NPAIR <= 65536, "candidate pairs as 16-bit indices");
     const unsigned lanes_below = (1u << lane) - 1u;
 #if FLOOR_G >= 0
     float fn[3];  // the only plane's normal
@@ -2059,16 +2069,13 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, float
     s.nefc_dof = ndof;  // dof rows (frictionloss, limits) come first; contact rows follow
   }
   PROF(4);
-  if (rec)  // tape: the contact table in contact (= row) order, two 16-bit entries pair | slot << TAPE_PAIR_BITS per word
-    for (int i = lane; i < (MAXCON + 1) / 2; i += 32) {
-      unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << TAPE_PAIR_BITS : TAPE_CON_NONE;
-      unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << TAPE_PAIR_BITS
-                                     : TAPE_CON_NONE;
-      if ((2 * i < ncon && (e0 >= TAPE_CON_NONE || s.con_slot[2 * i] >= TAPE_SLOT_CAPACITY)) ||
-          (2 * i + 1 < ncon && (e1 >= TAPE_CON_NONE || s.con_slot[2 * i + 1] >= TAPE_SLOT_CAPACITY))) {
-        asm volatile("trap;");  // an active slot must fit without colliding with the sentinel
+  if (rec)  // tape: one uint32 entry per contact in row order: pair | slot << 16
+    for (int i = lane; i < MAXCON; i += 32) {
+      unsigned entry = i < ncon ? (unsigned)s.con_pair[i] | (unsigned)s.con_slot[i] << TAPE_PAIR_BITS : TAPE_CON_NONE;
+      if (i < ncon && (entry == TAPE_CON_NONE || s.con_slot[i] >= TAPE_SLOT_CAPACITY)) {
+        asm volatile("trap;");
       }
-      __stcs(rec + OFF_CON + i, __uint_as_float(e0 | e1 << 16));
+      __stcs(rec + OFF_CON + i, __uint_as_float(entry));
     }
 }
 
