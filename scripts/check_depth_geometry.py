@@ -23,6 +23,43 @@ PROTOCOL = dict(raw_shape=[27, 48], fov_degrees=[87, 58], geom_groups=[0, 2],
                 image_gradient='stop gradient')
 
 
+
+def check_graphs(geometry, inputs):
+    import torch
+
+    def render(bp, bq, origins, directions):
+        return geometry.raycast(bp, bq, origins, directions)
+
+    buffers = [value.clone() for value in inputs]
+    compiled = torch.compile(render, fullgraph=True)
+    for _ in range(3):
+        render(*buffers)
+        compiled(*buffers)
+    torch.cuda.synchronize()
+    eager_graph, compiled_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(eager_graph):
+        captured_eager = render(*buffers)
+    with torch.cuda.graph(compiled_graph):
+        captured_compiled = compiled(*buffers)
+    rows = []
+    for variant in range(2):
+        changed = [value.roll(variant+1, dims=0).clone() for value in inputs]
+        changed[2][..., 2] += .017*(variant+1)
+        reference = render(*changed)
+        for target, source in zip(buffers, changed):
+            target.copy_(source)
+        eager_graph.replay()
+        compiled_graph.replay()
+        actual_compiled = compiled(*buffers)
+        for label, actual in [('cuda_graph', captured_eager),
+                              ('fullgraph_compile', actual_compiled),
+                              ('compiled_cuda_graph', captured_compiled)]:
+            rows.append(dict(mode=label, changed_input=variant,
+                ranges_equal=bool(torch.equal(actual[0], reference[0])),
+                geom_ids_equal=bool(torch.equal(actual[1], reference[1]))))
+    return dict(passed=all(row['ranges_equal'] and row['geom_ids_equal'] for row in rows), comparisons=rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', type=Path, required=True)
@@ -35,6 +72,7 @@ def main():
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--torch-reference-rays', type=int, default=32)
     parser.add_argument('--code-revision', required=True)
+    parser.add_argument('--check-graphs', action='store_true')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out/'protocol.json').write_text(json.dumps(dict(PROTOCOL, code_revision=args.code_revision,
@@ -106,6 +144,7 @@ def main():
         geometry.raycast(*benchmark_inputs)
         synchronize()
         durations.append(time.perf_counter()-begin)
+    graph_comparison = check_graphs(geometry, (body_positions, body_quaternions, origins, directions)) if args.check_graphs else None
     torch_comparison = None
     if args.torch_reference_rays:
         verification = DepthGeometry.from_model(model, device=args.device, backend='torch')
@@ -170,13 +209,16 @@ def main():
                   benchmark=dict(batch=args.benchmark_batch, raw_shape=[27, 48], warmup=args.warmup,
                       repeats=args.repeats, seconds=durations, median_seconds=float(np.median(durations)),
                       frames_per_second=float(args.benchmark_batch/np.median(durations))),
-                  torch_reference=torch_comparison,
+                  torch_reference=torch_comparison, graph_capture=graph_comparison,
                   render_seconds=seconds, rendered_frames=len(args.frames),
                   torch=torch.__version__, mujoco=mujoco.__version__,
+                  gpu=torch.cuda.get_device_name() if args.device.startswith('cuda') else None,
                   visible_geoms=len(geometry.geoms), code_revision=args.code_revision)
     result['terrain_coverage'] = any(row['terrain_pixels'] > 0 for row in rows)
     result['self_occlusion_coverage'] = any(row['self_occlusion_pixels'] > 0 for row in rows)
     result['passed'] = result['passed'] and result['terrain_coverage'] and result['self_occlusion_coverage']
+    if graph_comparison is not None:
+        result['passed'] = result['passed'] and graph_comparison['passed']
     if torch_comparison is not None:
         result['passed'] = result['passed'] and torch_comparison['hit_mismatches'] == 0 and torch_comparison['max_range_error_m'] <= PROTOCOL['range_atol_m']
     (args.out/'report.json').write_text(json.dumps(result, indent=2)+'\n')

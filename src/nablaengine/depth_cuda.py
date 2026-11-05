@@ -5,6 +5,7 @@ uses current body poses, and retains primitive surfaces and robot self occlusion
 The Python owner keeps packed GPU arrays and the compiled library alive together.
 """
 import ctypes
+import itertools
 import os
 import subprocess
 import tempfile
@@ -14,6 +15,9 @@ import numpy as np
 import torch
 
 from .cuda import nvcc
+
+
+_OPERATOR_IDS = itertools.count()
 
 
 SOURCE = r'''
@@ -204,9 +208,34 @@ class CudaDepthGeometry:
         self.launch.restype = ctypes.c_int
         self.launch.argtypes = ([ctypes.c_int]*4+[ctypes.c_void_p]*10+
                                 [ctypes.c_float]*2+[ctypes.c_int, ctypes.c_float]+[ctypes.c_void_p]*3)
+        # Register outside a compile trace. The closure owns this fixed model's
+        # library and packed arrays, with no mutable global model registry.
+        name = f'nablaengine::depth_rays_{next(_OPERATOR_IDS)}'
+        @torch.library.custom_op(name, mutates_args=())
+        def operation(bp: torch.Tensor, bq: torch.Tensor, origins: torch.Tensor,
+                      directions: torch.Tensor, maximum: float, minimum: float,
+                      hops: int, epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+            return self._raycast_impl(bp, bq, origins, directions, max_distance=maximum,
+                min_distance=minimum, max_hops=hops, surface_epsilon=epsilon)
+
+        @operation.register_fake
+        def fake(bp, bq, origins, directions, maximum, minimum, hops, epsilon):
+            return origins.new_empty(origins.shape[:-1]), origins.new_empty(origins.shape[:-1], dtype=torch.long)
+
+        self.operation = operation
 
     @torch.no_grad()
     def raycast(self, body_positions, body_quaternions, origins, directions,
+                *, max_distance, min_distance, max_hops, surface_epsilon):
+        if torch.compiler.is_compiling():
+            return self.operation(body_positions, body_quaternions, origins, directions,
+                                  max_distance, min_distance, max_hops, surface_epsilon)
+        return self._raycast_impl(body_positions, body_quaternions, origins, directions,
+            max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+            surface_epsilon=surface_epsilon)
+
+    @torch.no_grad()
+    def _raycast_impl(self, body_positions, body_quaternions, origins, directions,
                 *, max_distance, min_distance, max_hops, surface_epsilon):
         inputs = [body_positions, body_quaternions, origins, directions]
         if any(value.dtype != torch.float32 or value.device != self.geometry.device for value in inputs):
@@ -216,12 +245,13 @@ class CudaDepthGeometry:
         ids = torch.empty_like(distances, dtype=torch.long)
         arrays = [self.geometry, self.poses, self.sizes, self.bounds, self.nodes, self.triangles,
                   bp, bq, origin, direction]
-        stream = torch.cuda.current_stream(self.device)
-        error = self.launch(origins.shape[0], origins.shape[1], len(self.geometry), self.body_count,
-                            *[ctypes.c_void_p(value.data_ptr()) for value in arrays],
-                            max_distance, min_distance, max_hops, surface_epsilon,
-                            ctypes.c_void_p(distances.data_ptr()), ctypes.c_void_p(ids.data_ptr()),
-                            ctypes.c_void_p(stream.cuda_stream))
+        with torch.cuda.device(self.device):
+            stream = torch.cuda.current_stream(self.device)
+            error = self.launch(origins.shape[0], origins.shape[1], len(self.geometry), self.body_count,
+                                *[ctypes.c_void_p(value.data_ptr()) for value in arrays],
+                                max_distance, min_distance, max_hops, surface_epsilon,
+                                ctypes.c_void_p(distances.data_ptr()), ctypes.c_void_p(ids.data_ptr()),
+                                ctypes.c_void_p(stream.cuda_stream))
         if error:
             raise RuntimeError(f'CUDA depth ray launch failed with error {error}')
         return distances, ids

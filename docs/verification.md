@@ -232,6 +232,36 @@ of 1.25e-6 in generalized position and 1.43e-4 in generalized velocity, and maxi
 0.00233. The candidate remains experimental. The terrain-policy readings use the fixed incident-face engine
 revision linked above, with this optimization disabled.
 
+## Source-camera depth rays
+
+`scripts/check_depth_geometry.py` compares the native depth backend with MuJoCo `mj_ray` on the loaded visible
+model and recorded body states. It records pixel ranges, geom IDs, terrain hits, robot self occlusion and misses.
+The camera uses the source torso installation and full body rotation, 87x58-degree fields of view, 27x48 raw
+pixels, groups 0 and 2, and a 0.05-metre near-hit skip rule. Both implementations continue through near surfaces
+for up to 24 skips. Clipped image-plane depths are also compared. The declared range and clipped-depth absolute
+margins are both 0.0002 metres. Outputs, generated CUDA source and timing records stay in the requested fresh
+external directory.
+
+At [the native BVH revision](https://github.com/LingzheZhao/NablaEngine/tree/ee5510f), the six-terrain model contained
+513 visible CoACD hulls and 35 robot visual geoms. Four recorded source-motion states at frames 0, 190, 235 and 320
+covered terrain hits, self occlusion and misses. All 5,184 raw pixel queries matched MuJoCo's hit/miss decisions and
+geom IDs. Maximum metric-range error was 0.0000126621 metres, and maximum clipped image-plane depth error was
+0.0000122706 metres. The explicit Torch reference on 32 rays per frame had maximum range error 0.000002265 metres.
+The task requested an NVIDIA GeForce RTX 3090 and used PyTorch 2.13.0+cu129 and MuJoCo 3.17.0.
+
+Construction and CUDA compilation took 7.113 seconds. After three warmup calls, five 128-frame batches of 27x48
+images had median elapsed time 6.967 milliseconds, or 18,372 frames per second on that GPU workload. The first
+four-frame render took 18.640 milliseconds. These timings measure ray rendering with the fixed loaded geometry.
+
+An earlier model selected only 35 robot visual geoms because terrain hulls inherited an excluded geom group.
+Its comparisons therefore covered self occlusion and misses. The corrected scene explicitly places the source
+camera's visible CoACD hulls in group 0, following the source task's collision-hull visualization setting.
+
+Add `--check-graphs` to compare eager CUDA Graph capture, full-graph `torch.compile`, and compiled graph replay
+with eager rendering at two changed input states. Build the geometry before capture. The script separately records
+construction, first render and steady-state rendering, with `--benchmark-batch`, `--warmup` and `--repeats` fixing
+the timing conditions.
+
 ## Labels
 
 ### Forward-tape checks T1-T8 (`engine_step_check.py --tape`)

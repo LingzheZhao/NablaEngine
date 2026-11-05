@@ -76,6 +76,40 @@ calls are `torch.library` custom ops (`nablaengine::forward`, `nablaengine::back
 opaque nodes without graph breaks. In eager mode the same functions are called directly, without the custom ops'
 dispatch.
 
+## Depth rays bound to the model
+
+`nablaengine.depth_geometry.DepthGeometry` packs the loaded model's visible geometry once. The CUDA backend
+builds a triangle BVH for each compiled mesh and traces first-hit rays against mesh triangles, spheres, capsules,
+boxes and planes. Each call uses the supplied body positions and WXYZ quaternions, including robot self occlusion.
+Mesh vertices retain MuJoCo's compiled geom frame and use `geom_pos` and `geom_quat` once. Geometry groups and
+transparent geoms are selected at construction. The source camera uses groups 0 and 2, with CoACD terrain hulls
+in group 0 and robot visual meshes in group 2.
+
+```python
+from nablaengine.depth_geometry import DepthGeometry
+
+camera_geometry = DepthGeometry.from_model(model, device="cuda", groups=(0, 2))
+ranges, geom_ids = camera_geometry.raycast(
+    body_positions, body_quaternions, ray_origins, unit_ray_directions,
+    max_distance=1e6, min_distance=.05, max_hops=24,
+)
+```
+
+Body tensors have shapes `[B, nbody, 3]` and `[B, nbody, 4]`. World-space ray tensors both have shape `[B, pixels, 3]`.
+CUDA inputs are float32 on the construction device. Ranges are metres along each unit ray. Misses return
+`max_distance` with geom ID -1. Hits before `min_distance` advance the ray by the hit range plus `1e-5` metres and
+continue, up to `max_hops` skipped surfaces. Image-plane depth is the range multiplied by the unit ray's camera
+forward component. The source consumer applies the 27x48 camera intrinsics, torso installation pose, depth
+normalization, crop and resize.
+
+Ray observations use `torch.no_grad()`. A trainable image encoder can consume these observations with its own
+parameter gradients. CUDA construction compiles its library into a fresh `depth-rays-*` directory under
+`DK_CACHE_DIR`, or a system temporary directory when that variable is unset. Construct before tracing or capturing.
+Calls allocate through Torch and launch on the current CUDA stream. `torch.compile` uses an opaque `torch.library`
+operation with a fake implementation. Direct CUDA Graph capture and compiled graph replay are checked by
+`scripts/check_depth_geometry.py --check-graphs`. Select `backend="torch"` explicitly at construction for the
+verification implementation.
+
 ## Diagnostics
 
 Every forward and backward adds its counts (worlds at the solver's iteration limit, tape flags, rows with non-finite
