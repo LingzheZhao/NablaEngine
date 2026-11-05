@@ -166,8 +166,9 @@ The current capacity uses four 32-bit contact-mask tiles. Hessian accumulation k
 self contacts, in ascending tile order; DOF support masks and solver equations retain their definitions. For the
 mjlab G1 at 128 contacts, a tape record has 1600 float32 words (6400 bytes), including 18 zone words. Its
 8/10/6/8-bit header holds contact count, row count, limit count and iteration count. Each uint32 contact entry
-holds a uint16 candidate-pair index and uint16 slot; collision geom indices also use uint16 fields. Torch artifacts
-use version 4. Libraries must be rebuilt; earlier tape encodings are rejected.
+holds a uint16 candidate-pair index and uint16 slot. Collision geom indices also use uint16 fields. The physical
+tape encoding is version 4. Torch artifacts use version 5 and record the substep input-state offsets.
+Earlier artifact versions and tape encodings are rejected.
 [Capacity qualification](contact_capacity.md) separates the current sparse-contact check of 15,231 candidate pairs
 from the earlier dense 96-contact evidence. Dense 128-contact execution and original benchmark throughput at the
 current capacity remain unqualified.

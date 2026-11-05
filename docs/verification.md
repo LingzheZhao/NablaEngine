@@ -188,8 +188,8 @@ face. Continuous clipping parameters and the original surface-edge offset retain
 geometry and invalid slots propagate through the forward status and stop unsupported backward replay.
 
 Tape records use a uint32 contact entry: a 16-bit candidate-pair index and a 16-bit slot field. The reserved
-word identifies format 4, and Torch artifacts declare version 4 and the matching encoding. Current primitives
-use slots 0 through 7; the unused-contact sentinel is `0xffffffff`. Pair constants store two uint16 geom indices
+word identifies physical tape format 4. Current Torch artifacts declare version 5, the matching tape encoding,
+and the substep input-state offsets. Current primitives use slots 0 through 7. The unused-contact sentinel is `0xffffffff`. Pair constants store two uint16 geom indices
 in `c_pgeom` and parameter-set, dimension and flags in `c_pword`. The encoding supports 65,536 candidate pairs
 and collision geoms, with 256 parameter sets. The header holds ncon/nefc/nlim/niter in 8/10/6/8 bits.
 The default active-contact capacity is 128 and constraint-row capacity 576, covering 128 condim-3 contacts,

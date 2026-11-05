@@ -29,7 +29,7 @@ python -m nablaengine.torch_ffi build                      # the first GPU's arc
 python -m nablaengine.torch_ffi build --arch sm_90 --arch sm_120   # or named ones (no GPU needed; nvcc must support them: sm_120 needs CUDA 12.8)
 ```
 
-This needs mujoco 3.17 and nvcc (a CUDA 12.x toolkit) and writes `libdk_g1_torch_<arch>_<key>.so` (the CUDA runtime
+This needs mujoco 3.17 and nvcc (a CUDA 12.x toolkit) and writes `libdk_g1_torch_v5_<arch>_<key>.so` (the CUDA runtime
 linked statically; the units of the JAX library without its XLA FFI unit, so the kernels are the same), the packed
 model constants (`.npy`) and the model facts (`.json`), and makes it the architecture's current artifact. A process
 that only runs the interface needs PyTorch, NumPy and the NVIDIA driver: `init()` loads the artifact with ctypes and
@@ -37,6 +37,10 @@ imports no JAX and no mujoco and calls no nvcc (an artifact built elsewhere: cop
 `DK_TORCH_ARTIFACT` to its `.json`). The artifact records a hash of the package sources it was generated from; after
 an update of the package `init()` rebuilds it where mujoco and nvcc are available and refuses it otherwise. Without
 any artifact, `init()` builds one first.
+
+The current artifact version is 5. Its metadata records physical tape encoding 4 and the qpos/qvel offsets used
+by `read_substep_inputs`. The library, constants and metadata share the versioned cache stem
+`libdk_g1_torch_v5_<arch>_<key>`. `init()` rejects earlier artifact versions.
 
 On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUDA 12.6 wheels
 (`--index-url https://download.pytorch.org/whl/cu126`); the CUDA 12.8 and 12.9 wheels start at sm_75.
@@ -54,6 +58,7 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 | `diagnostics(device=None)`, `read_diagnostics(device=None, reset=True)` | `diagnostics`, `read_diagnostics` | the counters of `jax_ffi.DIAG`, kept per device (below) |
 | `set_diagnostics(enabled)` | | the counters on (default) or off; returns the previous setting |
 | `tape_bytes(nworld, substeps=4, steps=1)` | `tape_bytes` | |
+| `read_substep_inputs(tape, substeps=4)` | | read-only qpos/qvel views shaped `(B, substeps, nq/nv)` at each substep input, using the loaded artifact's layout |
 
 Every tensor is float32, contiguous and on one CUDA device, with the worlds as the leading dimension; another dtype,
 device, layout or shape raises `TypeError` (nothing is cast or copied). Every call runs on PyTorch's current CUDA

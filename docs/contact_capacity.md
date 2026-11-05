@@ -3,14 +3,15 @@
 The current default is 128 active contacts and 576 constraint rows. Candidate pairs and collision geoms have
 16-bit indices, independently of the active-contact capacity. The row allocation covers 128 condim-3 contacts,
 35 dof frictionloss rows and 29 hinge-limit rows. Tape format 4 uses uint32 contact entries and an 8/10/6/8-bit
-count header; Torch artifacts use version 4. Current primitives emit slots 0 through 7.
+count header. Current Torch artifacts use version 5 and record substep input-state offsets. Current primitives
+emit slots 0 through 7.
 
 ## Current sparse-contact candidate-index check
 
 At the [qualified implementation](https://github.com/LingzheZhao/NablaEngine/tree/41c820ae0b9ee9533f2625e2a1e7b2f5270d6167),
 `scripts/check_pair_capacity.py` passed all three generated model conditions on an NVIDIA GeForce RTX 3090,
-with MuJoCo 3.17.0, NumPy 2.5.1 and PyTorch 2.13.0+cu129. Each condition ran one and four controls, with four
-substeps per control and a 50-iteration Newton cap, starting at the script's `qpos0_asymmetric_contact` state
+with MuJoCo 3.17.0, NumPy 2.5.1 and PyTorch 2.13.0+cu129. That reading used Torch artifact version 4 and
+physical tape encoding 4. Each condition ran one and four controls, with four substeps per control and a 50-iteration Newton cap, starting at the script's `qpos0_asymmetric_contact` state
 with foot friction 1 and zero torso COM offset. Both horizons passed forward comparison with MuJoCo and all nine
 directional-gradient conditions, using double-precision MuJoCo finite differences at steps 1e-5 and 5e-6.
 Forward position/velocity margins are 2e-4/2e-2; gradient margins are atol 0.003 and rtol 0.03.
