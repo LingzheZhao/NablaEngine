@@ -1,4 +1,4 @@
-"""Run upstream terrain0 CoACD functions verbatim from a fixed inspected checkout.
+"""Run upstream selected-terrain CoACD functions verbatim from a fixed inspected checkout.
 Outputs are new directories only. Surface errors are sampled diagnostics, not equivalence proofs.
 """
 
@@ -12,6 +12,11 @@ def main():
     p.add_argument("--upstream", required=True)
     p.add_argument("--dataset", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--metadata", help="Released metadata YAML, required with --terrain-index")
+    selection = p.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--terrain-index", type=int)
+    selection.add_argument("--terrain-file", help="Terrain STL path relative to --dataset")
+    p.add_argument("--artifact-id", required=True)
     p.add_argument("--upstream-revision", required=True)
     p.add_argument("--prepare-only", action="store_true")
     p.add_argument("--wrapper-smoke", action="store_true")
@@ -101,10 +106,22 @@ def main():
         use_input_origin_frame=True,
     )
     c = types.SimpleNamespace(**cfg)
-    source = (
-        pathlib.Path(a.dataset)
-        / "20251106_diveroll4_simpleLab_noWall/simplelab_enlarged_noWall.stl"
-    )
+    terrain_file = a.terrain_file
+    if a.terrain_index is not None:
+        if not a.metadata:
+            p.error("--terrain-index requires --metadata")
+        import yaml
+        metadata = yaml.safe_load(pathlib.Path(a.metadata).read_text())
+        selected = [t for t in metadata["terrains"] if t["terrain_id"] == a.terrain_index]
+        if len(selected) != 1:
+            raise ValueError("Terrain ID must select exactly one metadata entry")
+        terrain_file = selected[0]["terrain_file"]
+    source = pathlib.Path(a.dataset) / terrain_file
+    status.update(artifact_id=a.artifact_id, terrain_file=terrain_file,
+                  terrain_index=a.terrain_index, source=str(source),
+                  frame={"input_to_world_translation_m": [15.0, 8.0, 0.0],
+                         "coacd_z_alignment_applies_to": "collision hulls only"})
+    write_status()
     mesh, border = ns["_load_motion_matched_terrain_mesh"](
         str(source), str(source), (30, 16), True, True
     )
@@ -137,9 +154,11 @@ def main():
             Mesh=coacd.Mesh, set_log_level=coacd.set_log_level, run_coacd=fake_run_coacd
         )
         status["synthetic_hulls_only"] = True
-    parts = ns["_run_coacd_decomposition"](mesh, kw, "terrain0", "off")
+    parts = ns["_run_coacd_decomposition"](mesh, kw, f"terrain{a.terrain_index}", "off")
     z = ns["_compute_coacd_auto_align_z"](c, mesh, parts)
     report = dict(
+        artifact_id=a.artifact_id, terrain_file=terrain_file, terrain_index=a.terrain_index,
+        frame=status["frame"],
         config=cfg,
         requested_kwargs=kw,
         effective_kwargs=ns["_adapt_coacd_kwargs_for_mesh"](kw, mesh),
