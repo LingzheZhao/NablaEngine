@@ -597,7 +597,7 @@ __device__ void mv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i
         depth += (primitives[stop] == '{') - (primitives[stop] == '}')
         stop += 1
     frame = primitives[start:stop].replace('float', 'BoxDual')
-    frame = frame.replace('dot3_rn(n, b)', 'dot3(n, b)').replace('RFMS(n[k], d, b[k])', '(n[k]*d-b[k])').replace('normalize3_rn(b);', 'BoxDual norm=sqrtf(dot3(b,b)); for(int k=0;k<3;k++) b[k]=b[k]/norm;').replace('cross_rn(n, b, c);', 'c[0]=n[1]*b[2]-n[2]*b[1]; c[1]=n[2]*b[0]-n[0]*b[2]; c[2]=n[0]*b[1]-n[1]*b[0];')
+    frame = frame.replace('dot3_rn(n, b)', 'dot3(n, b)').replace('RFMS(n[k], d, b[k])', '(b[k]-n[k]*d)').replace('normalize3_rn(b);', 'BoxDual norm=sqrtf(dot3(b,b)); for(int k=0;k<3;k++) b[k]=b[k]/norm;').replace('cross_rn(n, b, c);', 'c[0]=n[1]*b[2]-n[2]*b[1]; c[1]=n[2]*b[0]-n[0]*b[2]; c[2]=n[0]*b[1]-n[1]*b[0];')
     wrapper = r'''
 __device__ bool static_box_capsule_vjp(int slot,const float*cp,const float*axis,float radius,float half_length,
  const float*bp,const float*R,const float*bs,const float*cot,float*gb){
