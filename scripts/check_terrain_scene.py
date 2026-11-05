@@ -3,11 +3,13 @@
 All geometry comes from the model's checked packed hull representation. The
 reference is a current prepare_instinct_motion output directory. World transforms,
 terrain identities and explicit foot-pair bindings are checked before screening.
-No reference pose or joint is modified. Static geometry screening records every
+Reference poses and joints retain their source values. Static geometry screening records every
 selected frame, including centerline intersections and absent foot proximity.
 
 Run full-reference screening on provisioned compute. Output requires a fresh
 external directory. The small --self-test uses generated cube geometry only.
+Add --execute, --sensor DIRECTORY and explicit --frames to run whole-step GPU
+VJPs, physical reference comparisons, continuous chains and a native SGD update.
 """
 import argparse
 import json
@@ -210,7 +212,11 @@ def screen(args, report, out):
     near = (distance <= PROTOCOL['near_support_distance_m']) & ~intersects
     report.update(scene_contract=contract, reference_artifact_id=motion_contract['artifact_id'],
                   reference_path=str(args.reference), motion=args.motion, frames=frames.tolist(),
-                  capability=validation.to_dict(), centerline_invalid_frames=int(intersects.any(axis=1).sum()),
+                  capability=validation.to_dict(), selected_frame_count=len(frames),
+                  centerline_invalid_frames=int(intersects.any(axis=1).sum()),
+                  centerline_invalid_fraction=float(intersects.any(axis=1).mean()),
+                  terrain_pair_bindings=[dict(pair=p, robot_geom=model.geom(r).name, hull_geom=model.geom(h).name)
+                                         for p, r, h in pairs],
                   foot_contact_candidate_frames=int(contact[:, foot].any(axis=1).sum()),
                   foot_near_support_frames=int(near[:, foot].any(axis=1).sum()), rows=[])
     for index, frame in enumerate(frames):
