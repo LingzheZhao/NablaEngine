@@ -54,7 +54,9 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
     edge_scale=torch.stack([torch.linalg.vector_norm(tri[:,1]-tri[:,0],dim=1),
                             torch.linalg.vector_norm(tri[:,2]-tri[:,1],dim=1),
                             torch.linalg.vector_norm(tri[:,0]-tri[:,2],dim=1)]).amax(0)
-    if bool((norm <= tolerance*edge_scale).any()):
+    # Face validity uses relative floating-point resolution, not the query
+    # distance tolerance: real hulls can contain thin but resolvable triangles.
+    if bool((norm <= torch.finfo(center.dtype).eps*edge_scale.square()).any()):
         raise ValueError('degenerate hull face')
     n = n/norm[:,None]
     centroid=vertices.mean(0)
@@ -104,7 +106,7 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
                     t=(torch.dot(delta,a+edge*u-p)/dd).clamp(0,1)
                     add(t,a+edge*u,('vertex',i,j,int(float(u))))
                 de=torch.dot(delta,edge);cross_de=torch.linalg.cross(delta,edge);det=torch.dot(cross_de,cross_de)
-                if float(det.detach())>tolerance*tolerance*max(float(dd.detach()),float(ee.detach())):
+                if float(det.detach())>0:
                     dw=torch.dot(delta,w);ew=torch.dot(edge,w)
                     t=torch.dot(torch.linalg.cross(-w,edge),cross_de)/det
                     u=torch.dot(torch.linalg.cross(-w,delta),cross_de)/det
