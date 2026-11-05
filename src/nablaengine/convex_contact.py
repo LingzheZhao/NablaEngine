@@ -34,6 +34,17 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
         raise ValueError('expected triangulated closed convex hull')
     if float(half_length) < 0 or float(radius) <= 0 or abs(float(torch.linalg.vector_norm(axis).detach())-1) > 1e-6:
         raise ValueError('positive radius, nonnegative length and unit axis required')
+    if not bool(torch.isfinite(center).all() and torch.isfinite(axis).all() and torch.isfinite(vertices).all()):
+        raise ValueError('finite geometry required')
+    if faces.dtype not in (torch.int32, torch.int64) or int(faces.min()) < 0 or int(faces.max()) >= len(vertices):
+        raise ValueError('valid integer triangle indices required')
+    edges = {}
+    for face in faces.detach().cpu().tolist():
+        for a, b in zip(face, face[1:] + face[:1]):
+            edge = tuple(sorted((a, b)))
+            edges[edge] = edges.get(edge, 0) + 1
+    if any(count != 2 for count in edges.values()):
+        raise ValueError('closed two-manifold triangle topology required')
     tri = vertices[faces]
     n = torch.linalg.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0])
     norm = torch.linalg.vector_norm(n,dim=1)
