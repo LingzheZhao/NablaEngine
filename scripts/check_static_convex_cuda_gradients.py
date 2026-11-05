@@ -262,7 +262,7 @@ def run_hull(vertices, faces, directory, stream, selected_cases=None):
             elif row['status'] != 1:
                 row['passed'] = False
             else:
-                oracle = MujocoOracle(vertices, faces, case)
+                oracle = MujocoOracle(vertices, faces, case, explicit_pair=case.get('compare_manifold', False))
                 distance, witness = oracle.distance(case)
                 row.update(value=values[index].tolist(), jacobian=jacobians[index].tolist(),
                            oracle_distance=distance, oracle_witness=witness,

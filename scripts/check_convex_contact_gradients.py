@@ -109,7 +109,7 @@ def cases(v, f):
 
 
 class MujocoOracle:
-    def __init__(self, vertices, faces, case):
+    def __init__(self, vertices, faces, case, *, explicit_pair=False):
         import mujoco
         from scipy.spatial.transform import Rotation
         self.mj = mujoco
@@ -123,7 +123,9 @@ class MujocoOracle:
                f'<mesh name="h" vertex="{fmt(vertices)}" face="{fmt(faces)}"/></asset><worldbody>'
                f'<geom name="terrain" type="mesh" mesh="h" pos="{fmt(p)}" quat="{fmt(quat)}"/>'
                f'<body mocap="true"><geom name="robot" type="{kind}" size="{fmt(size)}"/></body>'
-               '</worldbody></mujoco>')
+               '</worldbody>'
+               + ('<contact><pair geom1="robot" geom2="terrain"/></contact>' if explicit_pair else '')
+               + '</mujoco>')
         self.model = mujoco.MjModel.from_xml_string(xml); self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
         self.h = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'terrain')
