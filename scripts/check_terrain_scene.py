@@ -256,6 +256,8 @@ def execute(args, context, report, out):
     model, foot_pairs = context['model'], context['foot_pairs']
     qpos, qvel, frames = context['qpos'], context['qvel'], context['frames']
     sensor_contract = json.loads((args.sensor/'contract.json').read_text())
+    if sensor_contract['format'] != 'nablamimic-convex-terrain-v1':
+        raise ValueError('Current convex-terrain sensor format required')
     if sensor_contract['artifact_id'] != context['contract']['terrain_artifact_id']:
         raise ValueError('Physical terrain and height sensor artifact identities differ')
     sensor_data = np.load(args.sensor/'terrain.npz', allow_pickle=False)
@@ -458,7 +460,7 @@ def execute(args, context, report, out):
         after, after_scan = loss()
         diagnostics = F.read_diagnostics(reset=True)
         strict = all(diagnostics[key] == 0 for key in ('fwd_unsupported_worlds', 'nonfinite_rows', 'replay_mismatch_worlds',
-                                                       'fwd_contact_overflow_worlds', 'fwd_row_overflow_worlds', 'nonconv_records'))
+                                                       'fwd_contact_overflow_worlds', 'fwd_row_overflow_worlds', 'nonconv_records', 'singular_records'))
         update.update(loss_before=float(before.detach()), loss_after=float(after.detach()),
                       gradient_norm=float(gradient.norm()), parameter_change_norm=float(parameter.detach().norm()),
                       scan_min_m=float(scan.min()), scan_max_m=float(scan.max()), diagnostics=diagnostics,
