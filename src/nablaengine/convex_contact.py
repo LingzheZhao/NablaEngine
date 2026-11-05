@@ -107,6 +107,17 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
                         add(t,a+edge*u,('edge-interior',i,j))
     if not candidates: raise UnsupportedContact('no external closest feature')
     _,c,q,t,feature=min(candidates,key=lambda item:float(item[0].detach()))
+    # Equal distances can describe a continuum of physically different contact
+    # points (e.g. a spine parallel to a face), not just duplicate triangles.
+    # Do not assign an arbitrary point VJP to that set-valued witness.
+    best_distance=float(torch.linalg.vector_norm(q-c).detach())
+    witness_tolerance=max(tolerance,32*torch.finfo(center.dtype).eps*max(1.,best_distance))
+    for squared,other_c,other_q,_,_ in candidates:
+        other_distance=float(torch.sqrt(squared).detach())
+        if abs(other_distance-best_distance)<=witness_tolerance:
+            if max(float(torch.linalg.vector_norm(other_c-c).detach()),
+                   float(torch.linalg.vector_norm(other_q-q).detach()))>witness_tolerance:
+                raise UnsupportedContact('nonunique closest witness: contact-point VJP is undefined')
     distance=torch.linalg.vector_norm(q-c)
     if float(distance.detach())<=tolerance:
         raise UnsupportedContact('zero-distance centerline witness')
