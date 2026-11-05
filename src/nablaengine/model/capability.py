@@ -62,7 +62,7 @@ DISABLE_OK_NO_BOX = (D.mjDSBL_NATIVECCD, D.mjDSBL_MULTICCD)
 # disable flags of physics a supported model does not have, so they change nothing: springs and dampers (every
 # stiffness and damping field must be at its default 0: H22 and the default-kind fields; no tendons or flexes: H25),
 # equality constraints (neq 0: H25); frictionloss and joint limits only where no dof has frictionloss and no joint a limit
-DISABLE_NOOP = (D.mjDSBL_SPRING, D.mjDSBL_DAMPER, D.mjDSBL_EQUALITY)
+DISABLE_NOOP = (D.mjDSBL_SPRING, D.mjDSBL_EQUALITY)
 ENABLE_OK = (E.mjENBL_ENERGY, E.mjENBL_FWDINV, E.mjENBL_INVDISCRETE)  # diagnostics / inverse dynamics only
 STATUSES = ("error", "warn", "info", "ok")
 CTRLSPEC_OK = (0, int(mujoco.mjtCtrlInput.mjINPUT_POS))  # a fixed gain's input: the type default, or a position
@@ -368,7 +368,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H24a", m.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON, "error", "Newton solver",
         mujoco.mjtSolver(int(m.opt.solver)).name)
     has_box = any(m.geom_type[g] == G.mjGEOM_BOX for g in cg)
-    noop = DISABLE_NOOP + ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
+    noop = DISABLE_NOOP + ((D.mjDSBL_DAMPER,) if not np.any(m.dof_damping) else ()) + ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
         (D.mjDSBL_LIMIT,) if not np.asarray(m.jnt_limited).any() else ())
     dis = int(m.opt.disableflags) & ~_mask(DISABLE_OK + noop + (() if has_box else DISABLE_OK_NO_BOX))
     en = int(m.opt.enableflags) & ~_mask(ENABLE_OK)
