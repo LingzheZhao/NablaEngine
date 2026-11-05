@@ -62,8 +62,9 @@ def check_model(m):
     """The contact adjoint is for the mjlab model only: collision geoms are planes, spheres and capsules
     (no boxes), and no dof has a frictionloss row."""
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
-    assert int(mujoco.mjtGeom.mjGEOM_BOX) not in types, "the adjoint has no box collisions (mjlab model only)"
-    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2}, "collision geoms other than plane / sphere / capsule"
+    from nablaengine.model.capability import unsupported_adjoint_box_pairs
+    assert not unsupported_adjoint_box_pairs(m), "box VJP requires world-static box paired with sphere/capsule"
+    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2, 3}, "unsupported contact geometry"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
     assert not (m.dof_frictionloss > 0).any(), "the adjoint has no frictionloss rows (mjlab model only)"
@@ -86,7 +87,7 @@ def header(m):
 #ifndef DK_ADJ_PARALLEL_EPS
 #define DK_ADJ_PARALLEL_EPS 1.2e-3f  // sin^2(theta) = |a1 x a2|^2 / (|a1|^2 |a2|^2) of DK_ADJ_PARALLEL 1 (strict <):
 #endif                               // ~sin^2(2 degrees) (theta < 1.99 degrees)
-static_assert(!HAS_BOX && NFLOSS == 0, "the contact adjoint is for the mjlab model: no boxes, no frictionloss rows");
+static_assert(NFLOSS == 0, "the contact adjoint is for the mjlab model: no boxes, no frictionloss rows");
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free
@@ -320,6 +321,12 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
   if (cot)
     for (int k = 0; k < 12; k++) gb[k] = 0.f;
 #if HAS_BOX
+  if (t1 == 1 && t2 == 3) {
+    float rotation[9], normal[3]; quat2mat(q2,rotation);
+    sphere_box(p1,sz1[0],p2,rotation,sz2,dist,pos,normal); make_frame(normal,fr);
+    if(cot) static_box_sphere_vjp(p1,sz1[0],p2,rotation,sz2,cot,gb);
+    return br;
+  }
   if (t1 == 2 && t2 == 3) { // capsule against a static world box; host gate enforces topology
     float axis[3], rotation[9];
     zaxis_rn(q1, axis);
@@ -608,6 +615,13 @@ __device__ void mv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i
     frame = primitives[start:stop].replace('float', 'BoxDual')
     frame = frame.replace('dot3_rn(n, b)', 'dot3(n, b)').replace('RFMS(n[k], d, b[k])', '(b[k]-n[k]*d)').replace('normalize3_rn(b);', 'BoxDual norm=sqrtf(dot3(b,b)); for(int k=0;k<3;k++) b[k]=b[k]/norm;').replace('cross_rn(n, b, c);', 'c[0]=n[1]*b[2]-n[2]*b[1]; c[1]=n[2]*b[0]-n[0]*b[2]; c[2]=n[0]*b[1]-n[1]*b[0];')
     wrapper = r'''
+__device__ void static_box_sphere_vjp(const float*cp,float radius,const float*bp,const float*R,const float*bs,const float*cot,float*gb){
+ BoxDual p[3],b[3],rot[9],size[3],dist,pos[3],n[3],fr[9];
+ for(int k=0;k<3;k++){p[k]=cp[k];p[k].d[k]=1.f;b[k]=bp[k];size[k]=bs[k];}
+ for(int k=0;k<9;k++)rot[k]=R[k];
+ dual_sphere_box(p,BoxDual(radius),b,rot,size,&dist,pos,n);make_frame(n,fr);
+ for(int j=0;j<6;j++){gb[j]=cot[0]*dist.d[j];for(int k=0;k<3;k++)gb[j]+=cot[1+k]*pos[k].d[j];for(int k=0;k<9;k++)gb[j]+=cot[4+k]*fr[k].d[j];}
+}
 __device__ bool static_box_capsule_vjp(int slot,const float*cp,const float*axis,float radius,float half_length,
  const float*bp,const float*R,const float*bs,const float*cot,float*gb){
  BoxDual p[3],a[3],b[3],rot[9],size[3],dist,pos[3],fr[9];
