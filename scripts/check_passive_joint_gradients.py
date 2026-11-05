@@ -26,6 +26,7 @@ def main():
     subprocess.run=passive_launch
 
     parser=argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--epsilon-diagnostic",action="store_true")
     parser.add_argument("--passive-damping",type=float,default=.5)
     parser.add_argument("--passive-frictionloss",type=float,default=.1)
     selected,remaining=parser.parse_known_args()
@@ -43,7 +44,8 @@ def main():
         units, constants, defines = generate(*args, **kwargs)
         return {name:'#define DK_CONVEX_AABB 0\n'+source for name,source in units.items()},constants,defines
     jax_ffi.library_sources = passive_sources
-    runpy.run_path(str(Path(__file__).with_name('check_box_step_gradients.py')),run_name='__main__')
+    target="diagnose_box_step_gradient_epsilon.py" if selected.epsilon_diagnostic else "check_box_step_gradients.py"
+    runpy.run_path(str(Path(__file__).with_name(target)),run_name="__main__")
 
 
 if __name__ == '__main__':
