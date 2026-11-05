@@ -15,6 +15,8 @@ def main():
     parser.add_argument('--scene',type=Path,required=True)
     parser.add_argument('--execution',type=Path,required=True)
     parser.add_argument('--substep',type=int,required=True)
+    parser.add_argument('--qualification-report',type=Path)
+    parser.add_argument('--direction-index',type=int,default=0)
     parser.add_argument('--out',type=Path,required=True)
     args=parser.parse_args();args.out.mkdir(parents=True,exist_ok=False)
     os.environ['DK_CACHE_DIR']=str(args.out/'build')
@@ -51,6 +53,38 @@ def main():
                 mujoco_force_rhs=(data.qfrc_smooth+data.qfrc_constraint).tolist(),
                 mujoco_solver_residual=(mass@data.qacc-data.qfrc_smooth-data.qfrc_constraint).tolist(),
                 native_next_qvel=result[1].cpu().numpy().tolist(),mujoco_next_qvel=data.qvel.tolist())
+    if args.qualification_report:
+        qualification=json.loads(args.qualification_report.read_text())
+        selected=qualification['directions'][args.direction_index]
+        direction=np.asarray(selected['direction'],dtype=np.float64)
+        cq=np.asarray(qualification['terminal_cotangent']['qpos'])
+        cv=np.asarray(qualification['terminal_cotangent']['qvel'])
+        report['finite_differences']=[]
+        report['direction']=selected
+        for epsilon in [1e-3,5e-4,1e-4,5e-5,1e-5,5e-6]:
+            trials=[]
+            for sign in [-1,1]:
+                qi=q.astype(np.float64).copy();vi=v.astype(np.float64).copy();ui=ctrl.astype(np.float64).copy()
+                if selected['block']=='qpos_tangent':mujoco.mj_integratePos(model,qi,direction,sign*epsilon)
+                elif selected['block']=='qvel':vi+=sign*epsilon*direction
+                elif selected['block']=='ctrl':ui+=sign*epsilon*direction
+                else:raise ValueError('unsupported diagnostic direction block')
+                # Both solvers consume exactly the same rounded physical packet.
+                qi=qi.astype(np.float32);vi=vi.astype(np.float32);ui=ui.astype(np.float32)
+                native=engine.forward(tensor(qi),tensor(vi),tensor(warm),tensor(ui),torch.ones(1,device='cuda'),
+                                      torch.zeros((1,3),device='cuda'),iterations=int(model.opt.iterations),substeps=1,tape=True)
+                torch.cuda.synchronize()
+                md=mujoco.MjData(model);md.qpos[:]=qi;md.qvel[:]=vi;md.ctrl[:]=ui;md.qacc_warmstart[:]=warm
+                mujoco.mj_step(model,md)
+                nq=native[0].cpu().numpy()[0];nv=native[1].cpu().numpy()[0]
+                flags=tape.decode(native[4].cpu().numpy().reshape(1,-1),model)['flags'].tolist()
+                trials.append(dict(sign=sign,input_qpos=qi.tolist(),input_qvel=vi.tolist(),input_ctrl=ui.tolist(),
+                                   native_qpos=nq.tolist(),native_qvel=nv.tolist(),native_flags=flags,
+                                   mujoco_qpos=md.qpos.tolist(),mujoco_qvel=md.qvel.tolist(),
+                                   native_objective=float(nq@cq+nv@cv),mujoco_objective=float(md.qpos@cq+md.qvel@cv)))
+            report['finite_differences'].append(dict(epsilon=epsilon,trials=trials,
+                native=(trials[1]['native_objective']-trials[0]['native_objective'])/(2*epsilon),
+                mujoco=(trials[1]['mujoco_objective']-trials[0]['mujoco_objective'])/(2*epsilon)))
     (args.out/'report.json').write_text(json.dumps(report,indent=2))
 
 
