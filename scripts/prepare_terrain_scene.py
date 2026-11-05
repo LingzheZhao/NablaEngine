@@ -203,7 +203,7 @@ def main():
         hull_face_counts=hull_face_counts,
         floor="Fixture plane and its pairs removed. Upstream motion_matched_terrain uses STL floor through CoACD hulls. Robot self pairs retained.",
         verification=dict(robot_field_max_errors=robot_error, hull_world_vertex_max_errors_m=frame_errors,
-                          capability_scopes=list(reports), generated_forward_source_bytes=len(forward_source),
+                          capability_scopes=list(reports), generated_forward_header_bytes=len(forward_source),
                           generated_adjoint_source_bytes=len(adjoint_source), adjoint_constants_created=True, physics_qualified=False),
     )
     mujoco.mj_saveModel(model, str(args.output / "model.mjb"))
