@@ -327,6 +327,20 @@ extern "C" int @PFX@_forward_measurements(cudaStream_t st, int nw, const float* 
   return (int)cudaGetLastError();
 #endif
 }
+extern "C" int @PFX@_forward_all_contact_measurements(cudaStream_t st, int nw, const float* qpos, const float* qvel,
+                           const float* warm, const float* ctrl, const float* fric, const float* com,
+                           int iterations, int nsub, float* oq, float* ov, float* ow, int* info, float* ocon,
+                           float* tape, void* work, float* wrench, int* count, float* actuator, int* sample_info, float* all_wrench, int* all_count) {
+#if DK_SPLIT
+  return (int)dk_forward_split(st, nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub, oq, ov, ow, info,
+                               ocon, tape, work, sizeof(SimP), sizeof(SimN), wrench, count, actuator, sample_info, all_wrench, all_count);
+#else
+  (void)work;
+  k_substep<<<nw, 32, sizeof(Sim), st>>>(nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub,
+                                      oq, ov, ow, info, ocon, tape, wrench, count, actuator, sample_info, all_wrench, all_count);
+  return (int)cudaGetLastError();
+#endif
+}
 // the kinematics outputs of a state (g1_engine.kinematics.KIN_DEVICE), and their VJP (gq_in / gv_in: null, or
 // added to the result last)
 extern "C" int @PFX@_kinematics(cudaStream_t st, int nw, const float* qpos, const float* qvel, const float* com,

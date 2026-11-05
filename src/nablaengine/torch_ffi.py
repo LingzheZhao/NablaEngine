@@ -61,6 +61,8 @@ OVERFLOW_CONTACTS, OVERFLOW_ROWS = 4, 16  # forward info[:, 3] bits: contacts / 
 _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # set_overflow_warnings
 NONFINITE_QPOS, NONFINITE_QVEL, NONFINITE_CTRL, NONFINITE_COT, NONFINITE_SHIFT = 1, 2, 4, 8, 16
 VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint builds (clamp_kv, normal)
+MEASUREMENT_FIELDS = ("terrain_wrench", "terrain_contact_count", "actuator_torque", "substep_info",
+                      "all_contact_wrench", "all_contact_count")
 FWD_UNIT = "dk_fwd"
 ARTIFACT_VERSION = 4
 TAPE_ENCODING = dict(contact_bits=32, pair_bits=16, slot_capacity=8, header_bits=[8, 10, 6, 8], format_marker=0x4E540410)
@@ -341,9 +343,9 @@ def _bind(lib, info):
     fns = dict(forward=getattr(lib, f"{fwd}_forward"), work_bytes=getattr(lib, f"{fwd}_work_bytes"),
                kin=getattr(lib, f"{fwd}_kinematics"), kin_vjp=getattr(lib, f"{fwd}_kinematics_vjp"))
     fns["forward"].argtypes = [vp, i32] + [vp] * 6 + [i32, i32] + [vp] * 7
-    fns["forward_measurements"] = getattr(lib, f"{fwd}_forward_measurements", None)
+    fns["forward_measurements"] = getattr(lib, f"{fwd}_forward_all_contact_measurements", None)
     if fns["forward_measurements"] is not None:
-        fns["forward_measurements"].argtypes = fns["forward"].argtypes + [vp] * 4
+        fns["forward_measurements"].argtypes = fns["forward"].argtypes + [vp] * 6
     fns["work_bytes"].argtypes, fns["work_bytes"].restype = [i32], ctypes.c_longlong
     fns["kin"].argtypes = [vp, i32] + [vp] * 8
     fns["kin_vjp"].argtypes = [vp, i32] + [vp] * 12
@@ -487,7 +489,9 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, t
         measured = [torch.empty((B, substeps, nb, 6), **kw),
                     torch.empty((B, substeps, nb), dtype=torch.int32, device=qpos.device),
                     torch.empty((B, substeps, nv-6), **kw),
-                    torch.empty((B, substeps, 4), dtype=torch.int32, device=qpos.device)]
+                    torch.empty((B, substeps, 4), dtype=torch.int32, device=qpos.device),
+                    torch.empty((B, substeps, nb, 6), **kw),
+                    torch.empty((B, substeps, nb), dtype=torch.int32, device=qpos.device)]
     if B == 0:
         return [q1, v1, w1, info, tp] + kin + measured
     fns = _STATE["fns"]
@@ -595,7 +599,8 @@ def _kinematics_backward_impl(qpos, qvel, com, g_qpos_n, g_xpos, g_xquat, g_cvel
 
 
 _OPS = {}
-_IMPL = dict(forward=lambda *a: _forward_impl(*a), backward=lambda *a: _backward_impl(*a),
+_IMPL = dict(forward=lambda *a: _forward_impl(*a),
+             forward_measurements=lambda *a: _forward_impl(*a, measurements=True), backward=lambda *a: _backward_impl(*a),
              kinematics=lambda *a: _kinematics_impl(*a), kinematics_backward=lambda *a: _kinematics_backward_impl(*a))
 
 
@@ -633,18 +638,22 @@ def _custom_ops():
 
     @torch.library.custom_op("nablaengine::forward_measurements", mutates_args=())
     def measured_op(qpos: Tensor, qvel: Tensor, warm: Tensor, ctrl: Tensor, friction: Tensor, com: Tensor,
-                    iterations: int, substeps: int, tape: bool) -> List[Tensor]:
-        return _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, False, True)
+                    iterations: int, substeps: int, tape: bool, kinematics: bool) -> List[Tensor]:
+        return _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics, True)
 
     @measured_op.register_fake
-    def _(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape):
+    def _(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics):
         nq, nv, _, nb, rec = _fake_sizes()
         B = qpos.shape[0]
-        return [qpos.new_empty((B, nq)), qpos.new_empty((B, nv)), qpos.new_empty((B, nv)),
-                qpos.new_empty((B, 4), dtype=torch.int32), qpos.new_empty((B if tape else 0, substeps*rec)),
-                qpos.new_empty((B, substeps, nb, 6)),
-                qpos.new_empty((B, substeps, nb), dtype=torch.int32),
-                qpos.new_empty((B, substeps, nv-6)), qpos.new_empty((B, substeps, 4), dtype=torch.int32)]
+        out = [qpos.new_empty((B, nq)), qpos.new_empty((B, nv)), qpos.new_empty((B, nv)),
+               qpos.new_empty((B, 4), dtype=torch.int32), qpos.new_empty((B if tape else 0, substeps*rec))]
+        if kinematics:
+            out += [qpos.new_empty(s) for s in ((B, nq), (B, nb, 3), (B, nb, 4), (B, nb, 6), (B, nb, 3))]
+        return out + [qpos.new_empty((B, substeps, nb, 6)),
+                      qpos.new_empty((B, substeps, nb), dtype=torch.int32),
+                      qpos.new_empty((B, substeps, nv-6)), qpos.new_empty((B, substeps, 4), dtype=torch.int32),
+                      qpos.new_empty((B, substeps, nb, 6)),
+                      qpos.new_empty((B, substeps, nb), dtype=torch.int32)]
 
     @torch.library.custom_op("nablaengine::backward", mutates_args=())
     def backward_op(tape: Tensor, friction: Tensor, com: Tensor, g_qpos: Tensor, g_qvel: Tensor,
@@ -782,18 +791,21 @@ def _make_step_fn():
     class _Step(torch.autograd.Function):
         @staticmethod
         def forward(ctx, qpos, qvel, warm, ctrl, friction, com, iterations, substeps, clamp_kv, normal, clamp_soft,
-                    grad_decay, kin):
-            r = _ops()["forward"](qpos, qvel, warm, ctrl, friction, com, iterations, substeps, True, kin)
+                    grad_decay, kin, measured):
+            operation = "forward_measurements" if measured else "forward"
+            r = _ops()[operation](qpos, qvel, warm, ctrl, friction, com, iterations, substeps, True, kin)
             q1, v1, w1, info, tp = r[:5]
             ctx.save_for_backward(tp, friction, com, ctrl, q1, v1)
             ctx.opts = (substeps, clamp_kv, normal, clamp_soft, grad_decay, kin)
-            ctx.mark_non_differentiable(w1)
+            measured_outputs = r[5+(5 if kin else 0):] if measured else []
+            ctx.mark_non_differentiable(w1, *measured_outputs)
             return (q1, v1, w1) + tuple(r[5:])
 
         @staticmethod
         def backward(ctx, g_q1, g_v1, g_w1, *g_kin):
             tp, friction, com, ctrl, q1, v1 = ctx.saved_tensors
             substeps, clamp_kv, normal, clamp_soft, grad_decay, kin = ctx.opts
+            g_kin = g_kin[:5] if kin else ()
             g_q1 = torch.zeros_like(q1) if g_q1 is None else g_q1.contiguous()
             g_v1 = torch.zeros_like(v1) if g_v1 is None else g_v1.contiguous()
             kin_state, kin_cot = [], []
@@ -806,7 +818,7 @@ def _make_step_fn():
                                                0.0 if clamp_soft is None else clamp_soft)
             if grad_decay != 1.0:  # the state cotangent through this step's physics times it, ctrl's not
                 gq, gv = gq * grad_decay, gv * grad_decay  # grad_decay a float32 value: one float32 product
-            return gq, gv, None, gu, None, None, None, None, None, None, None, None, None
+            return gq, gv, None, gu, None, None, None, None, None, None, None, None, None, None
 
     return _Step
 
@@ -847,11 +859,17 @@ def _fn(name, make):
 
 
 def step(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, substeps=SUBSTEPS, clamp_kv=CLAMP_KV,
-         normal=NORMAL, clamp_soft=None, grad_decay=GRAD_DECAY, kinematics=False):
+         normal=NORMAL, clamp_soft=None, grad_decay=GRAD_DECAY, kinematics=False, measurements=False):
     """One control step: (qpos', qvel', warm'); kinematics=True: (qpos', qvel', warm', qpos_n, xpos, xquat, cvel,
     subtree_com), the output state's kinematics. Options as jax_ffi.step (clamp_kv, normal, clamp_soft and
     grad_decay act on the backward only). Differentiable in qpos, qvel and ctrl when any input requires grad (then the
-    forward also writes the tape); warm' is not differentiable."""
+    forward also writes the tape); warm' is not differentiable.
+
+    measurements=True appends one dictionary after the normal state outputs.
+    Its fixed fields are MEASUREMENT_FIELDS, with the same sampling, units and
+    semantics as forward_measurements. Measurements are marked nondifferentiable.
+    State outputs retain the native VJP from this same forward execution.
+    """
     import torch
     if int(clamp_kv) not in (0, 1, 2) or int(normal) not in (0, 1, 2, 3):
         raise _err("clamp_kv in {0, 1, 2}, normal in 0..3", ValueError)
@@ -861,10 +879,17 @@ def step(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, subste
         raise _err(f"grad_decay must be finite, got {grad_decay}", ValueError)
     args = (qpos, qvel, warm, ctrl, friction, com)
     if torch.is_grad_enabled() and any(isinstance(x, torch.Tensor) and x.requires_grad for x in args):
-        return _fn("step", _make_step_fn).apply(*args, int(iterations), int(substeps), int(clamp_kv), int(normal),
-                                                soft, gd, bool(kinematics))
-    r = _ops()["forward"](*args, int(iterations), int(substeps), False, bool(kinematics))
-    return tuple(r[:3]) + tuple(r[5:])
+        output = _fn("step", _make_step_fn).apply(*args, int(iterations), int(substeps), int(clamp_kv), int(normal),
+                                                soft, gd, bool(kinematics), bool(measurements))
+    else:
+        operation = "forward_measurements" if measurements else "forward"
+        result = _ops()[operation](*args, int(iterations), int(substeps), False, bool(kinematics))
+        output = tuple(result[:3]) + tuple(result[5:])
+    if measurements:
+        state_count = 8 if kinematics else 3
+        measured = dict(zip(MEASUREMENT_FIELDS, output[state_count:]))
+        return tuple(output[:state_count]) + (measured,)
+    return output
 
 
 def kinematics(qpos, qvel, com):
@@ -893,6 +918,10 @@ def forward_measurements(qpos, qvel, warm, ctrl, friction, com, *, iterations=IT
     geom 2 and -force to geom 1. Only pairs with one world-body geom contribute.
     Body zero holds the opposite terrain reaction. terrain_contact_count counts
     retained geometric contacts, including those whose final solved force is zero.
+    all_contact_wrench and all_contact_count have the same shapes and reference
+    conventions, and include both sides of robot self contacts. Forces are summed
+    as vectors per body before computing a magnitude. This permits cancellation
+    between contacts. Source hard contact thresholds consume the magnitude.
     actuator_torque (B, substeps, nv-6) is the executed clamped actuator generalized
     torque in actuated dof order, in N m. It excludes passive damping/friction.
     substep_info (B, substeps, 4) holds iterations, contacts, rows and unsupported
@@ -902,15 +931,9 @@ def forward_measurements(qpos, qvel, warm, ctrl, friction, com, *, iterations=IT
     implicitfast advances to t_k+dt. At dt=.005 and substeps=4 this is 200 Hz.
     These observational outputs have no autograd rule. Use step for state VJPs.
     """
-    import torch
-    if torch.compiler.is_compiling():
-        result = _custom_ops()["forward_measurements"](qpos, qvel, warm, ctrl, friction, com,
-                                                       int(iterations), int(substeps), bool(tape))
-    else:
-        result = _forward_impl(qpos, qvel, warm, ctrl, friction, com,
-                               int(iterations), int(substeps), bool(tape), False, True)
-    output = dict(zip(("qpos", "qvel", "warm", "info", "tape", "terrain_wrench", "terrain_contact_count",
-                       "actuator_torque", "substep_info"), result))
+    result = _ops()["forward_measurements"](qpos, qvel, warm, ctrl, friction, com,
+                                             int(iterations), int(substeps), bool(tape), False)
+    output = dict(zip(("qpos", "qvel", "warm", "info", "tape") + MEASUREMENT_FIELDS, result))
     if not tape:
         output.pop("tape")
     return output
