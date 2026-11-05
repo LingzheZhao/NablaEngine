@@ -2235,7 +2235,10 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
 #endif
     PROF(6);
     it++;
-    conv = UNIFORM(improvement < tol || scale * gn < tol);
+#ifdef DK_NEWTON_STOP_DEBUG
+    if(lane==0)printf("NEWTON_STOP iteration=%d alpha=%.9g cost=%.9g improvement=%.9g scaled_gradient=%.9g tolerance=%.9g\n",it,alpha,cost,improvement,scale*gn,tol);
+#endif
+    conv = UNIFORM((improvement > 0.f && improvement < tol) || scale * gn < tol);
     if (conv || it == iterations) {
       if (rec) {  // tape: did the last step change a zone?
         zchanged = __any_sync(0xffffffffu, chg);
