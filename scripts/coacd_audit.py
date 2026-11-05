@@ -3,6 +3,8 @@ Outputs are new directories only. Surface errors are sampled diagnostics, not eq
 """
 
 import argparse, ast, json, pathlib, types, os, sys, platform, importlib.metadata, traceback
+sys.dont_write_bytecode = True
+
 import numpy as np
 import trimesh, coacd
 
@@ -21,6 +23,11 @@ def main():
     p.add_argument("--prepare-only", action="store_true")
     p.add_argument("--wrapper-smoke", action="store_true")
     a = p.parse_args()
+    a.upstream = str(pathlib.Path(a.upstream).resolve())
+    a.dataset = str(pathlib.Path(a.dataset).resolve())
+    if a.metadata:
+        a.metadata = str(pathlib.Path(a.metadata).resolve())
+    a.output = str(pathlib.Path(a.output).resolve())
     out = pathlib.Path(a.output)
     out.mkdir(parents=True, exist_ok=False)
     status = dict(
@@ -38,6 +45,8 @@ def main():
         (out / "execution.json").write_text(json.dumps(status, indent=2))
 
     write_status()
+    # Keep native-library logs and any incidental relative files beside outputs.
+    os.chdir(out)
 
     def record_failure(kind, value, tb):
         status.update(
