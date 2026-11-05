@@ -167,6 +167,13 @@ def main():
         status['conditions'].append(dict(terrain_id=terrain_id, state=row['state']))
         write_index()
         write_status()
+    terrain_set = dict(artifact_id=f'{args.artifact_id}/terrain_set', tiles=[
+        dict(terrain_index=row['terrain_id'], coacd=row['coacd'],
+             terrain_artifact_id=row['coacd_artifact_id'], translation_m=row['proposed_combined_translation_m'])
+        for row in index['terrains']])
+    (args.output / 'terrain_set.yaml').write_text(yaml.safe_dump(terrain_set, sort_keys=False))
+    index['terrain_set_configuration'] = dict(path=str(args.output / 'terrain_set.yaml'),
+                                              artifact_id=terrain_set['artifact_id'])
     failed = [row['terrain_id'] for row in index['terrains'] if row['state'] == 'failed']
     status.update(state='planned' if args.plan_only else ('failed' if failed else 'completed'), failed_terrain_ids=failed)
     write_status()

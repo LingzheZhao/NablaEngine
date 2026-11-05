@@ -1,4 +1,4 @@
-"""Build a pelvis-root terrain model from this engine's fixture and completed CoACD output.
+"""Build a terrain model from a declared robot fixture and completed CoACD output.
 
 CPU construction and source-generation checks only. Physical contact and gradient
 qualification must run separately on explicitly provisioned compute.
@@ -16,6 +16,7 @@ sys.dont_write_bytecode = True
 import mujoco
 import numpy as np
 import trimesh
+import yaml
 from scipy.spatial import ConvexHull, cKDTree
 
 from capability_check import spec_from_model
@@ -157,7 +158,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--fixture-contract", type=Path, help="Contract of the source G1 model producer")
-    parser.add_argument("--coacd", type=Path, required=True)
+    terrain_inputs = parser.add_mutually_exclusive_group(required=True)
+    terrain_inputs.add_argument("--coacd", type=Path)
+    terrain_inputs.add_argument("--terrain-set", type=Path, help="YAML with artifact_id and tiles containing terrain_index, coacd, terrain_artifact_id, translation_m")
     parser.add_argument("--artifact-id", required=True)
     parser.add_argument("--code-revision", required=True)
     parser.add_argument("--terrain-artifact-id", required=True)
@@ -172,7 +175,10 @@ def main():
     if args.fixture_contract is not None:
         args.fixture_contract = args.fixture_contract.resolve()
     args.fixture = args.fixture.resolve()
-    args.coacd = args.coacd.resolve()
+    if args.coacd is not None:
+        args.coacd = args.coacd.resolve()
+    if args.terrain_set is not None:
+        args.terrain_set = args.terrain_set.resolve()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     status = dict(state="started", code_revision=args.code_revision,
@@ -194,16 +200,52 @@ def main():
     # Resolve selected inputs first, then own incidental native logs in the new
     # output root. In particular MuJoCo's default warning log uses the cwd.
     os.chdir(args.output)
-    execution = json.loads((args.coacd / "execution.json").read_text())
-    result = json.loads((args.coacd / "result.json").read_text())
-    if execution["state"] != "completed" or execution.get("synthetic_hulls_only"):
-        raise ValueError("Scene requires a completed, real CoACD decomposition")
-    if execution["artifact_id"] != args.terrain_artifact_id or result["artifact_id"] != args.terrain_artifact_id:
-        raise ValueError("Selected CoACD artifact identity mismatch")
-    if execution["frame"] != result["frame"]:
-        raise ValueError("CoACD frame records disagree")
-    if result["frame"]["input_to_world_translation_m"] != [15.0, 8.0, 0.0]:
-        raise ValueError("Expected declared upstream 30 by 16 metre input frame")
+    if args.terrain_set is None:
+        tiles = [dict(coacd=args.coacd, terrain_artifact_id=args.terrain_artifact_id, translation_m=[0., 0., 0.])]
+    else:
+        selected = yaml.safe_load(args.terrain_set.read_text())
+        if selected['artifact_id'] != args.terrain_artifact_id:
+            raise ValueError('Selected terrain-set identity differs from the declared physical terrain identity')
+        tiles = selected['tiles']
+        if not tiles or len({row['terrain_index'] for row in tiles}) != len(tiles):
+            raise ValueError('The terrain set requires distinct selected terrain IDs')
+    terrain_contracts = []
+    for tile in tiles:
+        directory = Path(tile['coacd'])
+        if not directory.is_absolute() and args.terrain_set is not None:
+            directory = args.terrain_set.parent / directory
+        tile['coacd'] = directory.resolve()
+        translation = np.asarray(tile['translation_m'], dtype=float)
+        if translation.shape != (3,) or not np.isfinite(translation).all():
+            raise ValueError('Each terrain tile requires a finite XYZ translation')
+        execution = json.loads((tile['coacd'] / 'execution.json').read_text())
+        result = json.loads((tile['coacd'] / 'result.json').read_text())
+        if execution['state'] != 'completed' or execution.get('synthetic_hulls_only'):
+            raise ValueError('Scene requires completed, real CoACD decompositions')
+        if execution['artifact_id'] != tile['terrain_artifact_id'] or result['artifact_id'] != tile['terrain_artifact_id']:
+            raise ValueError('Selected CoACD artifact identity mismatch')
+        if execution['frame'] != result['frame']:
+            raise ValueError('CoACD frame records disagree')
+        if result['frame']['input_to_world_translation_m'] != [15., 8., 0.]:
+            raise ValueError('Expected declared upstream 30 by 16 metre input frame')
+        if args.terrain_set is not None and tile['terrain_index'] != result['terrain_index']:
+            raise ValueError('Selected tile and CoACD terrain IDs differ')
+        if not result['hulls']:
+            raise ValueError('Each selected terrain requires a nonempty decomposition')
+        tile['result'] = result
+        tile['translation_m'] = translation.tolist()
+        terrain_contracts.append(dict(
+            terrain_index=result['terrain_index'], terrain_file=result['terrain_file'],
+            terrain_artifact_id=tile['terrain_artifact_id'], coacd=str(tile['coacd']),
+            translation_m=translation.tolist(),
+            input_to_world_translation_m=(np.array([15., 8., 0.]) + translation).tolist(),
+            coacd_auto_align_z_m=result['auto_align_z'], hulls=len(result['hulls']), hull_geom_names=[]))
+    if args.terrain_set is not None:
+        resolved = dict(artifact_id=args.terrain_artifact_id, tiles=[
+            dict(terrain_index=row['terrain_index'], coacd=row['coacd'],
+                 terrain_artifact_id=row['terrain_artifact_id'], translation_m=row['translation_m'])
+            for row in terrain_contracts])
+        (args.output / 'terrain_set.yaml').write_text(yaml.safe_dump(resolved, sort_keys=False))
     fixture = mujoco.MjModel.from_binary_path(str(args.fixture))
     if fixture.jnt_type[0] != mujoco.mjtJoint.mjJNT_FREE:
         raise ValueError("Fixture must have a free root")
@@ -259,40 +301,47 @@ def main():
     hull_names = []
     expected_vertices = []
     hull_face_counts = []
-    for index, record in enumerate(result["hulls"]):
-        hull = trimesh.load(args.coacd / f"hull_{index}.ply", process=False)
-        vertices, faces = np.asarray(hull.vertices), np.asarray(hull.faces)
-        if vertices.shape != (record["vertices"], 3) or faces.shape != (record["faces"], 3):
-            raise ValueError(f"Hull {index} differs from its completed decomposition record")
-        if not np.isfinite(vertices).all() or not hull.is_watertight:
-            raise ValueError(f"Hull {index} is not a finite closed mesh")
-        # MuJoCo collides against the convex hull. Re-triangulate the stored
-        # float32 vertices so near-coplanar CoACD faces cannot encode tiny dents.
-        convex = ConvexHull(vertices)
-        faces = convex.simplices.copy()
-        triangles = vertices[faces]
-        normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
-        inward = np.sum(normals * (triangles[:, 0] - vertices.mean(0)), axis=1) < 0
-        faces[inward] = faces[inward][:, [0, 2, 1]]
-        hull_face_counts.append(dict(coacd_faces=record["faces"], convex_faces=len(faces)))
-        name = f"terrain_hull_{index}"
-        hull_names.append(name)
-        expected_vertices.append(vertices)
-        spec.add_mesh(name=name, uservert=vertices.ravel().tolist(), userface=faces.ravel().tolist())
-        spec.worldbody.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_MESH,
-                                meshname=name, contype=0, conaffinity=0, mass=0)
-        for robot in robots:
-            # Foot names preserve the environment's established foot-pair selector.
-            suffix = "floor" if robot in foot_robots else "terrain"
-            prefix = f'{robot}__foot' if robot in foot_robots and '_foot' not in robot else robot
-            pair = spec.add_pair(name=f"{prefix}__hull_{index}_{suffix}",
-                                 geomname1=robot, geomname2=name)
-            for field, value in parameters[robot].items():
-                setattr(pair, field, value)
+    for tile, terrain in zip(tiles, terrain_contracts):
+        result = tile["result"]
+        for index, record in enumerate(result["hulls"]):
+            hull = trimesh.load(tile["coacd"] / f"hull_{index}.ply", process=False)
+            vertices, faces = np.asarray(hull.vertices), np.asarray(hull.faces)
+            if vertices.shape != (record["vertices"], 3) or faces.shape != (record["faces"], 3):
+                raise ValueError(f"Hull {index} differs from its completed decomposition record")
+            if not np.isfinite(vertices).all() or not hull.is_watertight:
+                raise ValueError(f"Hull {index} is not a finite closed mesh")
+            # MuJoCo collides against the convex hull. Re-triangulate the stored
+            # float32 vertices so near-coplanar CoACD faces cannot encode tiny dents.
+            convex = ConvexHull(vertices)
+            faces = convex.simplices.copy()
+            triangles = vertices[faces]
+            normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+            inward = np.sum(normals * (triangles[:, 0] - vertices.mean(0)), axis=1) < 0
+            faces[inward] = faces[inward][:, [0, 2, 1]]
+            hull_face_counts.append(dict(terrain_index=terrain["terrain_index"], hull_index=index,
+                                         coacd_faces=record["faces"], convex_faces=len(faces)))
+            name = f"terrain_{terrain['terrain_index']}_hull_{index}" if args.terrain_set else f"terrain_hull_{index}"
+            hull_names.append(name)
+            terrain["hull_geom_names"].append(name)
+            expected_vertices.append(vertices + tile["translation_m"])
+            spec.add_mesh(name=name, uservert=vertices.ravel().tolist(), userface=faces.ravel().tolist())
+            spec.worldbody.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_MESH,
+                                    meshname=name, pos=tile["translation_m"], contype=0, conaffinity=0, mass=0)
+            for robot in robots:
+                # Foot names preserve the environment's established foot-pair selector.
+                suffix = "floor" if robot in foot_robots else "terrain"
+                prefix = f'{robot}__foot' if robot in foot_robots and '_foot' not in robot else robot
+                pair = spec.add_pair(name=f"{prefix}__{name}_{suffix}" if args.terrain_set else f"{prefix}__hull_{index}_{suffix}",
+                                     geomname1=robot, geomname2=name)
+                for field, value in parameters[robot].items():
+                    setattr(pair, field, value)
     if not hull_names:
         raise ValueError("Empty terrain decomposition")
     model = spec.compile()
     robot_error = verify_robot(fixture, model)
+    for terrain in terrain_contracts:
+        terrain["hull_geom_ids"] = [model.geom(name).id for name in terrain["hull_geom_names"]]
+        terrain["terrain_pairs"] = len(robots) * terrain["hulls"]
     foot_pairs = [i for i in range(model.npair) if "_foot" in model.pair(i).name and model.pair(i).name.endswith("_floor")]
     if model.npair != self_pairs + len(robots) * len(hull_names):
         raise ValueError("Compiled terrain pair count mismatch")
@@ -328,18 +377,25 @@ def main():
     adjoint_source = adjoint.cuda_source(model, convex_hulls=packed_hulls)
     # The actual generated source path is checked by the owning engine API.
     adjoint.engine_constants(model, np.asarray(foot_pairs), convex_hulls=packed_hulls)
+    if args.terrain_set is None:
+        frame = dict(**tiles[0]['result']['frame'], coacd_auto_align_z_m=tiles[0]['result']['auto_align_z'],
+                     hull_files_already_aligned=True)
+    else:
+        frame = dict(coacd_input_to_tile_translation_m=[15., 8., 0.],
+                     terrain_translations_m={str(row['terrain_index']): row['translation_m'] for row in terrain_contracts},
+                     coacd_z_alignment_applies_to='collision hulls only', hull_files_already_aligned=True)
     contract = dict(
         artifact_id=args.artifact_id, terrain_artifact_id=args.terrain_artifact_id,
         fixture=str(args.fixture), fixture_artifact_id=fixture_contract['artifact_id'] if fixture_contract else None,
         free_root_body=fixture.body(1).name, source_action=fixture_contract['source_action'] if fixture_contract else None,
-        coacd=str(args.coacd), terrain_file=result["terrain_file"],
-        terrain_index=result["terrain_index"], actuator_joint_names=[model.joint(model.actuator_trnid[i, 0]).name for i in range(model.nu)],
+        coacd=str(args.coacd) if args.coacd is not None else None,
+        terrain_file=terrain_contracts[0]["terrain_file"] if len(tiles) == 1 else None,
+        terrain_index=terrain_contracts[0]["terrain_index"] if len(tiles) == 1 else None, terrains=terrain_contracts, actuator_joint_names=[model.joint(model.actuator_trnid[i, 0]).name for i in range(model.nu)],
         tracked_body_names=list(TRACKED_BODIES), foot_pairs=foot_pairs,
         versions={name: importlib.metadata.version(name) for name in ("mujoco", "numpy", "trimesh", "scipy")},
         engine_revision=args.code_revision,
-        frame={**result["frame"], "coacd_auto_align_z_m": result["auto_align_z"],
-               "hull_files_already_aligned": True},
-        counts=dict(robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom, robot_visual_geoms=int(np.count_nonzero((model.geom_bodyid != 0) & (model.geom_group == 2))),
+        frame=frame,
+        counts=dict(terrains=len(tiles), collision_geoms=len(step.collision_geoms(model)), robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom, robot_visual_geoms=int(np.count_nonzero((model.geom_bodyid != 0) & (model.geom_group == 2))),
                     self_pairs=self_pairs, terrain_pairs=len(robots) * len(hull_names), pairs=model.npair),
         hull_surface="ConvexHull triangulation of stored CoACD vertices, with outward winding. All vertices retained.",
         hull_face_counts=hull_face_counts,
