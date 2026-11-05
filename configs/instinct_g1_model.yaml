@@ -1,0 +1,9 @@
+# PerceptiveShadowingEnvCfg and G1 SuperMimic source runtime conditions.
+timestep: 0.005
+integrator: implicitfast
+solver: Newton
+cone: pyramidal
+jacobian: sparse
+iterations: 10
+ls_iterations: 20
+ccd_iterations: 128

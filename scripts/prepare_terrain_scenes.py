@@ -27,10 +27,11 @@ def main():
                         help='Reuse a completed current-format decomposition, without modifying it')
     parser.add_argument('--operation', choices=('coacd', 'scenes', 'all'), default='all')
     parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--fixture-contract', type=Path)
     parser.add_argument('--visual-model', type=Path)
     parser.add_argument('--visual-artifact-id')
     args = parser.parse_args()
-    for name in ('upstream', 'dataset', 'metadata', 'fixture', 'output', 'visual_model'):
+    for name in ('upstream', 'dataset', 'metadata', 'fixture', 'output', 'visual_model', 'fixture_contract'):
         value = getattr(args, name)
         if value is not None:
             setattr(args, name, value.resolve())
@@ -70,6 +71,14 @@ def main():
     for motion in metadata['motion_files']:
         if motion['terrain_id'] not in terrains:
             raise ValueError('Every metadata motion must bind an existing terrain')
+    fixture_self_pairs, robot_collision_geoms, robot_visual_geoms = 469, 33, 0
+    if args.fixture_contract is not None:
+        fixture_contract = json.loads(args.fixture_contract.read_text())
+        if fixture_contract['format'] != 'instinct-g1-model-v1':
+            raise ValueError('Expected the source G1 model producer contract')
+        fixture_self_pairs = fixture_contract['counts']['self_pairs']
+        robot_collision_geoms = fixture_contract['counts']['robot_collision_geoms']
+        robot_visual_geoms = fixture_contract['counts']['robot_visual_geoms']
     scripts = Path(__file__).resolve().parent
     index = dict(artifact_id=args.artifact_id, metadata=str(args.metadata), code_revision=args.code_revision,
                  upstream_revision=args.upstream_revision, fixture=str(args.fixture), terrains=[],
@@ -83,12 +92,12 @@ def main():
         hulls = sum(row['hulls'] for row in completed)
         index['budget'] = dict(known_terrain_ids=[row['terrain_id'] for row in completed],
                                unknown_terrain_ids=[i for i in selected if i not in [row['terrain_id'] for row in completed]],
-                               known_hulls=hulls, combined_pairs_for_known_hulls=469 + 33*hulls,
-                               combined_collision_geoms_for_known_hulls=33+hulls,
-                               combined_visual_geoms_if_source_imported=35 if args.visual_model else 0,
+                               known_hulls=hulls, combined_pairs_for_known_hulls=fixture_self_pairs + robot_collision_geoms*hulls,
+                               combined_collision_geoms_for_known_hulls=robot_collision_geoms+hulls,
+                               combined_visual_geoms=35 if args.visual_model else robot_visual_geoms,
                                formulas=dict(pairs='fixture_self_pairs + robot_collision_geoms * sum(hulls)',
                                              collision_geoms='robot_collision_geoms + sum(hulls)'),
-                               assumed_fixture_self_pairs=469, assumed_robot_collision_geoms=33)
+                               fixture_self_pairs=fixture_self_pairs, robot_collision_geoms=robot_collision_geoms)
         (args.output / 'index.json').write_text(json.dumps(index, indent=2))
 
     for terrain_id in selected:
@@ -127,6 +136,8 @@ def main():
                        '--coacd', str(coacd), '--artifact-id', f'{args.artifact_id}/terrain/{terrain_id}/scene',
                        '--terrain-artifact-id', decomposition_id, '--code-revision', args.code_revision,
                        '--output', str(root / 'scene')]
+            if args.fixture_contract is not None:
+                command += ['--fixture-contract', str(args.fixture_contract)]
             if args.visual_model:
                 command += ['--visual-model', str(args.visual_model), '--visual-artifact-id', args.visual_artifact_id]
             row['commands'].append(command)

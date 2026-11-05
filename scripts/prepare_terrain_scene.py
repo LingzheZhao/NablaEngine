@@ -64,7 +64,7 @@ def verify_robot(fixture, model):
         target = model.geom(fixture.geom(index).name).id
         for field in ("geom_type", "geom_bodyid", "geom_size", "geom_pos", "geom_quat",
                       "geom_contype", "geom_conaffinity", "geom_condim", "geom_friction",
-                      "geom_solref", "geom_solimp", "geom_margin", "geom_gap"):
+                      "geom_solref", "geom_solimp", "geom_margin", "geom_gap", "geom_group"):
             if not np.allclose(getattr(fixture, field)[index], getattr(model, field)[target], rtol=0, atol=1e-12):
                 raise ValueError(f"Terrain construction changed {fixture.geom(index).name} {field}")
     for index in range(fixture.npair):
@@ -156,6 +156,7 @@ def verify_robot_visuals(model, data, evidence):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--fixture-contract", type=Path, help="Contract of the source G1 model producer")
     parser.add_argument("--coacd", type=Path, required=True)
     parser.add_argument("--artifact-id", required=True)
     parser.add_argument("--code-revision", required=True)
@@ -168,6 +169,8 @@ def main():
         parser.error("--visual-model and --visual-artifact-id must be supplied together")
     if args.visual_model is not None:
         args.visual_model = args.visual_model.resolve()
+    if args.fixture_contract is not None:
+        args.fixture_contract = args.fixture_contract.resolve()
     args.fixture = args.fixture.resolve()
     args.coacd = args.coacd.resolve()
     args.output = args.output.resolve()
@@ -202,9 +205,23 @@ def main():
     if result["frame"]["input_to_world_translation_m"] != [15.0, 8.0, 0.0]:
         raise ValueError("Expected declared upstream 30 by 16 metre input frame")
     fixture = mujoco.MjModel.from_binary_path(str(args.fixture))
-    if fixture.body(fixture.jnt_bodyid[0]).name != "pelvis":
-        raise ValueError("Fixture must have a free pelvis root")
-    spec = spec_from_model(fixture)
+    if fixture.jnt_type[0] != mujoco.mjtJoint.mjJNT_FREE:
+        raise ValueError("Fixture must have a free root")
+    fixture_contract = None
+    if args.fixture_contract is not None:
+        fixture_contract = json.loads(args.fixture_contract.read_text())
+        if fixture_contract['format'] != 'instinct-g1-model-v1':
+            raise ValueError('Expected the declared source G1 model contract')
+        if args.visual_model is not None:
+            raise ValueError('The source G1 model already owns its visual geometry')
+        from prepare_instinct_g1_model import build_source_model
+        spec, source, reconstructed, actuators, collision, selected_pairs, foot_names, material = build_source_model(
+            Path(fixture_contract['upstream']), fixture_contract['resolved_configuration'])
+        verify_robot(fixture, reconstructed)
+        if fixture.body(1).name != fixture_contract['free_root_body']:
+            raise ValueError('Constructed free root differs from the selected model contract')
+    else:
+        spec = spec_from_model(fixture)
     # Ray selection consumes these original groups independently of contacts.
     for geom in range(fixture.ngeom):
         spec.geom(fixture.geom(geom).name).group = int(fixture.geom_group[geom])
@@ -213,8 +230,8 @@ def main():
         visual_contract, visual_evidence = add_robot_visuals(
             spec, fixture, args.visual_model, args.visual_artifact_id)
     # motion_matched_terrain imports its STL floor and creates no additional plane.
-    # Retain all 469 fixture self pairs. Replace its 33 plane pairs with one
-    # explicit pair per robot collision geom per hull, retaining pair parameters.
+    # Retain the fixture self pairs. Replace its plane pairs with one explicit
+    # pair per declared robot collision geom per hull, retaining pair parameters.
     planes = [i for i in range(fixture.ngeom) if fixture.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE]
     if len(planes) != 1 or fixture.geom_bodyid[planes[0]] != 0:
         raise ValueError("Expected exactly one fixture world plane")
@@ -224,9 +241,13 @@ def main():
         if fixture.geom(floor).name in (pair.geomname1, pair.geomname2):
             robot = pair.geomname2 if pair.geomname1 == fixture.geom(floor).name else pair.geomname1
             floor_pairs[robot] = pair
-    robots = [fixture.geom(i).name for i in range(fixture.ngeom) if fixture.geom_bodyid[i] != 0]
-    if len(robots) != 33 or set(floor_pairs) != set(robots):
-        raise ValueError("Expected all 33 robot collision geoms bound to fixture plane pairs")
+    physical_geoms = {int(g) for g in np.concatenate((fixture.pair_geom1, fixture.pair_geom2))
+                      if fixture.geom_bodyid[g] != 0}
+    robots = [fixture.geom(i).name for i in sorted(physical_geoms)]
+    if not robots or set(floor_pairs) != set(robots):
+        raise ValueError("Every robot collision geom must have a fixture plane-pair template")
+    foot_robots = {name for name, pair in floor_pairs.items()
+                   if '_foot' in pair.name and pair.name.endswith('_floor')}
     # Copy values before deleting owned MjSpec objects.
     parameters = {name: dict(condim=int(p.condim), friction=np.array(p.friction).copy(),
                             solref=np.array(p.solref).copy(), solimp=np.array(p.solimp).copy(),
@@ -262,8 +283,9 @@ def main():
                                 meshname=name, contype=0, conaffinity=0, mass=0)
         for robot in robots:
             # Foot names preserve the environment's established foot-pair selector.
-            suffix = "floor" if "_foot" in robot else "terrain"
-            pair = spec.add_pair(name=f"{robot}__hull_{index}_{suffix}",
+            suffix = "floor" if robot in foot_robots else "terrain"
+            prefix = f'{robot}__foot' if robot in foot_robots and '_foot' not in robot else robot
+            pair = spec.add_pair(name=f"{prefix}__hull_{index}_{suffix}",
                                  geomname1=robot, geomname2=name)
             for field, value in parameters[robot].items():
                 setattr(pair, field, value)
@@ -272,7 +294,7 @@ def main():
     model = spec.compile()
     robot_error = verify_robot(fixture, model)
     foot_pairs = [i for i in range(model.npair) if "_foot" in model.pair(i).name and model.pair(i).name.endswith("_floor")]
-    if model.npair != self_pairs + 33 * len(hull_names):
+    if model.npair != self_pairs + len(robots) * len(hull_names):
         raise ValueError("Compiled terrain pair count mismatch")
     for name in TRACKED_BODIES:
         model.body(name)
@@ -308,18 +330,22 @@ def main():
     adjoint.engine_constants(model, np.asarray(foot_pairs), convex_hulls=packed_hulls)
     contract = dict(
         artifact_id=args.artifact_id, terrain_artifact_id=args.terrain_artifact_id,
-        fixture=str(args.fixture), coacd=str(args.coacd), terrain_file=result["terrain_file"],
+        fixture=str(args.fixture), fixture_artifact_id=fixture_contract['artifact_id'] if fixture_contract else None,
+        free_root_body=fixture.body(1).name, source_action=fixture_contract['source_action'] if fixture_contract else None,
+        coacd=str(args.coacd), terrain_file=result["terrain_file"],
         terrain_index=result["terrain_index"], actuator_joint_names=[model.joint(model.actuator_trnid[i, 0]).name for i in range(model.nu)],
         tracked_body_names=list(TRACKED_BODIES), foot_pairs=foot_pairs,
         versions={name: importlib.metadata.version(name) for name in ("mujoco", "numpy", "trimesh", "scipy")},
         engine_revision=args.code_revision,
         frame={**result["frame"], "coacd_auto_align_z_m": result["auto_align_z"],
                "hull_files_already_aligned": True},
-        counts=dict(robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom, robot_visual_geoms=len(visual_evidence),
-                    self_pairs=self_pairs, terrain_pairs=33 * len(hull_names), pairs=model.npair),
+        counts=dict(robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom, robot_visual_geoms=int(np.count_nonzero((model.geom_bodyid != 0) & (model.geom_group == 2))),
+                    self_pairs=self_pairs, terrain_pairs=len(robots) * len(hull_names), pairs=model.npair),
         hull_surface="ConvexHull triangulation of stored CoACD vertices, with outward winding. All vertices retained.",
         hull_face_counts=hull_face_counts,
-        robot_visuals=visual_contract,
+        robot_visuals=visual_contract if fixture_contract is None else dict(
+            artifact_id=fixture_contract["artifact_id"], geometry=fixture_contract["geometry"],
+            include_geom_groups=[0, 2], exclude_parent_body=False),
         robot_collision_geom_groups={fixture.geom(i).name: int(fixture.geom_group[i])
                                      for i in range(fixture.ngeom) if fixture.geom_bodyid[i] != 0},
         floor="Fixture plane and its pairs removed. Upstream motion_matched_terrain uses STL floor through CoACD hulls. Robot self pairs retained.",
