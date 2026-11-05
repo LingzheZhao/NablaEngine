@@ -85,11 +85,7 @@ SPHERE_VJP = r'''
 __device__ bool static_box_primitive_vjp(int kind,int slot,const float*cp,const float*axis,float radius,float hl,
  const float*bp,const float*R,const float*bs,const float*cot,float*gb){
  if(kind==2)return static_box_capsule_vjp(slot,cp,axis,radius,hl,bp,R,bs,cot,gb);
- BoxDual p[3],b[3],rot[9],size[3],dist,pos[3],n[3],fr[9];
- for(int k=0;k<3;k++){p[k]=cp[k];p[k].d[k]=1.f;b[k]=bp[k];size[k]=bs[k];}
- for(int k=0;k<9;k++)rot[k]=R[k];
- dual_sphere_box(p,BoxDual(radius),b,rot,size,&dist,pos,n);make_frame(n,fr);
- for(int j=0;j<6;j++){gb[j]=cot[0]*dist.d[j];for(int k=0;k<3;k++)gb[j]+=cot[1+k]*pos[k].d[j];for(int k=0;k<9;k++)gb[j]+=cot[4+k]*fr[k].d[j];}
+ static_box_sphere_vjp(cp,radius,bp,R,bs,cot,gb);
  return true;
 }
 '''
