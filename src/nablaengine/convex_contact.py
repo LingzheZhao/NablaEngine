@@ -51,7 +51,10 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
     tri = vertices[faces]
     n = torch.linalg.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0])
     norm = torch.linalg.vector_norm(n,dim=1)
-    if bool((norm <= tolerance).any()):
+    edge_scale=torch.stack([torch.linalg.vector_norm(tri[:,1]-tri[:,0],dim=1),
+                            torch.linalg.vector_norm(tri[:,2]-tri[:,1],dim=1),
+                            torch.linalg.vector_norm(tri[:,0]-tri[:,2],dim=1)]).amax(0)
+    if bool((norm <= tolerance*edge_scale).any()):
         raise ValueError('degenerate hull face')
     n = n/norm[:,None]
     centroid=vertices.mean(0)
@@ -79,9 +82,10 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
         q=x-normal*torch.dot(normal,x-a)
         # Projection in triangle, including coplanar triangle boundaries.
         e0=b-a;e1=c-a;d=q-a
-        aa=torch.dot(e0,e0);ab=torch.dot(e0,e1);bb=torch.dot(e1,e1)
-        u=(torch.dot(d,e0)*bb-torch.dot(d,e1)*ab)/(aa*bb-ab*ab)
-        v=(torch.dot(d,e1)*aa-torch.dot(d,e0)*ab)/(aa*bb-ab*ab)
+        cross=torch.linalg.cross(e0,e1)
+        cross_squared=torch.dot(cross,cross)
+        u=torch.dot(torch.linalg.cross(d,e1),cross)/cross_squared
+        v=torch.dot(torch.linalg.cross(e0,d),cross)/cross_squared
         if float(u.detach())>=0 and float(v.detach())>=0 and float((u+v).detach())<=1:
             add(t,q,('face',idx))
     zero=center.new_tensor(0.);one=center.new_tensor(1.)
@@ -99,10 +103,11 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
                 for u in (zero,one):
                     t=(torch.dot(delta,a+edge*u-p)/dd).clamp(0,1)
                     add(t,a+edge*u,('vertex',i,j,int(float(u))))
-                de=torch.dot(delta,edge);det=dd*ee-de*de
-                if float(det.detach())>tolerance*tolerance:
+                de=torch.dot(delta,edge);cross_de=torch.linalg.cross(delta,edge);det=torch.dot(cross_de,cross_de)
+                if float(det.detach())>tolerance*tolerance*max(float(dd.detach()),float(ee.detach())):
                     dw=torch.dot(delta,w);ew=torch.dot(edge,w)
-                    t=(de*ew-ee*dw)/det;u=(dd*ew-de*dw)/det
+                    t=torch.dot(torch.linalg.cross(-w,edge),cross_de)/det
+                    u=torch.dot(torch.linalg.cross(-w,delta),cross_de)/det
                     if 0<float(t.detach())<1 and 0<float(u.detach())<1:
                         add(t,a+edge*u,('edge-interior',i,j))
     if not candidates: raise UnsupportedContact('no external closest feature')
