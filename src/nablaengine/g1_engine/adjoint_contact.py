@@ -579,7 +579,7 @@ __device__ BoxDual fabsf(BoxDual a){return a.v<0.f?-a:a;}
 __device__ BoxDual fminf(BoxDual a,BoxDual b){return a.v<=b.v?a:b;}
 __device__ BoxDual fmaxf(BoxDual a,BoxDual b){return a.v>=b.v?a:b;}
 __device__ BoxDual sqrtf(BoxDual a){BoxDual c(sqrtf(a.v));for(int i=0;i<6;i++)c.d[i]=a.d[i]/(2.f*c.v);return c;}
-__device__ BoxDual safe_div(BoxDual a,BoxDual b){return fabsf(b).v<1e-15f?BoxDual(0.f):a/b;}
+__device__ BoxDual safe_div(BoxDual a,BoxDual b){return a/(b.v!=0.f?b:BoxDual(1e-15f));}
 __device__ BoxDual dot3(const BoxDual*a,const BoxDual*b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
 __device__ void mtv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i++)b[i]=R[i]*a[0]+R[3+i]*a[1]+R[6+i]*a[2];}
 __device__ void mv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i++)b[i]=R[3*i]*a[0]+R[3*i+1]*a[1]+R[3*i+2]*a[2];}
@@ -597,4 +597,5 @@ __device__ void mv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i
         depth += (primitives[stop] == '{') - (primitives[stop] == '}')
         stop += 1
     frame = primitives[start:stop].replace('float', 'BoxDual')
+    frame = frame.replace('dot3_rn(n, b)', 'dot3(n, b)').replace('RFMS(n[k], d, b[k])', '(n[k]*d-b[k])').replace('normalize3_rn(b);', 'BoxDual norm=sqrtf(dot3(b,b)); for(int k=0;k<3;k++) b[k]=b[k]/norm;').replace('cross_rn(n, b, c);', 'c[0]=n[1]*b[2]-n[2]*b[1]; c[1]=n[2]*b[0]-n[0]*b[2]; c[2]=n[0]*b[1]-n[1]*b[0];')
     return prelude + frame + code
