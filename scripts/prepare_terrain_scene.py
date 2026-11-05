@@ -16,7 +16,7 @@ sys.dont_write_bytecode = True
 import mujoco
 import numpy as np
 import trimesh
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, cKDTree
 
 from capability_check import spec_from_model
 from nablaengine.g1_engine import kinematics
@@ -77,6 +77,82 @@ def verify_robot(fixture, model):
     return errors
 
 
+def add_robot_visuals(spec, fixture, path, artifact_id):
+    """Attach source group-2 triangle surfaces to the existing robot bodies.
+
+    Fixed source children are folded into their named target ancestor. Moving
+    source bodies require that same named target body. No collision pairs or
+    inertials are created by the visual import.
+    """
+    source = (mujoco.MjModel.from_binary_path(str(path)) if path.suffix == '.mjb'
+              else mujoco.MjModel.from_xml_path(str(path)))
+    data = mujoco.MjData(source)
+    mujoco.mj_kinematics(source, data)
+    target_names = {fixture.body(i).name for i in range(1, fixture.nbody)}
+    meshes = {}
+    evidence = []
+    for geom in range(source.ngeom):
+        if int(source.geom_group[geom]) != 2 or source.geom_bodyid[geom] == 0:
+            continue
+        if source.geom_type[geom] != mujoco.mjtGeom.mjGEOM_MESH:
+            raise ValueError('Selected source group-2 visual geometry must use triangle meshes')
+        owner = int(source.geom_bodyid[geom])
+        source_body = source.body(owner).name
+        while source.body(owner).name not in target_names:
+            if source.body_jntnum[owner] or owner == 0:
+                raise ValueError(f'Source visual body {source_body} has no fixed named target binding')
+            owner = int(source.body_parentid[owner])
+        target_body = source.body(owner).name
+        mesh = int(source.geom_dataid[geom])
+        start, count = int(source.mesh_vertadr[mesh]), int(source.mesh_vertnum[mesh])
+        vertices = np.asarray(source.mesh_vert[start:start+count], dtype=float)
+        if mesh not in meshes:
+            mesh_name = f'robot_visual_mesh_{mesh}'
+            face_start, face_count = int(source.mesh_faceadr[mesh]), int(source.mesh_facenum[mesh])
+            faces = source.mesh_face[face_start:face_start+face_count]
+            spec.add_mesh(name=mesh_name, uservert=vertices.ravel().tolist(), userface=faces.ravel().tolist())
+            meshes[mesh] = mesh_name
+        body_rotation = data.xmat[owner].reshape(3, 3)
+        geom_rotation = data.geom_xmat[geom].reshape(3, 3)
+        position = body_rotation.T @ (data.geom_xpos[geom] - data.xpos[owner])
+        rotation = body_rotation.T @ geom_rotation
+        quaternion = np.empty(4)
+        mujoco.mju_mat2Quat(quaternion, rotation.ravel())
+        name = f'robot_visual_geom_{geom}'
+        spec.body(target_body).add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_MESH,
+                                       meshname=meshes[mesh], pos=position, quat=quaternion,
+                                       contype=0, conaffinity=0, group=2, mass=0,
+                                       rgba=source.geom_rgba[geom])
+        evidence.append(dict(name=name, source_geom=geom, source_body=source_body, target_body=target_body,
+                             expected_body_vertices=vertices @ rotation.T + position))
+    if not evidence:
+        raise ValueError('The selected visual model contains no robot group-2 meshes')
+    return dict(artifact_id=artifact_id, source=str(path), geoms=len(evidence), meshes=len(meshes),
+                include_geom_groups=[0, 2], exclude_parent_body=False,
+                geometry='Source compiled triangle surfaces attached to named target body frames; fixed children folded into their named ancestor',
+                body_frame_equivalence='Import preserves local visual surfaces. Source and target physical kinematics require their independent motion/FK checks.'), evidence
+
+
+def verify_robot_visuals(model, data, evidence):
+    """Check the compiled visual surfaces in their declared owning body frame."""
+    result = []
+    for row in evidence:
+        geom = model.geom(row['name']).id
+        body = model.body(row['target_body']).id
+        mesh = model.geom_dataid[geom]
+        start, count = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+        world = model.mesh_vert[start:start+count] @ data.geom_xmat[geom].reshape(3, 3).T + data.geom_xpos[geom]
+        actual = (world - data.xpos[body]) @ data.xmat[body].reshape(3, 3)
+        expected = row['expected_body_vertices']
+        error = float(max(cKDTree(expected).query(actual)[0].max(), cKDTree(actual).query(expected)[0].max()))
+        if error > 2e-5:
+            raise ValueError(f'Compiled robot visual surface changed for {row["name"]}: {error}')
+        result.append(dict(name=row['name'], source_geom=row['source_geom'], source_body=row['source_body'],
+                           target_body=row['target_body'], body_vertex_max_error_m=error,
+                           vertices=int(count), faces=int(model.mesh_facenum[mesh])))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
@@ -85,7 +161,13 @@ def main():
     parser.add_argument("--code-revision", required=True)
     parser.add_argument("--terrain-artifact-id", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--visual-model", type=Path)
+    parser.add_argument("--visual-artifact-id")
     args = parser.parse_args()
+    if bool(args.visual_model) != bool(args.visual_artifact_id):
+        parser.error("--visual-model and --visual-artifact-id must be supplied together")
+    if args.visual_model is not None:
+        args.visual_model = args.visual_model.resolve()
     args.fixture = args.fixture.resolve()
     args.coacd = args.coacd.resolve()
     args.output = args.output.resolve()
@@ -123,6 +205,13 @@ def main():
     if fixture.body(fixture.jnt_bodyid[0]).name != "pelvis":
         raise ValueError("Fixture must have a free pelvis root")
     spec = spec_from_model(fixture)
+    # Ray selection consumes these original groups independently of contacts.
+    for geom in range(fixture.ngeom):
+        spec.geom(fixture.geom(geom).name).group = int(fixture.geom_group[geom])
+    visual_contract, visual_evidence = None, []
+    if args.visual_model is not None:
+        visual_contract, visual_evidence = add_robot_visuals(
+            spec, fixture, args.visual_model, args.visual_artifact_id)
     # motion_matched_terrain imports its STL floor and creates no additional plane.
     # Retain all 469 fixture self pairs. Replace its 33 plane pairs with one
     # explicit pair per robot collision geom per hull, retaining pair parameters.
@@ -189,6 +278,8 @@ def main():
         model.body(name)
     data = mujoco.MjData(model)
     mujoco.mj_kinematics(model, data)
+    if visual_contract is not None:
+        visual_contract["bindings"] = verify_robot_visuals(model, data, visual_evidence)
     frame_errors = []
     for name, expected in zip(hull_names, expected_vertices):
         geom = model.geom(name).id
@@ -224,10 +315,13 @@ def main():
         engine_revision=args.code_revision,
         frame={**result["frame"], "coacd_auto_align_z_m": result["auto_align_z"],
                "hull_files_already_aligned": True},
-        counts=dict(robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom,
+        counts=dict(robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom, robot_visual_geoms=len(visual_evidence),
                     self_pairs=self_pairs, terrain_pairs=33 * len(hull_names), pairs=model.npair),
         hull_surface="ConvexHull triangulation of stored CoACD vertices, with outward winding. All vertices retained.",
         hull_face_counts=hull_face_counts,
+        robot_visuals=visual_contract,
+        robot_collision_geom_groups={fixture.geom(i).name: int(fixture.geom_group[i])
+                                     for i in range(fixture.ngeom) if fixture.geom_bodyid[i] != 0},
         floor="Fixture plane and its pairs removed. Upstream motion_matched_terrain uses STL floor through CoACD hulls. Robot self pairs retained.",
         verification=dict(robot_field_max_errors=robot_error, hull_world_vertex_max_errors_m=frame_errors,
                           capability_scopes=list(reports), generated_forward_header_bytes=len(forward_source),
