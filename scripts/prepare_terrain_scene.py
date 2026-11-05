@@ -7,7 +7,11 @@ import argparse
 import importlib.metadata
 import json
 from pathlib import Path
-import subprocess
+import os
+import sys
+import traceback
+
+sys.dont_write_bytecode = True
 
 import mujoco
 import numpy as np
@@ -78,10 +82,33 @@ def main():
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--coacd", type=Path, required=True)
     parser.add_argument("--artifact-id", required=True)
+    parser.add_argument("--code-revision", required=True)
     parser.add_argument("--terrain-artifact-id", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    args.fixture = args.fixture.resolve()
+    args.coacd = args.coacd.resolve()
+    args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
+    status = dict(state="started", code_revision=args.code_revision,
+                  arguments={name: str(value) if isinstance(value, Path) else value
+                             for name, value in vars(args).items()})
+
+    def write_status():
+        (args.output / "execution.json").write_text(json.dumps(status, indent=2))
+
+    write_status()
+
+    def record_failure(kind, value, tb):
+        status.update(state="failed", failure_type=kind.__name__, failure=str(value),
+                      traceback="".join(traceback.format_exception(kind, value, tb)))
+        write_status()
+        sys.__excepthook__(kind, value, tb)
+
+    sys.excepthook = record_failure
+    # Resolve selected inputs first, then own incidental native logs in the new
+    # output root. In particular MuJoCo's default warning log uses the cwd.
+    os.chdir(args.output)
     execution = json.loads((args.coacd / "execution.json").read_text())
     result = json.loads((args.coacd / "result.json").read_text())
     if execution["state"] != "completed" or execution.get("synthetic_hulls_only"):
@@ -194,7 +221,7 @@ def main():
         terrain_index=result["terrain_index"], actuator_joint_names=[model.joint(model.actuator_trnid[i, 0]).name for i in range(model.nu)],
         tracked_body_names=list(TRACKED_BODIES), foot_pairs=foot_pairs,
         versions={name: importlib.metadata.version(name) for name in ("mujoco", "numpy", "trimesh", "scipy")},
-        engine_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True).strip(),
+        engine_revision=args.code_revision,
         frame={**result["frame"], "coacd_auto_align_z_m": result["auto_align_z"],
                "hull_files_already_aligned": True},
         counts=dict(robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom,
@@ -208,6 +235,8 @@ def main():
     )
     mujoco.mj_saveModel(model, str(args.output / "model.mjb"))
     (args.output / "contract.json").write_text(json.dumps(contract, indent=2))
+    status.update(state="completed", counts=contract["counts"])
+    write_status()
     print(json.dumps(dict(output=str(args.output), counts=contract["counts"])))
 
 
