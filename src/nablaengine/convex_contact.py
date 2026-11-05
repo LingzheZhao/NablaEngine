@@ -27,11 +27,14 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
     Radius penetration is supported; centerline intersection/touch is refused.
     No hull/axis normalization or silent geometric repair is performed.
     """
+    import math
     import torch
     if center.shape != (3,) or axis.shape != (3,) or vertices.ndim != 2 or vertices.shape[1] != 3:
         raise ValueError('expected center/axis[3] and vertices[V,3]')
     if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 4:
         raise ValueError('expected triangulated closed convex hull')
+    if not all(math.isfinite(float(x)) for x in (half_length, radius, tolerance)) or tolerance <= 0:
+        raise ValueError('finite scalar dimensions and positive tolerance required')
     if float(half_length) < 0 or float(radius) <= 0 or abs(float(torch.linalg.vector_norm(axis).detach())-1) > 1e-6:
         raise ValueError('positive radius, nonnegative length and unit axis required')
     if not bool(torch.isfinite(center).all() and torch.isfinite(axis).all() and torch.isfinite(vertices).all()):
