@@ -208,6 +208,15 @@ contacts on near-parallel capsules. A per-substep comparison localized the latte
 first five milliseconds of frame 190. MuJoCo's first compatible incident-face rule restored both contacts and
 resolved the large forward discrepancy. The original failed runs remain separate from the corrected readings.
 
+The static-mesh AABB candidate was compared with its compile-time switch disabled on the same four recorded
+states, repeated across 64 environments. After three warm-up calls, twenty forward-and-backward calls averaged
+93.82 ms without AABB and 83.96 ms with it, a 10.5% reduction in this workload. All 256 substeps retained the
+same pair/slot multisets, contact counts, constraint-row counts and status flags. The declared bitwise comparison
+failed. Contact rows were emitted in a different order through `atomicAdd`, with maximum output differences
+of 1.25e-6 in generalized position and 1.43e-4 in generalized velocity, and maximum state-gradient difference
+0.00233. The candidate remains experimental. The terrain-policy readings use the fixed incident-face engine
+revision linked above, with this optimization disabled.
+
 ## Labels
 
 ### Forward-tape checks T1-T8 (`engine_step_check.py --tape`)
