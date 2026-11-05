@@ -1,7 +1,8 @@
 """CUDA static convex-hull contact selection and differentiable witness replay.
 
 Slots zero and one expose the minimum and maximum segment parameters of
-the near-minimum-distance witness set. A spatially unique witness uses slot zero.
+a clipped capsule surface edge on a hull face, or the near-minimum-distance
+witness set for an edge contact. A spatially unique witness uses slot zero.
 The two-point set retains the endpoints of a parallel face contact interval.
 Intersecting centerlines use the minimum-support facet of hull plus segment to
 compute signed penetration and recover witnesses at the separating translation.
@@ -17,6 +18,8 @@ DEVICE = r'''
 namespace static_convex {
 constexpr float geometry_tolerance = 2e-5f;
 constexpr float manifold_distance_tolerance = 2e-6f;
+// MuJoCo 3.17.0 edge/face alignment criterion (engine_collision_gjk.h).
+constexpr float capsule_face_alignment = .0888f;
 enum Status { NoContact = 0, Valid = 1, InvalidGeometry = -3, InvalidSlot = -4 };
 
 // Scalar<0> and Scalar<6> have identical explicitly rounded primal operations.
@@ -167,7 +170,11 @@ template<int D> __device__ void penetration_geometry(int hull, const Penetration
   depth = dot(normal, vertex<D>(hull, facet.support_vertex)-endpoint);
 }
 
+struct FaceLimit { int plane, endpoint; };
+struct FaceManifold { int face; FaceLimit lower, upper; };
 struct Selection {
+  bool face_manifold;
+  FaceManifold manifold;
   bool penetrating;
   PenetrationFacet penetration_facet;
   Feature feature;
@@ -335,6 +342,7 @@ __device__ int select_penetration(int hull, const Vector<0>& start,
 
 __device__ int select(int hull, const Vector<0>& start, const Vector<0>& delta, Selection& selection) {
   selection.penetrating = false;
+  selection.face_manifold = false;
   float lower = 0.f, upper = 1.f;
   for (int i = 0; i < c_hull_facenum[hull]; ++i) {
     int face = c_hull_faceadr[hull]+i;
@@ -364,7 +372,108 @@ __device__ int select(int hull, const Vector<0>& start, const Vector<0>& delta, 
   return selection.status;
 }
 
+template<int D> __device__ Vector<D> contact_normal(int hull, const Selection& selection,
+                                                      const Vector<D>& start, const Vector<D>& delta) {
+  if (selection.penetrating) {
+    Vector<D> normal;
+    Scalar<D> depth;
+    penetration_geometry(hull, selection.penetration_facet, start, delta, normal, depth);
+    return normal*Scalar<D>(-1.f);
+  }
+  Witness<D> witness = replay(hull, selection.feature, start, delta);
+  Vector<D> offset = witness.surface-witness.centerline;
+  return offset*(Scalar<D>(1.f)/square_root(dot(offset, offset)));
+}
+template<int D> __device__ Vector<D> capsule_surface_start(int hull, const Selection& selection,
+                                                            const Vector<D>& start,
+                                                            const Vector<D>& delta, float radius) {
+  Vector<D> axis = delta*(Scalar<D>(1.f)/square_root(dot(delta, delta)));
+  Vector<D> radial = contact_normal(hull, selection, start, delta)*Scalar<D>(radius);
+  // Recover the capsule surface generator through the original witness.
+  // Removing its axial component matches MuJoCo's capsuleEdgeNormals rule.
+  return start+radial-axis*dot(axis, radial);
+}
+template<int D> __device__ Scalar<D> face_parameter(int hull, const FaceManifold& manifold,
+                                                    const FaceLimit& limit,
+                                                    const Vector<D>& skin_start,
+                                                    const Vector<D>& delta) {
+  if (limit.plane < 0) return Scalar<D>(float(limit.endpoint));
+  Vector<D> normal = face_normal<D>(manifold.face);
+  Vector<D> a = vertex<D>(hull, c_hull_faces[3*manifold.face]);
+  Vector<D> projected = skin_start-normal*dot(normal, skin_start-a);
+  Vector<D> projected_delta = delta-normal*dot(normal, delta);
+  Vector<D> bound_normal = face_normal<D>(limit.plane);
+  Vector<D> b = vertex<D>(hull, c_hull_faces[3*limit.plane]);
+  return dot(bound_normal, b-projected)/dot(bound_normal, projected_delta);
+}
+__device__ bool clip_face(int hull, int face, const Vector<0>& skin_start,
+                            const Vector<0>& delta, FaceManifold& manifold) {
+  Vector<0> normal = face_normal<0>(face);
+  Vector<0> a = vertex<0>(hull, c_hull_faces[3*face]);
+  Vector<0> projected = skin_start-normal*dot(normal, skin_start-a);
+  Vector<0> projected_delta = delta-normal*dot(normal, delta);
+  float lower = 0.f, upper = 1.f;
+  manifold = {face, {-1, 0}, {-1, 1}};
+  for (int i = 0; i < c_hull_facenum[hull]; ++i) {
+    int plane = c_hull_faceadr[hull]+i;
+    Vector<0> bound_normal = face_normal<0>(plane);
+    Vector<0> b = vertex<0>(hull, c_hull_faces[3*plane]);
+    float offset = dot(bound_normal, projected-b).value;
+    float slope = dot(bound_normal, projected_delta).value;
+    if (fabsf(slope) <= geometry_tolerance) {
+      if (offset > geometry_tolerance) return false;
+      continue;
+    }
+    float bound = -offset/slope;
+    if (slope < 0.f && bound > lower) { lower = bound; manifold.lower = {plane, 0}; }
+    if (slope > 0.f && bound < upper) { upper = bound; manifold.upper = {plane, 1}; }
+  }
+  if (lower > upper) return false;
+  Vector<0> span = projected_delta*Scalar<0>(__fsub_rn(upper, lower));
+  return dot(span, span).value > geometry_tolerance*geometry_tolerance;
+}
+__device__ void select_face_manifold(int hull, const Vector<0>& start,
+                                       const Vector<0>& delta, float radius,
+                                       Selection& selection) {
+  if (dot(delta, delta).value <= geometry_tolerance*geometry_tolerance) return;
+  Vector<0> initial_normal = contact_normal(hull, selection, start, delta);
+  float signed_distance;
+  if (selection.penetrating) {
+    Vector<0> outward;
+    Scalar<0> depth;
+    penetration_geometry(hull, selection.penetration_facet, start, delta, outward, depth);
+    signed_distance = -depth.value-radius;
+  } else {
+    signed_distance = sqrtf(selection.squared_distance)-radius;
+  }
+  if (signed_distance >= 0.f) return;
+  Vector<0> axis = delta*(Scalar<0>(1.f)/square_root(dot(delta, delta)));
+  Vector<0> skin_start = capsule_surface_start(hull, selection, start, delta, radius);
+  Vector<0> hull_witness = selection.witness.surface;
+  float best_alignment = 0.f;
+  for (int i = 0; i < c_hull_facenum[hull]; ++i) {
+    int face = c_hull_faceadr[hull]+i;
+    Vector<0> normal = face_normal<0>(face);
+    if (fabsf(dot(normal, axis).value) >= capsule_face_alignment) continue;
+    Vector<0> a = vertex<0>(hull, c_hull_faces[3*face]);
+    if (fabsf(dot(normal, hull_witness-a).value) > geometry_tolerance) continue;
+    float alignment = -dot(normal, initial_normal).value;
+    if (alignment <= best_alignment) continue;
+    FaceManifold manifold;
+    if (!clip_face(hull, face, skin_start, delta, manifold)) continue;
+    Scalar<0> lower = face_parameter(hull, manifold, manifold.lower, skin_start, delta);
+    Scalar<0> upper = face_parameter(hull, manifold, manifold.upper, skin_start, delta);
+    float d0 = dot(normal, skin_start+delta*lower-a).value;
+    float d1 = dot(normal, skin_start+delta*upper-a).value;
+    if (fminf(d0, d1) >= 0.f) continue;
+    best_alignment = alignment;
+    selection.manifold = manifold;
+    selection.face_manifold = true;
+  }
+}
+
 __device__ int select_slot(const Selection& selection, int slot, Feature& feature) {
+  if (selection.face_manifold) { feature = selection.feature; return Valid; }
   float best_distance = sqrtf(selection.squared_distance);
   float witness_tolerance = fmaxf(geometry_tolerance,
                                   32.f*1.1920928955078125e-7f*fmaxf(1.f, best_distance));
@@ -402,14 +511,26 @@ template<int D> __device__ void local_inputs(int hull, const float* center, cons
 }
 template<int D> __device__ void outputs(int hull, const Feature& feature, const Vector<D>& start,
                                          const Vector<D>& delta, float radius, const float* hull_position,
-                                         const float* hull_quaternion, const PenetrationFacet* penetration,
+                                         const float* hull_quaternion, const Selection& selection, int slot,
                                          Scalar<D>* output) {
   Vector<D> normal, position;
   Scalar<D> signed_distance;
-  if (penetration) {
+  if (selection.face_manifold) {
+    const FaceManifold& manifold = selection.manifold;
+    Vector<D> skin_start = capsule_surface_start(hull, selection, start, delta, radius);
+    Scalar<D> t = face_parameter(hull, manifold, slot == 0 ? manifold.lower : manifold.upper,
+                                  skin_start, delta);
+    Vector<D> skin = skin_start+delta*t;
+    Vector<D> outward = face_normal<D>(manifold.face);
+    Vector<D> a = vertex<D>(hull, c_hull_faces[3*manifold.face]);
+    signed_distance = dot(outward, skin-a);
+    Vector<D> surface = skin-outward*signed_distance;
+    normal = outward*Scalar<D>(-1.f);
+    position = (surface+skin)*Scalar<D>(.5f);
+  } else if (selection.penetrating) {
     Vector<D> outward;
     Scalar<D> depth;
-    penetration_geometry(hull, *penetration, start, delta, outward, depth);
+    penetration_geometry(hull, selection.penetration_facet, start, delta, outward, depth);
     Witness<D> witness = replay(hull, feature, start+outward*depth, delta);
     Vector<D> original_centerline = start+delta*witness.parameter;
     normal = outward*Scalar<D>(-1.f);
@@ -462,12 +583,13 @@ __device__ int static_convex_contact(int geom, int slot, const float* center, co
   Selection selected;
   int status = select(hull, start, delta, selected);
   if (status != Valid) return status;
+  select_face_manifold(hull, start, delta, radius, selected);
   Feature feature;
   status = select_slot(selected, slot, feature);
   if (status != Valid) return status;
   Scalar<0> output[13];
   outputs(hull, feature, start, delta, radius, hull_position, hull_quaternion,
-          selected.penetrating ? &selected.penetration_facet : nullptr, output);
+          selected, slot, output);
   *distance = output[0].value;
   for (int i = 0; i < 3; ++i) position[i] = output[1+i].value;
   for (int i = 0; i < 9; ++i) frame[i] = output[4+i].value;
@@ -486,6 +608,7 @@ __device__ int static_convex_vjp(int geom, int slot, const float* center, const 
   Selection selected;
   int status = select(hull, start, delta, selected);
   if (status != Valid) return status;
+  select_face_manifold(hull, start, delta, radius, selected);
   Feature feature;
   status = select_slot(selected, slot, feature);
   if (status != Valid) return status;
@@ -495,7 +618,7 @@ __device__ int static_convex_vjp(int geom, int slot, const float* center, const 
   Scalar<6> output[13];
   outputs(hull, feature, differentiable_start, differentiable_delta, radius,
           hull_position, hull_quaternion,
-          selected.penetrating ? &selected.penetration_facet : nullptr, output);
+          selected, slot, output);
   for (int i = 0; i < 6; ++i)
     for (int k = 0; k < 13; ++k) gradient[i] += cotangent[k]*output[k].derivative[i];
   return Valid;

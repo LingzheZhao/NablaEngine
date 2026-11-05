@@ -19,7 +19,10 @@ from check_convex_contact_gradients import MujocoOracle, cases, load_ply, rotati
 
 PROTOCOL = {
     'scope': 'float32 CUDA packed static convex hull sphere/capsule forward and six-pose VJP',
-    'contacts': 'unique witness in slot0, near-minimum-distance min/max segment parameters in slots0/1',
+    'contacts': 'capsule surface edge clipped to an adjacent face gives slots0/1, edge contact retains near-minimum witnesses',
+    'capsule_face_alignment': .0888,
+    'face_manifold_position_atol': 2e-4,
+    'face_manifold_normal_cosine_min': .99999,
     'geometry_tolerance_m': 2e-5,
     'manifold_distance_tolerance_m': 2e-6,
     'manifold_relative_tolerance': '8*float32_epsilon*max(1,centerline_distance)',
@@ -48,7 +51,7 @@ PROTOCOL = {
                  'capsule_nearparallel_two_contacts', 'capsule_nearparallel_unique',
                  'sphere_inside_medial_axis', 'capsule_intersection_medial_axis', 'touch_supported',
                  'sphere_inside_face', 'capsule_inside_face_endpoint', 'capsule_inside_parallel_face',
-                 'capsule_inside_side_facet'],
+                 'capsule_inside_side_facet', 'capsule_face_unequal_depth'],
 }
 
 CUDA_RUNNER = r'''
@@ -215,12 +218,22 @@ def qualification_cases(vertices, faces):
             break
     else:
         raise ValueError('declared generated side-facet coverage could not be constructed')
+    tangent = parallel['axis']
+    unequal_axis = tangent*np.sqrt(1-1./900)+outward/30.
+    matrix.append(dict(base, name='capsule_face_unequal_depth', center=face_point+outward*.001,
+                       axis=unequal_axis, half_length=.09, radius=.01,
+                       expected_contacts=2, compare_manifold=True))
     return matrix
 
 
-def run_hull(vertices, faces, directory, stream):
+def run_hull(vertices, faces, directory, stream, selected_cases=None):
     from nablaengine.model.convex import pack_static_convex_hulls
     matrix = qualification_cases(vertices, faces)
+    if selected_cases is not None:
+        available = {case['name'] for case in matrix}
+        if not set(selected_cases) <= available:
+            raise ValueError('Requested cases are absent from the declared panel')
+        matrix = [case for case in matrix if case['name'] in selected_cases]
     # One compiled mesh owns the packed representation. Robot sphere/capsule
     # models for the independent oracle all use the same compiled terrain pose.
     packed_oracle = MujocoOracle(vertices, faces, matrix[0])
@@ -255,6 +268,25 @@ def run_hull(vertices, faces, directory, stream):
                            oracle_distance=distance, oracle_witness=witness,
                            compiled_mesh_transform=oracle.transform)
                 row['distance_error'] = abs(float(values[index, 0])-distance)
+                if case.get('compare_manifold'):
+                    contacts = []
+                    for contact in oracle.data.contact[:oracle.data.ncon]:
+                        first, second = map(int, contact.geom)
+                        if {first, second} != {oracle.robot, oracle.h}:
+                            continue
+                        normal = np.array(contact.frame[:3])*(1 if first == oracle.robot else -1)
+                        contacts.append(dict(distance=float(contact.dist), position=contact.pos.tolist(),
+                                             normal=normal.tolist()))
+                    row['oracle_contacts'] = contacts
+                    if not contacts:
+                        raise ValueError('Independent MuJoCo collision produced no face manifold')
+                    matched = min(contacts, key=lambda contact: np.linalg.norm(values[index, 1:4]-contact['position']))
+                    row['distance_error'] = abs(float(values[index, 0])-matched['distance'])
+                    row['contact_position_error'] = float(np.linalg.norm(values[index, 1:4]-matched['position']))
+                    row['contact_normal_cosine'] = float(values[index, 4:7]@matched['normal'])
+                    row['manifold_geometry_passed'] = (len(contacts) == case['expected_contacts']
+                        and row['contact_position_error'] <= PROTOCOL['face_manifold_position_atol']
+                        and row['contact_normal_cosine'] >= PROTOCOL['face_manifold_normal_cosine_min'])
                 row['finite_output_and_jacobian'] = bool(np.isfinite(values[index]).all() and np.isfinite(jacobians[index]).all())
                 reference_value = np.full(13, np.nan)
                 reference_input = x.astype(np.float64)
@@ -263,7 +295,7 @@ def run_hull(vertices, faces, directory, stream):
                 row['forward_max_error'] = float(np.abs(values[index]-reference_value).max())
                 row['forward_passed'] = bool(reference_status == 1 and np.allclose(values[index], reference_value,
                     atol=PROTOCOL['forward_atol'], rtol=PROTOCOL['forward_rtol']))
-                row['passed'] = bool(row['distance_error'] <= PROTOCOL['distance_atol'] and row['finite_output_and_jacobian'])
+                row['passed'] = bool(row['distance_error'] <= PROTOCOL['distance_atol'] and row['finite_output_and_jacobian'] and row.get('manifold_geometry_passed', True))
                 try:
                     baseline, fds = finite_differences(reference, x)
                     row['finite_differences'] = [fd.tolist() for fd in fds]
@@ -292,11 +324,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hulls', nargs='+', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--cases', nargs='+', help='Explicit subset of the declared generated cases')
     parser.add_argument('--code-revision', required=True)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out/'protocol.json').write_text(json.dumps(dict(PROTOCOL, code_revision=args.code_revision,
-        hulls=[str(path) for path in args.hulls]), indent=2)+'\n')
+        hulls=[str(path) for path in args.hulls], selected_cases=args.cases), indent=2)+'\n')
     from scipy.spatial import ConvexHull
     import mujoco
     (args.out/'environment.json').write_text(json.dumps(dict(mujoco=mujoco.__version__), indent=2)+'\n')
@@ -309,7 +342,7 @@ def main():
             directory = args.out/name
             try:
                 directory.mkdir(exist_ok=False)
-                rows.extend(run_hull(vertices, faces, directory, stream))
+                rows.extend(run_hull(vertices, faces, directory, stream, args.cases))
             except Exception:
                 failure = dict(hull=name, passed=False, setup_error=traceback.format_exc())
                 stream.write(json.dumps(failure)+'\n'); stream.flush(); rows.append(failure)
