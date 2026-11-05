@@ -1,6 +1,6 @@
 """Experimental external-centerline contacts against one static convex hull.
 
-CPU/Torch reference primitive only: no engine dispatch or contact manifold claim.
+Torch reference primitive only: no engine dispatch or contact manifold claim.
 Topology selection uses detached values; continuous witness parameters keep gradients.
 """
 from dataclasses import dataclass

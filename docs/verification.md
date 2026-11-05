@@ -176,7 +176,7 @@ terrain-0 hull (46 vertices, 88 faces), CPU/CUDA, float32/float64, six smooth qu
 per combination. The 48 smooth queries passed independent MuJoCo distance checks, finite-difference stability and
 all eight-output/six-pose Jacobian checks; the 32 rejection conditions failed in the declared way. Compiled mesh
 world vertices were checked independently of MuJoCo's mesh-centering transform. The largest distance difference
-was 1.34e-7 m, largest Jacobian/FD difference 0.00412 (float32), and largest CUDA/CPU Jacobian difference 1.95e-10.
+was 1.34e-7 m, largest Jacobian/FD difference 0.00411 (float32), and largest CUDA/CPU Jacobian difference 1.95e-10.
 The physical oracle checks distance, not an independent physical-engine gradient or contact manifold.
 
 Earlier complete readings were 60/80, because an area-versus-length degeneracy check rejected thin float32 hull
