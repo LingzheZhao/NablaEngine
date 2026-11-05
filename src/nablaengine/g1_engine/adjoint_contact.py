@@ -598,4 +598,16 @@ __device__ void mv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i
         stop += 1
     frame = primitives[start:stop].replace('float', 'BoxDual')
     frame = frame.replace('dot3_rn(n, b)', 'dot3(n, b)').replace('RFMS(n[k], d, b[k])', '(n[k]*d-b[k])').replace('normalize3_rn(b);', 'BoxDual norm=sqrtf(dot3(b,b)); for(int k=0;k<3;k++) b[k]=b[k]/norm;').replace('cross_rn(n, b, c);', 'c[0]=n[1]*b[2]-n[2]*b[1]; c[1]=n[2]*b[0]-n[0]*b[2]; c[2]=n[0]*b[1]-n[1]*b[0];')
-    return prelude + frame + code
+    wrapper = r'''
+__device__ bool static_box_capsule_vjp(int slot,const float*cp,const float*axis,float radius,float half_length,
+ const float*bp,const float*R,const float*bs,const float*cot,float*gb){
+ BoxDual p[3],a[3],b[3],rot[9],size[3],dist,pos[3],fr[9];
+ for(int k=0;k<3;k++){p[k]=cp[k];p[k].d[k]=1.f;a[k]=axis[k];b[k]=bp[k];size[k]=bs[k];}
+ for(int j=0;j<3;j++){int u=(j+1)%3,v=(j+2)%3;a[u].d[3+j]=-axis[v];a[v].d[3+j]=axis[u];}
+ for(int k=0;k<9;k++)rot[k]=R[k];
+ if(!dual_capsule_box_contact(slot,p,a,BoxDual(radius),BoxDual(half_length),b,rot,size,&dist,pos,fr))return false;
+ for(int j=0;j<6;j++){gb[j]=cot[0]*dist.d[j];for(int k=0;k<3;k++)gb[j]+=cot[1+k]*pos[k].d[j];for(int k=0;k<9;k++)gb[j]+=cot[4+k]*fr[k].d[j];}
+ return true;
+}
+'''
+    return prelude + frame + code + wrapper
