@@ -1,11 +1,54 @@
 # Contact capacity qualification
 
+The current default is 128 active contacts and 576 constraint rows. Candidate pairs and collision geoms have
+16-bit indices, independently of the active-contact capacity. The row allocation covers 128 condim-3 contacts,
+35 dof frictionloss rows and 29 hinge-limit rows. Tape format 4 uses uint32 contact entries and an 8/10/6/8-bit
+count header; Torch artifacts use version 4. Current primitives emit slots 0 through 7.
+
+## Current sparse-contact candidate-index check
+
+At the [qualified implementation](https://github.com/LingzheZhao/NablaEngine/tree/41c820ae0b9ee9533f2625e2a1e7b2f5270d6167),
+`scripts/check_pair_capacity.py` passed all three generated model conditions on an NVIDIA GeForce RTX 3090,
+with MuJoCo 3.17.0, NumPy 2.5.1 and PyTorch 2.13.0+cu129. Each condition ran one and four controls, with four
+substeps per control and a 50-iteration Newton cap, starting at the script's `qpos0_asymmetric_contact` state
+with foot friction 1 and zero torso COM offset. Both horizons passed forward comparison with MuJoCo and all nine
+directional-gradient conditions, using double-precision MuJoCo finite differences at steps 1e-5 and 5e-6.
+Forward position/velocity margins are 2e-4/2e-2; gradient margins are atol 0.003 and rtol 0.03.
+
+The large input has 577 total geoms, 542 collision geoms and 15,231 unique explicit pairs. Its 15,184 distant
+box/robot pairs expand the candidate table; a physically equivalent 47-pair control retains the same geoms and
+active support. The original 502-pair fixture is a third condition. These generated inputs match the intended
+full-scene index counts; they are not the source G1 with all six CoACD terrains. All conditions actually use 28
+active contacts and 112 rows per substep. High active pair IDs are 2547–2553 and 11691–11697. At both horizons,
+the large model agrees with the 47-pair control in final position, velocity and VJP under the declared margins.
+The large model's largest generalized-position/velocity differences from MuJoCo are 8.64e-8/8.10e-6 after one
+control and 2.47e-7/4.76e-6 after four. All unmodified tape and backward flags are zero, with no contact/row
+overflow, nonconvergence, singularity, nonfinite gradient or replay mismatch.
+
+Negative controls mask actual tape pair IDs to eight or eleven bits. Both masks change 112 contact entries at
+one control and 448 at four controls; all four conditions trigger replay mismatches. Their intentionally invalid
+backward diagnostics remain separate from the clean positive checks.
+
+For 256 repeated worlds and four substeps, the large model's forward-plus-backward CUDA-event time has median
+3.292 ms over ten measurements after three warmups; the 47-pair control reads 1.396 ms and the original fixture
+1.022 ms. This is one control's sparse-contact execution, excluding host transfers, with no speed pass threshold.
+Compiled sizes are 94,240 bytes for `Sim`, 24,544 for `Adj` and 6400 per tape record. The split forward requests
+52,848 dynamic shared bytes for `k_pre` and 8176 for `k_post`, with zero static shared bytes; both kernels opt in
+to their requested sizes. The device's per-block opt-in limit is 101,376 bytes.
+
+An earlier check compiled the large model but failed its first forward launch because `k_pre` requested more
+than the default 48 KiB without opting in. The corrected check above retains the same physical margins. These
+results qualify wide candidate indices with sparse active contacts. They do not qualify dense 128-contact
+execution, all-six-terrain dynamics, task fidelity or full training throughput.
+
+## Earlier 96-contact / 416-row qualification
+
 The 96-contact / 416-row extension passes bounded tests of storage, native execution,
 contact Jacobians and Hessians on one NVIDIA CMP 170HX. It does not establish that
 96 contacts cover every possible state. Callers must keep the overflow checks active;
 the NablaMimic reproduction rejects a training update with lost physics.
 
-The model is the current donor G1: 36 qpos coordinates, 35 velocity coordinates,
+The model in that qualification is the donor G1: 36 qpos coordinates, 35 velocity coordinates,
 29 actuators, 31 bodies and 502 declared collision pairs. The extension keeps its
 collision geometry, physical constants, Newton settings and adjoint options.
 Contact sets use three 32-bit tiles; DOF masks retain their original meaning.
@@ -13,7 +56,7 @@ Hessian accumulation keeps all world-contact groups before self contacts.
 A tape record grows from 1472 to 1504 float32 words, with 13 row-zone words and
 the same 7/9/8/8-bit header. Old libraries must be rebuilt.
 
-The source and dependency revisions, input arrays, complete diagnostics and failed
+For that qualification, the source and dependency revisions, input arrays, complete diagnostics and failed
 conditions are recorded beside the provisioned runs. The public donor's
 [capacity study](https://github.com/LingzheZhao/NablaMimic/tree/codex/pytorch-nablaengine/studies/pytorch)
 contains the runnable programs and frozen protocol. Numerical margins were fixed
