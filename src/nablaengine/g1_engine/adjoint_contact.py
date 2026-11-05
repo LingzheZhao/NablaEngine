@@ -319,6 +319,16 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
   *nu = __int_as_float(0x7f800000);
   if (cot)
     for (int k = 0; k < 12; k++) gb[k] = 0.f;
+#if HAS_BOX
+  if (t1 == 2 && t2 == 3) { // capsule against a static world box; host gate enforces topology
+    float axis[3], rotation[9];
+    zaxis_rn(q1, axis);
+    quat2mat(q2, rotation);
+    if (!capsule_box_contact(slot,p1,axis,sz1[0],sz1[1],p2,rotation,sz2,dist,pos,fr)) return -1;
+    if (cot && !static_box_capsule_vjp(slot,p1,axis,sz1[0],sz1[1],p2,rotation,sz2,cot,gb)) return -1;
+    return br;
+  }
+#endif
   if (t1 == 0) {  // plane (the floor, static): normal = its z axis; the frame does not depend on the other geom...
     float n[3];
     zaxis_rn(q1, n);
@@ -537,7 +547,7 @@ __device__ __forceinline__ void geom_to_body_vjp(const float* xg, const float* X
 
 def source(m):
     """header(m) + DEVICE: the contact adjoint's device code for model m, to place after step.STEP_DEVICE."""
-    return header(m) + DEVICE
+    return header(m) + (static_box_dual_source() if any(int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_BOX) for g in step.collision_geoms(m)) else '') + DEVICE
 
 
 def static_box_dual_source():
