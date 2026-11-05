@@ -2018,10 +2018,10 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec) {
     s.nefc_dof = ndof;  // dof rows (frictionloss, limits) come first; contact rows follow
   }
   PROF(4);
-  if (rec)  // tape: the contact table in contact (= row) order, two 16-bit entries pair | slot << 9 per word
+  if (rec)  // tape: the contact table in contact (= row) order, two 16-bit entries pair | slot << TAPE_PAIR_BITS per word
     for (int i = lane; i < (MAXCON + 1) / 2; i += 32) {
-      unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << 9 : TAPE_CON_NONE;
-      unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << 9
+      unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << TAPE_PAIR_BITS : TAPE_CON_NONE;
+      unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << TAPE_PAIR_BITS
                                      : TAPE_CON_NONE;
       __stcs(rec + OFF_CON + i, __uint_as_float(e0 | e1 << 16));
     }
@@ -2233,7 +2233,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       __stcs(rec + OFF_HDR, __uint_as_float(hd));
       __stcs(rec + OFF_FLAGS, __uint_as_float(fl));
       __stcs(rec + OFF_MIN_NU, nu);
-      __stcs(rec + OFF_RESERVED, 0.f);
+      __stcs(rec + OFF_RESERVED, __uint_as_float(TAPE_FORMAT_MARKER));
     }
   }
   for (int i = lane; i < NV; i += 32) s.qvel[i] += h * s.tmp[i];

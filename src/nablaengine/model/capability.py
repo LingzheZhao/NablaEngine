@@ -387,7 +387,8 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and 1 <= maxcon <= step.MAX_CONTACTS and m.npair < 65536, "error",
         f"<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, 1 <= MAXCON <= {step.MAX_CONTACTS}",
         dict(ngeomc=len(cg), param_sets=npset, kdof=kdof, maxcon=maxcon))
-    add("H26b", m.npair <= 512, "error", "at most 512 contact pairs (the tape's 9-bit pair index)", int(m.npair),
+    from nablaengine.g1_engine.tape import PAIR_CAPACITY
+    add("H26b", m.npair <= PAIR_CAPACITY, "error", "at most 2048 contact pairs (the tape's 11-bit pair index)", int(m.npair),
         ("adjoint",))
     if foot_pairs is not None:
         fps = [int(p) for p in np.asarray(foot_pairs).ravel()]

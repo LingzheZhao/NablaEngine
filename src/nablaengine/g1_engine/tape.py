@@ -22,6 +22,11 @@ FLAG_NONCONV = 1 << 9  # the Newton iterations ran out before the stopping test 
 FLAG_SINGULAR = 1 << 10  # min_nu < SINGULAR_NU: a self contact whose geom axes (or centres) nearly meet
 FLAG_VERIFY_DIFF = 1 << 11  # -DDK_TAPE_VERIFY: L_H differs from a re-assembly at the final zones (expected only with REFACT)
 SINGULAR_NU = 5e-3  # m
+PAIR_BITS = 11
+PAIR_MASK = (1 << PAIR_BITS) - 1
+PAIR_CAPACITY = 1 << PAIR_BITS
+SLOT_CAPACITY = 1 << (16 - PAIR_BITS)
+FORMAT_MARKER = 0x4E54020B  # NT, format 2, 11-bit pair index
 CON_NONE = 0xFFFF  # contact table entry past ncon
 
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
@@ -32,7 +37,7 @@ _FIELDS = (
     ("reserved", "OFF_RESERVED", 1),
     ("clamp", "OFF_CLAMP", lambda nq, nv, ntri, nc: -(-nv // 32)),  # dof bits: actuator force at its limit
     ("zone", "OFF_ZONE", lambda nq, nv, ntri, nc: -(-step.NEFC // 32)),  # row bits: quadratic zone (row in the Hessian)
-    ("con", "OFF_CON", lambda nq, nv, ntri, nc: -(-nc // 2)),  # u16 per contact (row order): pair | slot << 9
+    ("con", "OFF_CON", lambda nq, nv, ntri, nc: -(-nc // 2)),  # u16 per contact (row order): pair | slot << PAIR_BITS
     ("qpos", "OFF_QPOS", lambda nq, nv, ntri, nc: nq),  # substep input
     ("qvel", "OFF_QVEL", lambda nq, nv, ntri, nc: nv),
     ("qacc", "OFF_QACC", lambda nq, nv, ntri, nc: nv),  # final Newton acceleration a* (the warm start of the next one)
@@ -48,7 +53,7 @@ _FIELDS = (
 def _table(m, max_contacts=None):
     nc = step.maxcon(m) if max_contacts is None else step.validate_maxcon(max_contacts)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    assert nv <= 64 and m.npair <= 512 and nc <= 127 and step.NEFC <= 511, "field widths (clamp u64, pair 9 bits, ncon 7 / nefc 9 bits)"
+    assert nv <= 64 and m.npair <= PAIR_CAPACITY and nc <= 127 and step.NEFC <= 511, "field widths (clamp u64, pair 11 bits, ncon 7 / nefc 9 bits)"
     out, off = [], 0
     for name, define, n in _FIELDS:
         if name is None:
@@ -75,6 +80,8 @@ def header(m, max_contacts=None):
     tab, total = _table(m, max_contacts)
     lines = [f"#define REC_WORDS {total}  // tape record (tape.py): words per world and substep"]
     lines += [f"#define {define} {off}  // {name}, {n} words" for name, define, off, n in tab]
+    lines += [f"#define TAPE_PAIR_BITS {PAIR_BITS}", f"#define TAPE_PAIR_MASK {PAIR_MASK}u",
+              f"#define TAPE_FORMAT_MARKER {FORMAT_MARKER}u"]
     lines += [f"#define TAPE_REFACT {FLAG_REFACT}u", f"#define TAPE_NONCONV {FLAG_NONCONV}u",
               f"#define TAPE_SINGULAR {FLAG_SINGULAR}u", f"#define TAPE_VERIFY_DIFF {FLAG_VERIFY_DIFF}u",
               f"#define TAPE_SINGULAR_NU {SINGULAR_NU}f", f"#define TAPE_CON_NONE {CON_NONE}u"]
@@ -98,6 +105,8 @@ def decode(arr, m, max_contacts=None):
     nw = rec_words(m, max_contacts)
     assert a.shape[-1] == nw, (a.shape, nw)
     u = a.view(np.uint32)
+    if np.any(u[..., layout(m, max_contacts)["reserved"][0]] != FORMAT_MARKER):
+        raise ValueError("incompatible tape contact encoding")
     lay = layout(m, max_contacts)
     sl = lambda name: slice(lay[name][0], lay[name][0] + lay[name][1])  # noqa: E731
     hdr, flags = u[..., lay["hdr"][0]].astype(np.int64), u[..., lay["flags"][0]].astype(np.int64)
@@ -115,7 +124,17 @@ def decode(arr, m, max_contacts=None):
     nc = step.maxcon(m) if max_contacts is None else step.validate_maxcon(max_contacts)
     e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
     past = np.arange(nc) >= out["ncon"][..., None]
-    out["pair"], out["slot"] = np.where(past, -1, e & 511), np.where(past, -1, e >> 9)
+    out["pair"], out["slot"] = np.where(past, -1, e & PAIR_MASK), np.where(past, -1, e >> PAIR_BITS)
     for name in ("qpos", "qvel", "qacc", "qacc_adv", "L_H", "L_Q"):
         out[name] = a[..., sl(name)]
     return out
+
+
+def pack_contact(pair, slot):
+    """Pack one active contact. The all-ones entry remains reserved."""
+    if not 0 <= pair < PAIR_CAPACITY or not 0 <= slot < SLOT_CAPACITY:
+        raise ValueError('contact pair or slot exceeds its field')
+    entry = int(pair) | int(slot) << PAIR_BITS
+    if entry == CON_NONE:
+        raise ValueError('contact collides with the reserved sentinel')
+    return entry
