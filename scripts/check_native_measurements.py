@@ -58,10 +58,15 @@ def run(out, report):
                   timestep_s=float(m.opt.timestep), sampling_hz=1./float(m.opt.timestep),
                   body_names=[m.body(i).name for i in range(m.nbody)],
                   dof_joint_names=[m.joint(m.dof_jntid[i]).name for i in range(6, m.nv)])
-    equal = {key: torch.equal(ordinary[i], measured[key])
+    # Tape contains integer fields transported as float32, including NaN bit
+    # patterns for absent contacts. Compare storage bits, including signed zero.
+    equal = {key: torch.equal(ordinary[i].view(torch.int32), measured[key].view(torch.int32))
              for i, key in enumerate(('qpos', 'qvel', 'warm', 'info', 'tape'))}
+    different_words = {key: int((ordinary[i].view(torch.int32) != measured[key].view(torch.int32)).sum())
+                       for i, key in enumerate(('qpos', 'qvel', 'warm', 'info', 'tape'))}
     arrays = {key: value.detach().cpu().numpy() for key, value in measured.items()}
-    np.savez_compressed(out/'measurements.npz', input_qpos=q, input_qvel=v, input_ctrl=u, **arrays)
+    np.savez_compressed(out/'measurements.npz', input_qpos=q, input_qvel=v, input_ctrl=u,
+                        ordinary_tape=ordinary[4].detach().cpu().numpy(), **arrays)
     decoded = tape.decode(arrays['tape'].reshape(3, 4, tape.rec_words(m)), m)
     wrench = arrays['terrain_wrench'].astype(float)
     count = arrays['terrain_contact_count']
@@ -117,7 +122,7 @@ def run(out, report):
     flags_ok = not np.any(decoded['flags'] & bad_mask)
     all_finite = all(np.isfinite(arrays[key]).all() for key in ('qpos', 'qvel', 'warm', 'terrain_wrench', 'actuator_torque'))
     saturated = bool(np.any(np.isclose(abs(actuator[2, 0]), packed['c_frclim'][6:], atol=.0003, rtol=0)))
-    report.update(bitwise_equal=equal, rows=rows, saturated_actuator_present=saturated, terrain_reaction_balances=reaction_ok,
+    report.update(bitwise_equal=equal, different_storage_words=different_words, rows=rows, saturated_actuator_present=saturated, terrain_reaction_balances=reaction_ok,
                   no_terrain_contact_zero_force=airborne_zero, foot_contact_present=contact_ok,
                   strict_flags_ok=bool(flags_ok), finite=all_finite,
                   diagnostics=F.read_diagnostics(reset=True))
