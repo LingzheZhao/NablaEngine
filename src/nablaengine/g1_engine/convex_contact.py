@@ -172,12 +172,14 @@ template<int D> __device__ void penetration_geometry(int hull, const Penetration
 
 struct FaceLimit { int plane, endpoint; };
 struct FaceManifold { int face; FaceLimit lower, upper; };
-struct Selection {
+struct ContactSelection {
   bool face_manifold;
   FaceManifold manifold;
   bool penetrating;
   PenetrationFacet penetration_facet;
   Feature feature;
+};
+struct Selection : ContactSelection {
   Witness<0> witness;
   float squared_distance;
   bool found, has_extrema;
@@ -389,7 +391,7 @@ __device__ int select(int hull, const Vector<0>& start, const Vector<0>& delta, 
   return selection.status;
 }
 
-template<int D> __device__ Vector<D> contact_normal(int hull, const Selection& selection,
+template<int D> __device__ Vector<D> contact_normal(int hull, const ContactSelection& selection,
                                                       const Vector<D>& start, const Vector<D>& delta) {
   if (selection.penetrating) {
     Vector<D> normal;
@@ -401,7 +403,7 @@ template<int D> __device__ Vector<D> contact_normal(int hull, const Selection& s
   Vector<D> offset = witness.surface-witness.centerline;
   return offset*(Scalar<D>(1.f)/square_root(dot(offset, offset)));
 }
-template<int D> __device__ Vector<D> capsule_surface_start(int hull, const Selection& selection,
+template<int D> __device__ Vector<D> capsule_surface_start(int hull, const ContactSelection& selection,
                                                             const Vector<D>& start,
                                                             const Vector<D>& delta, float radius) {
   Vector<D> axis = delta*(Scalar<D>(1.f)/square_root(dot(delta, delta)));
@@ -530,7 +532,7 @@ template<int D> __device__ void local_inputs(int hull, const float* center, cons
 }
 template<int D> __device__ void outputs(int hull, const Feature& feature, const Vector<D>& start,
                                          const Vector<D>& delta, float radius, const float* hull_position,
-                                         const float* hull_quaternion, const Selection& selection, int slot,
+                                         const float* hull_quaternion, const ContactSelection& selection, int slot,
                                          Scalar<D>* output) {
   Vector<D> normal, position;
   Scalar<D> signed_distance;
@@ -585,10 +587,73 @@ template<int D> __device__ void outputs(int hull, const Feature& feature, const 
     output[10+i] = third.x[i];
   }
 }
+// One physical input owns the selected features until its two slots and VJPs
+// finish. Candidate-search witnesses are discarded after deriving slot features.
+struct PreparedContact {
+  int hull;
+  Vector<0> start, delta;
+  ContactSelection selection;
+  Feature feature[2];
+  int status[2];
+};
 }  // namespace static_convex
 
 // All negative return values must fail the world/batch. Positive-distance valid
 // queries are ordinary noncontacts and can be discarded by the pair dispatcher.
+__device__ int static_convex_prepare(int geom, const float* center, const float* axis,
+                                      float radius, float half_length, const float* hull_position,
+                                      const float* hull_quaternion, static_convex::PreparedContact& prepared) {
+  using namespace static_convex;
+  int hull = c_ghull[geom];
+  if (hull < 0) return InvalidGeometry;
+  prepared.hull = hull;
+  local_inputs(hull, center, axis, half_length, hull_position, hull_quaternion,
+               prepared.start, prepared.delta);
+  Selection selected{};
+  int status = select(hull, prepared.start, prepared.delta, selected);
+  if (status != Valid) return status;
+  select_face_manifold(hull, prepared.start, prepared.delta, radius, selected);
+  prepared.selection = selected;
+  for (int slot = 0; slot < 2; ++slot)
+    prepared.status[slot] = select_slot(selected, slot, prepared.feature[slot]);
+  return Valid;
+}
+__device__ int static_convex_contact_selected(const static_convex::PreparedContact& prepared,
+                                               int slot, float radius, const float* hull_position,
+                                               const float* hull_quaternion, float* distance,
+                                               float* position, float* frame) {
+  using namespace static_convex;
+  if (slot < 0 || slot > 1) return InvalidSlot;
+  int status = prepared.status[slot];
+  if (status != Valid) return status;
+  Scalar<0> output[13];
+  outputs(prepared.hull, prepared.feature[slot], prepared.start, prepared.delta, radius,
+          hull_position, hull_quaternion, prepared.selection, slot, output);
+  *distance = output[0].value;
+  for (int i = 0; i < 3; ++i) position[i] = output[1+i].value;
+  for (int i = 0; i < 9; ++i) frame[i] = output[4+i].value;
+  return Valid;
+}
+__device__ int static_convex_vjp_selected(const static_convex::PreparedContact& prepared,
+                                           int slot, const float* center, const float* axis,
+                                           float radius, float half_length, const float* hull_position,
+                                           const float* hull_quaternion, const float* cotangent,
+                                           float* gradient) {
+  using namespace static_convex;
+  for (int i = 0; i < 6; ++i) gradient[i] = 0.f;
+  if (slot < 0 || slot > 1) return InvalidSlot;
+  int status = prepared.status[slot];
+  if (status != Valid) return status;
+  Vector<6> differentiable_start, differentiable_delta;
+  local_inputs(prepared.hull, center, axis, half_length, hull_position, hull_quaternion,
+               differentiable_start, differentiable_delta);
+  Scalar<6> output[13];
+  outputs(prepared.hull, prepared.feature[slot], differentiable_start, differentiable_delta, radius,
+          hull_position, hull_quaternion, prepared.selection, slot, output);
+  for (int i = 0; i < 6; ++i)
+    for (int k = 0; k < 13; ++k) gradient[i] += cotangent[k]*output[k].derivative[i];
+  return Valid;
+}
 __device__ int static_convex_contact(int geom, int slot, const float* center, const float* axis,
                                       float radius, float half_length, const float* hull_position,
                                       const float* hull_quaternion, float* distance, float* position,
