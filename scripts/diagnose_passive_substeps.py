@@ -34,8 +34,8 @@ def main():
         for i in range(len(decoded['qpos'])):
             data=mujoco.MjData(model);data.qpos[:]=decoded['qpos'][i];data.qvel[:]=decoded['qvel'][i]
             data.ctrl[:]=state['u'];data.qacc_warmstart[:]=decoded['qacc'][i-1] if i else 0
-            mujoco.mj_forward(model,data)
             v_before=data.qvel.copy();q_before=data.qpos.copy()
+            mujoco.mj_step(model,data)
             row=dict(state=name,controls=controls,substep=i,
                      qacc_max_error=float(np.max(np.abs(data.qacc-decoded['qacc'][i]))),
                      engine_qacc=decoded['qacc'][i].tolist(),mujoco_qacc=data.qacc.tolist(),
@@ -43,7 +43,7 @@ def main():
                      mujoco_row_id=data.efc_id.tolist(),mujoco_row_force=data.efc_force.tolist(),
                      mujoco_row_D=data.efc_D.tolist(),mujoco_aref=data.efc_aref.tolist(),
                      mujoco_J=np.asarray(data.efc_J).tolist(),qvel=v_before.tolist(),qpos=q_before.tolist())
-            mujoco.mj_step(model,data);mujoco.mj_step(model,chain)
+            mujoco.mj_step(model,chain)
             if i+1<len(decoded['qpos']):
                 row.update(same_state_next_q_error=float(np.max(np.abs(data.qpos-decoded['qpos'][i+1]))),
                            same_state_next_v_error=float(np.max(np.abs(data.qvel-decoded['qvel'][i+1]))),
