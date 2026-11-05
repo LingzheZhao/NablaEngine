@@ -229,7 +229,9 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
                 arch=arch, version=nablaengine.__version__, sources_sha256=sources_sha256(),
                 consts_sha256=hashlib.sha256(consts.tobytes()).hexdigest(), rec_words=g1_tape.rec_words(m),
                 nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
-                off_flags=int(g1_tape.layout(m)["flags"][0]), forward_unit=plan["forward_unit"],
+                off_flags=int(g1_tape.layout(m)["flags"][0]),
+                substep_input_offsets={name: int(g1_tape.layout(m)[name][0]) for name in ("qpos", "qvel")},
+                forward_unit=plan["forward_unit"],
                 variants=[list(v) for v in VARIANTS], kinematics_error=kin_error, timestep=float(m.opt.timestep),
                 foot_pairs=[int(p) for p in fp], arch_flags=plan["arch_flags"],
                 forward_defines=plan["forward_defines"], built=built,
@@ -937,6 +939,26 @@ def forward_measurements(qpos, qvel, warm, ctrl, friction, com, *, iterations=IT
     if not tape:
         output.pop("tape")
     return output
+
+
+def read_substep_inputs(tape, substeps=SUBSTEPS):
+    """Views of recorded input states at each physics substep t_k.
+
+    tape is the current loaded model's contiguous float32 CUDA forward tape,
+    shaped (B, substeps * rec_words). Returns qpos (B, substeps, nq) and qvel
+    (B, substeps, nv) as views into that same storage. Treat these views and the
+    original tape as read-only. This operation performs tensor indexing only.
+    The loaded artifact owns the current tape schema and its recorded offsets.
+    """
+    if not isinstance(substeps, int) or not 1 <= substeps <= 32:
+        raise _err("substeps must be an integer in 1..32", ValueError)
+    dev = _ready(tape)
+    nq, nv, _, _, record_words = _sizes()
+    _check("tape", tape, (tape.shape[0], substeps * record_words), dev)
+    offsets = _STATE["info"]["substep_input_offsets"]
+    records = tape.reshape(tape.shape[0], substeps, record_words)
+    return {"qpos": records[..., offsets["qpos"]:offsets["qpos"]+nq],
+            "qvel": records[..., offsets["qvel"]:offsets["qvel"]+nv]}
 
 
 def backward(tape, friction, com, g_qpos, g_qvel, *, substeps=SUBSTEPS, clamp_kv=CLAMP_KV, normal=NORMAL, ctrl=None,
