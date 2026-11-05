@@ -33,9 +33,9 @@ def main():
     load_model = fixtures.load_model
     def passive_model(*args, **kwargs):
         model, metadata = load_model(*args, **kwargs)
-        model.dof_damping[6:] = selected.passive_damping
-        model.dof_frictionloss[6:] = selected.passive_frictionloss
-        assert (model.dof_damping[6:]==selected.passive_damping).all() and (model.dof_frictionloss[6:]==selected.passive_frictionloss).all()
+        model.dof_damping[:] = selected.passive_damping
+        model.dof_frictionloss[:] = selected.passive_frictionloss
+        assert (model.dof_damping[:]==selected.passive_damping).all() and (model.dof_frictionloss[:]==selected.passive_frictionloss).all()
         return model, metadata
     fixtures.load_model = passive_model
     generate = jax_ffi.library_sources

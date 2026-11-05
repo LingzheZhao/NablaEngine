@@ -937,9 +937,9 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
 #endif
     nl += __popc(bal);
   }
-  if (lane == 0 && nl != (int)(((unsigned)s.hdr >> 16) & 255u)) s.flags |= (int)ADJ_REPLAY_MISMATCH;
+  if (lane == 0 && nl - NFLOSS != (int)(((unsigned)s.hdr >> 16) & 255u)) s.flags |= (int)ADJ_REPLAY_MISMATCH;
   __syncwarp();
-  APROF_COUNT(APROF_COUNT_LIMIT_ROWS, nl);
+  APROF_COUNT(APROF_COUNT_LIMIT_ROWS, nl - NFLOSS);
   APROF(APROF_LIMITS);
 }
 
