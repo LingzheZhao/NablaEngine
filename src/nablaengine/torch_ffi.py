@@ -62,7 +62,8 @@ _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # s
 NONFINITE_QPOS, NONFINITE_QVEL, NONFINITE_CTRL, NONFINITE_COT, NONFINITE_SHIFT = 1, 2, 4, 8, 16
 VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint builds (clamp_kv, normal)
 FWD_UNIT = "dk_fwd"
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
+TAPE_ENCODING = dict(pair_bits=11, slot_capacity=8, format_marker=0x4E54020B)
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
 SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
 
@@ -222,7 +223,7 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
         kin_error = f"the model does not meet the kinematics outputs' assumptions ({e!r})"
     stem = path.with_suffix("")
     np.save(stem.with_suffix(".npy"), consts)
-    meta = dict(artifact_version=ARTIFACT_VERSION, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
+    meta = dict(artifact_version=ARTIFACT_VERSION, tape_encoding=TAPE_ENCODING, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
                 arch=arch, version=nablaengine.__version__, sources_sha256=sources_sha256(),
                 consts_sha256=hashlib.sha256(consts.tobytes()).hexdigest(), rec_words=g1_tape.rec_words(m),
                 nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
@@ -256,6 +257,8 @@ def _stale(js, arch):
     meta = json.loads(js.read_text())
     if meta.get("artifact_version") != ARTIFACT_VERSION:
         return f"artifact version {meta.get('artifact_version')}, this module reads {ARTIFACT_VERSION}"
+    if meta.get("tape_encoding") != TAPE_ENCODING:
+        return f"incompatible tape encoding {meta.get('tape_encoding')!r}, expected {TAPE_ENCODING!r}"
     if meta["arch"] != arch:
         return f"built for {meta['arch']}, the GPU is {arch}"
     if not (js.parent / meta["library"]).exists() or not (js.parent / meta["consts"]).exists():

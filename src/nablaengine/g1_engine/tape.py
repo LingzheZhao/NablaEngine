@@ -25,7 +25,8 @@ SINGULAR_NU = 5e-3  # m
 PAIR_BITS = 11
 PAIR_MASK = (1 << PAIR_BITS) - 1
 PAIR_CAPACITY = 1 << PAIR_BITS
-SLOT_CAPACITY = 1 << (16 - PAIR_BITS)
+SLOT_FIELD_CAPACITY = 1 << (16 - PAIR_BITS)
+SLOT_CAPACITY = 8  # current collision primitives emit slots 0 through 7
 FORMAT_MARKER = 0x4E54020B  # NT, format 2, 11-bit pair index
 CON_NONE = 0xFFFF  # contact table entry past ncon
 
@@ -80,7 +81,7 @@ def header(m, max_contacts=None):
     tab, total = _table(m, max_contacts)
     lines = [f"#define REC_WORDS {total}  // tape record (tape.py): words per world and substep"]
     lines += [f"#define {define} {off}  // {name}, {n} words" for name, define, off, n in tab]
-    lines += [f"#define TAPE_PAIR_BITS {PAIR_BITS}", f"#define TAPE_PAIR_MASK {PAIR_MASK}u",
+    lines += [f"#define TAPE_PAIR_BITS {PAIR_BITS}", f"#define TAPE_PAIR_MASK {PAIR_MASK}u", f"#define TAPE_SLOT_CAPACITY {SLOT_CAPACITY}",
               f"#define TAPE_FORMAT_MARKER {FORMAT_MARKER}u"]
     lines += [f"#define TAPE_REFACT {FLAG_REFACT}u", f"#define TAPE_NONCONV {FLAG_NONCONV}u",
               f"#define TAPE_SINGULAR {FLAG_SINGULAR}u", f"#define TAPE_VERIFY_DIFF {FLAG_VERIFY_DIFF}u",

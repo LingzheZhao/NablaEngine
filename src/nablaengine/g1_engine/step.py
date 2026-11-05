@@ -2023,7 +2023,8 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec) {
       unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << TAPE_PAIR_BITS : TAPE_CON_NONE;
       unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << TAPE_PAIR_BITS
                                      : TAPE_CON_NONE;
-      if ((2 * i < ncon && e0 >= TAPE_CON_NONE) || (2 * i + 1 < ncon && e1 >= TAPE_CON_NONE)) {
+      if ((2 * i < ncon && (e0 >= TAPE_CON_NONE || s.con_slot[2 * i] >= TAPE_SLOT_CAPACITY)) ||
+          (2 * i + 1 < ncon && (e1 >= TAPE_CON_NONE || s.con_slot[2 * i + 1] >= TAPE_SLOT_CAPACITY))) {
         asm volatile("trap;");  // an active slot must fit without colliding with the sentinel
       }
       __stcs(rec + OFF_CON + i, __uint_as_float(e0 | e1 << 16));
