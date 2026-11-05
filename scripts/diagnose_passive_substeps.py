@@ -17,11 +17,13 @@ def main():
     parser.add_argument('--run',type=Path,required=True)
     parser.add_argument('--damping',type=float,required=True)
     parser.add_argument('--frictionloss',type=float,required=True)
+    parser.add_argument('--hinges-only',action='store_true')
     parser.add_argument('--out',type=Path,required=True)
     args=parser.parse_args();args.out.mkdir(parents=True,exist_ok=False)
     report=json.loads((args.run/'report.json').read_text())
     model,*_=checker.generated_model(report['condition'])
-    model.dof_damping[:]=args.damping;model.dof_frictionloss[:]=args.frictionloss
+    start=6 if args.hinges_only else 0
+    model.dof_damping[start:]=args.damping;model.dof_frictionloss[start:]=args.frictionloss
     rows=[]
     for condition in report['conditions']:
         name=condition['state'];controls=condition['controls']
