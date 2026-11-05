@@ -943,6 +943,7 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   const int g1 = PG1(pair), g2 = PG2(pair), b1 = c_gbody[g1], b2 = c_gbody[g2], dim = PDIM(pair);
   float d, p[3], fr[9], nu;
   const int br = adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr);
+  if (br < 0) { asm volatile("trap;"); return 0.f; }
   const float mu = PFOOT(pair) ? s.fric : PMU(pair);
   float ri[6];
   adj_row_impedance(PSOLREF(pair), PSOLIMP(pair), d, contact_invw(pair, mu), ri);
@@ -980,7 +981,9 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   for (int t = 0; t < 12; t++) fg[t] = 0.f;
   if (zone) {  // the primitive's VJP (it replays again) and the geoms' pose cotangents on their bodies
     float d2, p2[3], fr2[9], nu2, gb[12];
-    adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb);
+    if (adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb) < 0) {
+      asm volatile("trap;"); return 0.f;
+    }
     if (b1) geom_to_body_vjp(s.gx[g1], s.X[b1], gb, gb + 3, fg, fg + 3);
     geom_to_body_vjp(s.gx[g2], s.X[b2], gb + 6, gb + 9, fg + 6, fg + 9);
   }
