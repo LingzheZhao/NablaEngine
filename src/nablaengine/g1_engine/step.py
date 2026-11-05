@@ -620,9 +620,8 @@ __device__ void sphere_box(const float* sp, float r, const float* bp, const floa
 }
 
 // capsule-box (MuJoCo Warp's capsule_box_witness + capsule_box): up to two sphere-box contacts along the segment
-template <class S>
-__device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw, float cr, float hl, const float* bp,
-                            const float* R, const float* bs) {
+__device__ bool capsule_box_witness(const float* cp, const float* axisw, float hl, const float* bp,
+                                     const float* R, const float* bs, float* segment, float* offset) {
   float d[3] = {cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]}, pos[3], axis[3], ha[3];
   mtv3(R, d, pos);
   mtv3(R, axisw, axis);
@@ -672,7 +671,7 @@ __device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw,
         clcorner = i + (1 << j) * (ct / 6); cledge = j; cltype = ct;
       }
     }
-  if (cltype == -4) return;
+  if (cltype == -4) return false;
   float second = -4.f;
   if (cltype >= 0 && cltype / 3 != 1) {  // closest to a box corner
     int c1 = axisdir ^ clcorner;
@@ -722,6 +721,41 @@ __device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw,
     }
     second *= float(mul);
   }
+  *segment = bestseg;
+  *offset = second;
+  return true;
+}
+
+// Replay one existing forward contact slot, without emitting contacts or changing topology.
+// The caller owns activity selection; false means that this slot has no witness.
+__device__ bool capsule_box_contact(int slot, const float* cp, const float* axisw, float cr, float hl,
+                                   const float* bp, const float* R, const float* bs,
+                                   float* dist, float* pc, float* fr) {
+  float segment, offset;
+  if (slot < 0 || slot > 1 || !capsule_box_witness(cp, axisw, hl, bp, R, bs, &segment, &offset)) return false;
+  if (slot == 1 && !(offset > -3.f)) return false;
+  float d[3] = {cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]}, pos[3], axis[3], lc[3], ce[3];
+  mtv3(R, d, pos);
+  mtv3(R, axisw, axis);
+  float seg = slot == 0 ? segment : segment + offset;
+  for (int k = 0; k < 3; k++) lc[k] = pos[k] + (axis[k] * hl) * seg;
+  mv3(R, lc, ce);
+  for (int k = 0; k < 3; k++) ce[k] += bp[k];
+  float n[3];
+  sphere_box(ce, cr, bp, R, bs, dist, pc, n);
+  make_frame(n, fr);
+  return true;
+}
+
+template <class S>
+__device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw, float cr, float hl, const float* bp,
+                            const float* R, const float* bs) {
+  float bestseg, second;
+  if (!capsule_box_witness(cp, axisw, hl, bp, R, bs, &bestseg, &second)) return;
+  float d[3] = {cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]}, pos[3], axis[3], ha[3];
+  mtv3(R, d, pos);
+  mtv3(R, axisw, axis);
+  for (int k = 0; k < 3; k++) ha[k] = axis[k] * hl;
   for (int e = 0; e < 2; e++) {
     if (e == 1 && !(second > -3.f)) break;
     float seg = e == 0 ? bestseg : bestseg + second, ce[3], dist, pc[3], n[3], fr[9];
