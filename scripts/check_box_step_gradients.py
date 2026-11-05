@@ -75,9 +75,22 @@ def generated_model(condition):
         # assuming the old plane's derived fields remain valid for a box.
         probe = mujoco.MjModel.from_xml_string('<mujoco><worldbody><geom type="box" size="10 10 .1" '
                                                 'pos="0 0 -.1"/></worldbody></mujoco>')
+        # The plane was at its body's origin. Its compiled sameframe flag
+        # would otherwise make MuJoCo ignore the new -0.1 m geom translation.
+        m.geom_sameframe[floor] = probe.geom_sameframe[0]
         if not (np.array_equal(m.geom_aabb[floor], probe.geom_aabb[0])
                 and np.isclose(m.geom_rbound[floor], probe.geom_rbound[0], rtol=0, atol=1e-12)):
             raise ValueError("generated floor bounds disagree with compiled box probe")
+        kinematics = mujoco.MjData(m)
+        mujoco.mj_kinematics(m, kinematics)
+        if not (np.array_equal(kinematics.geom_xpos[floor], probe.geom_pos[0])
+                and np.array_equal(kinematics.geom_xmat[floor], np.eye(3).ravel())):
+            raise ValueError("generated floor world pose disagrees with compiled box probe")
+        # Explicit pair order is preserved by MuJoCo's compiler. The body's
+        # signature remains valid because the geom stays on the world body.
+        for p in pairs:
+            if int(m.pair_signature[p["pair"]]) != int(m.geom_bodyid[p["robot_geom"]]):
+                raise ValueError("generated floor pair body signature changed")
     m.opt.iterations = PROTOCOL["iterations"]
     fp = [int(p) for p in metadata["foot_pairs"]]
     if not set(fp) <= {p["pair"] for p in pairs}:
