@@ -538,3 +538,63 @@ __device__ __forceinline__ void geom_to_body_vjp(const float* xg, const float* X
 def source(m):
     """header(m) + DEVICE: the contact adjoint's device code for model m, to place after step.STEP_DEVICE."""
     return header(m) + DEVICE
+
+
+def static_box_dual_source():
+    """Experimental six-variable forward AD of the shared primitive, including witnesses.
+
+    Branches follow primal values. Feature boundaries remain nondifferentiable;
+    callers must qualify this primitive before using it for learning.
+    """
+    from nablaengine.g1_engine import step
+    primitives = step.STEP_DEVICE
+    begin = primitives.index('__device__ void sphere_box(')
+    end = primitives.index('template <class S>\n__device__ void capsule_box(', begin)
+    code = primitives[begin:end]
+    code = code.replace('sphere_box', 'dual_sphere_box').replace('capsule_box_witness', 'dual_capsule_box_witness').replace('capsule_box_contact', 'dual_capsule_box_contact')
+    code = code.replace('float', 'BoxDual')
+    prelude = r'''
+struct BoxDual {
+  float v, d[6];
+  __device__ BoxDual(float x=0.f):v(x) { for(int i=0;i<6;i++)d[i]=0.f; }
+  __device__ operator int() const { return int(v); }
+  __device__ BoxDual& operator+=(BoxDual b);
+  __device__ BoxDual& operator-=(BoxDual b);
+  __device__ BoxDual& operator*=(BoxDual b);
+};
+#define BOX_DUAL_OP(OP,DER) __device__ BoxDual operator OP(BoxDual a,BoxDual b){BoxDual c(a.v OP b.v);for(int i=0;i<6;i++)c.d[i]=DER;return c;}
+BOX_DUAL_OP(+,a.d[i]+b.d[i])
+BOX_DUAL_OP(-,a.d[i]-b.d[i])
+BOX_DUAL_OP(*,a.d[i]*b.v+a.v*b.d[i])
+BOX_DUAL_OP(/,(a.d[i]*b.v-a.v*b.d[i])/(b.v*b.v))
+#undef BOX_DUAL_OP
+__device__ BoxDual operator-(BoxDual a){return BoxDual(0.f)-a;}
+#define BOX_DUAL_CMP(OP) __device__ bool operator OP(BoxDual a,BoxDual b){return a.v OP b.v;}
+BOX_DUAL_CMP(<) BOX_DUAL_CMP(>) BOX_DUAL_CMP(<=) BOX_DUAL_CMP(>=)
+#undef BOX_DUAL_CMP
+__device__ BoxDual& BoxDual::operator+=(BoxDual b){*this=*this+b;return *this;}
+__device__ BoxDual& BoxDual::operator-=(BoxDual b){*this=*this-b;return *this;}
+__device__ BoxDual& BoxDual::operator*=(BoxDual b){*this=*this*b;return *this;}
+__device__ BoxDual fabsf(BoxDual a){return a.v<0.f?-a:a;}
+__device__ BoxDual fminf(BoxDual a,BoxDual b){return a.v<=b.v?a:b;}
+__device__ BoxDual fmaxf(BoxDual a,BoxDual b){return a.v>=b.v?a:b;}
+__device__ BoxDual sqrtf(BoxDual a){BoxDual c(sqrtf(a.v));for(int i=0;i<6;i++)c.d[i]=a.d[i]/(2.f*c.v);return c;}
+__device__ BoxDual safe_div(BoxDual a,BoxDual b){return fabsf(b).v<1e-15f?BoxDual(0.f):a/b;}
+__device__ BoxDual dot3(const BoxDual*a,const BoxDual*b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+__device__ void mtv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i++)b[i]=R[i]*a[0]+R[3+i]*a[1]+R[6+i]*a[2];}
+__device__ void mv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i++)b[i]=R[3*i]*a[0]+R[3*i+1]*a[1]+R[3*i+2]*a[2];}
+'''
+    # Reuse the forward frame construction as well, so tangent-basis derivatives
+    # follow its actual branch rather than a surrogate normal-only objective.
+    import re
+    match = re.search(r'__device__[^\n]*void make_frame\([^\n]*', primitives)
+    if match is None:
+        raise ValueError('shared make_frame definition unavailable')
+    start = match.start()
+    brace = primitives.index('{', start)
+    depth, stop = 1, brace + 1
+    while depth:
+        depth += (primitives[stop] == '{') - (primitives[stop] == '}')
+        stop += 1
+    frame = primitives[start:stop].replace('float', 'BoxDual')
+    return prelude + frame + code
