@@ -13,7 +13,7 @@ contact or row; no warp intrinsics, no shared state. They need source.DEVICE (qr
 step.STEP_DEVICE (kbimp, imp_raw, efc_D, contact_invw, sphere_sphere, make_frame and the primitives' geometry that
 collide_pair uses: plane_point, plane_capsule_frame, capsule_end, segment_point, capcap_*) before them in the compilation
 unit, and header(m) (which asserts the
-model: no boxes, no frictionloss rows). Unit-test labels: U4-U9 (docs/verification.md).
+model, plus sphere/capsule against static world boxes; no frictionloss rows). Unit-test labels: U4-U9 (docs/verification.md).
 
 Conventions:
 - P = grad Psi with MuJoCo Warp's res_* sign (the adjoint kernel subtracts it: qbar = qbar_dir - P). Every "bar"
@@ -59,8 +59,10 @@ from nablaengine.g1_engine import step
 
 
 def check_model(m):
-    """The contact adjoint is for the mjlab model only: collision geoms are planes, spheres and capsules
-    (no boxes), and no dof has a frictionloss row."""
+    """Validate primitive contacts and world-static boxes paired with spheres/capsules.
+
+    Dynamic boxes, other box pairings and frictionloss rows remain unsupported.
+    """
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
     from nablaengine.model.capability import unsupported_adjoint_box_pairs
     assert not unsupported_adjoint_box_pairs(m), "box VJP requires world-static box paired with sphere/capsule"
@@ -87,7 +89,7 @@ def header(m):
 #ifndef DK_ADJ_PARALLEL_EPS
 #define DK_ADJ_PARALLEL_EPS 1.2e-3f  // sin^2(theta) = |a1 x a2|^2 / (|a1|^2 |a2|^2) of DK_ADJ_PARALLEL 1 (strict <):
 #endif                               // ~sin^2(2 degrees) (theta < 1.99 degrees)
-static_assert(NFLOSS == 0, "the contact adjoint is for the mjlab model: no boxes, no frictionloss rows");
+static_assert(NFLOSS == 0, "the contact adjoint has no frictionloss rows");
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free
@@ -498,36 +500,6 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
     cross(a2, s2b, gb + 9);
   }
   return br;
-}
-
-// Experimental numerical primitive VJP for a static box. Not used by the engine
-// dispatcher: capability remains unchanged until primitive and rollout qualification.
-// axisw is the capsule's world unit axis; cot is (dist, pos[3], frame[9]).
-__device__ bool static_box_capsule_fd_vjp(int slot, const float* cp, const float* axisw, float radius, float half_length,
-                                         const float* bp, const float* R, const float* bs,
-                                         const float* cot, float epsilon, float* robot_gb) {
-  if (!(epsilon > 0.f)) return false;
-  for (int j = 0; j < 6; j++) {
-    float values[2];
-    for (int side = 0; side < 2; side++) {
-      float delta = (side == 0 ? -epsilon : epsilon), p[3], a[3];
-      for (int k = 0; k < 3; k++) { p[k] = cp[k]; a[k] = axisw[k]; }
-      if (j < 3) p[j] += delta;
-      else { // exact world-axis rotation of the capsule axis (torque coordinates)
-        int ax = j - 3, u = (ax + 1) % 3, v = (ax + 2) % 3;
-        a[u] = cosf(delta) * axisw[u] - sinf(delta) * axisw[v];
-        a[v] = sinf(delta) * axisw[u] + cosf(delta) * axisw[v];
-      }
-      float dist, pos[3], frame[9];
-      if (!capsule_box_contact(slot, p, a, radius, half_length, bp, R, bs, &dist, pos, frame)) return false;
-      float value = cot[0] * dist;
-      for (int k = 0; k < 3; k++) value += cot[1+k] * pos[k];
-      for (int k = 0; k < 9; k++) value += cot[4+k] * frame[k];
-      values[side] = value;
-    }
-    robot_gb[j] = (values[1] - values[0]) / (2.f * epsilon);
-  }
-  return true;
 }
 
 // adj_contact_geom for contact (pair, slot) of the engine's pair table, from the collision geoms' world poses
