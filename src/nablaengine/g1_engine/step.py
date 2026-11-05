@@ -1184,6 +1184,18 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
 #if HAS_CONVEX
   if ((t1 == 1 || t1 == 2) && t2 == 4) {
     float axis[3]={0.f,0.f,1.f}; if(t1==2)zaxis_rn(q1,axis);
+#ifndef DK_CONVEX_AABB
+#define DK_CONVEX_AABB 1
+#endif
+#if DK_CONVEX_AABB
+    // The model gate requires zero margin/gap. Bounds include conservative
+    // float32 padding and are expressed in the same world frame as p1.
+    for(int k=0;k<3;++k){
+      float extent=sz1[0]+(t1==2?fabsf(axis[k])*sz1[1]:0.f);
+      if(p1[k]+extent<c_hull_world_lower[3*g2+k] ||
+         p1[k]-extent>c_hull_world_upper[3*g2+k])return;
+    }
+#endif
     float dist,pos[3],fr[9];
     for(int slot=0;slot<2;++slot){
       int status=static_convex_contact(g2,slot,p1,axis,sz1[0],t1==2?sz1[1]:0.f,p2,q2,&dist,pos,fr);

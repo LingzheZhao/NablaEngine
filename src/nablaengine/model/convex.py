@@ -42,6 +42,8 @@ def pack_static_convex_hulls(model, collision_geoms):
     from scipy.spatial import ConvexHull
 
     geom_hulls = np.full(len(collision_geoms), -1, dtype=np.int32)
+    world_lower = np.zeros((max(1,len(collision_geoms)),3),dtype=np.float32)
+    world_upper = np.zeros_like(world_lower)
     vertex_addresses, vertex_counts, face_addresses, face_counts = [], [], [], []
     vertices, faces, normals, origins = [], [], [], []
     mesh_indices = {}
@@ -54,14 +56,23 @@ def pack_static_convex_hulls(model, collision_geoms):
         mesh = int(model.geom_dataid[geom])
         if not 0 <= mesh < model.nmesh:
             raise ValueError(f'mesh geom {geom} has invalid mesh index {mesh}')
+        # Bounds belong to each static collision geom, because one compiled mesh
+        # can be instantiated at several different world poses.
+        vertex_address = int(model.mesh_vertadr[mesh])
+        count = int(model.mesh_vertnum[mesh])
+        compiled_vertices = np.asarray(model.mesh_vert[vertex_address:vertex_address+count],dtype=np.float64)
+        if count < 4 or not np.isfinite(compiled_vertices).all():
+            raise ValueError(f'mesh {mesh} requires finite closed solid geometry')
+        rotation = np.empty(9,dtype=np.float64)
+        mujoco.mju_quat2Mat(rotation,model.geom_quat[geom])
+        world_vertices = compiled_vertices @ rotation.reshape(3,3).T + model.geom_pos[geom]
+        padding = 2e-5 + 32*np.finfo(np.float32).eps*max(1.,float(np.max(np.abs(world_vertices))))
+        world_lower[local_geom] = np.nextafter((world_vertices.min(0)-padding).astype(np.float32),-np.inf)
+        world_upper[local_geom] = np.nextafter((world_vertices.max(0)+padding).astype(np.float32),np.inf)
         if mesh in mesh_indices:
             geom_hulls[local_geom] = mesh_indices[mesh]
             continue
-        vertex_address = int(model.mesh_vertadr[mesh])
-        count = int(model.mesh_vertnum[mesh])
-        points = np.asarray(model.mesh_vert[vertex_address:vertex_address+count], dtype=np.float64)
-        if count < 4 or not np.isfinite(points).all():
-            raise ValueError(f'mesh {mesh} requires finite closed solid geometry')
+        points = compiled_vertices
         # MuJoCo's convex mesh support map uses all compiled vertices. Rebuild
         # that same convex body after compilation, keeping all input vertices.
         # Reusing a pre-compilation near-coplanar triangulation can produce
@@ -110,6 +121,8 @@ def pack_static_convex_hulls(model, collision_geoms):
     # contains only -1, so none of these inert entries can be consumed.
     packed = (
         ('c_ghull', 'i', geom_hulls if len(geom_hulls) else np.array([-1], np.int32)),
+        ('c_hull_world_lower', 'f', world_lower),
+        ('c_hull_world_upper', 'f', world_upper),
         ('c_hull_vertexadr', 'i', np.asarray(vertex_addresses or [0], np.int32)),
         ('c_hull_vertexnum', 'i', np.asarray(vertex_counts or [0], np.int32)),
         ('c_hull_faceadr', 'i', np.asarray(face_addresses or [0], np.int32)),
