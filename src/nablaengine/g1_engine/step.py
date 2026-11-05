@@ -1188,7 +1188,14 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
     float dist,pos[3],fr[9];
     for(int slot=0;slot<2;++slot){
       int status=static_convex_contact(g2,slot,p1,axis,sz1[0],t1==2?sz1[1]:0.f,p2,q2,&dist,pos,fr);
-      if(status<0){atomicOr(&s.unsupported,1);return;}
+      if(status<0){
+#ifdef DK_CONVEX_STATUS_DEBUG
+        printf("CONVEX_STATUS pair=%d slot=%d status=%d g1=%d g2=%d hull=%d type=%d radius=%.9g hl=%.9g cp=(%.9g %.9g %.9g) axis=(%.9g %.9g %.9g) hp=(%.9g %.9g %.9g) hq=(%.9g %.9g %.9g %.9g)\n",
+               pair,slot,status,g1,g2,c_ghull[g2],t1,sz1[0],t1==2?sz1[1]:0.f,
+               p1[0],p1[1],p1[2],axis[0],axis[1],axis[2],p2[0],p2[1],p2[2],q2[0],q2[1],q2[2],q2[3]);
+#endif
+        atomicOr(&s.unsupported,1);return;
+      }
       if(status==1 && dist<0.f)add_contact(s,pair,slot,dist,pos,fr);
     }
     return;
