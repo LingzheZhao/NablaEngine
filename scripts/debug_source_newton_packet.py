@@ -15,10 +15,13 @@ def main():
     parser.add_argument('--scene',type=Path,required=True)
     parser.add_argument('--execution',type=Path,required=True)
     parser.add_argument('--substep',type=int,required=True)
+    parser.add_argument('--substeps',type=int,choices=[1,4],default=1)
     parser.add_argument('--qualification-report',type=Path)
     parser.add_argument('--direction-index',type=int,default=0)
     parser.add_argument('--out',type=Path,required=True)
-    args=parser.parse_args();args.out.mkdir(parents=True,exist_ok=False)
+    args=parser.parse_args()
+    if args.substeps==4 and args.substep!=0:parser.error('four-substep comparison starts from the original control input')
+    args.out.mkdir(parents=True,exist_ok=False)
     os.environ['DK_CACHE_DIR']=str(args.out/'build')
     model=mujoco.MjModel.from_binary_path(str(args.scene/'model.mjb'))
     contract=json.loads((args.scene/'contract.json').read_text())
@@ -41,13 +44,13 @@ def main():
     def tensor(value):return torch.tensor(value[None],device='cuda',dtype=torch.float32)
     ctrl=saved['input_u']
     result=engine.forward(tensor(q),tensor(v),tensor(warm),tensor(ctrl),torch.ones(1,device='cuda'),
-                          torch.zeros((1,3),device='cuda'),iterations=int(model.opt.iterations),substeps=1,tape=True)
+                          torch.zeros((1,3),device='cuda'),iterations=int(model.opt.iterations),substeps=args.substeps,tape=True)
     torch.cuda.synchronize()
     data=mujoco.MjData(model);data.qpos[:]=q;data.qvel[:]=v;data.ctrl[:]=ctrl;data.qacc_warmstart[:]=warm
-    mujoco.mj_step(model,data)
+    for _ in range(args.substeps):mujoco.mj_step(model,data)
     mass=np.empty((model.nv,model.nv));mujoco.mj_fullM(model,data,mass)
-    decoded=tape.decode(result[4].cpu().numpy().reshape(1,-1),model)
-    report=dict(execution=str(args.execution),substep=args.substep,iterations=int(model.opt.iterations),
+    decoded=tape.decode(result[4].cpu().numpy().reshape(args.substeps,-1),model)
+    report=dict(execution=str(args.execution),substep=args.substep,substeps=args.substeps,iterations=int(model.opt.iterations),
                 native_flags=decoded['flags'].tolist(),native_qacc=decoded['qacc'].tolist(),
                 native_qacc_adv=decoded['qacc_adv'].tolist(),mujoco_qacc=data.qacc.tolist(),
                 mujoco_force_rhs=(data.qfrc_smooth+data.qfrc_constraint).tolist(),
@@ -60,7 +63,7 @@ def main():
         cq=np.asarray(qualification['terminal_cotangent']['qpos'])
         cv=np.asarray(qualification['terminal_cotangent']['qvel'])
         gradient=engine.backward(result[4],torch.ones(1,device='cuda'),torch.zeros((1,3),device='cuda'),
-                                 tensor(cq.astype(np.float32)),tensor(cv.astype(np.float32)),substeps=1,ctrl=tensor(ctrl))
+                                 tensor(cq.astype(np.float32)),tensor(cv.astype(np.float32)),substeps=args.substeps,ctrl=tensor(ctrl))
         torch.cuda.synchronize()
         if selected['block']=='qvel':
             report['analytic_directional_derivative']=float(gradient[1].cpu().numpy()[0]@direction)
@@ -80,12 +83,12 @@ def main():
                 # Both solvers consume exactly the same rounded physical packet.
                 qi=qi.astype(np.float32);vi=vi.astype(np.float32);ui=ui.astype(np.float32)
                 native=engine.forward(tensor(qi),tensor(vi),tensor(warm),tensor(ui),torch.ones(1,device='cuda'),
-                                      torch.zeros((1,3),device='cuda'),iterations=int(model.opt.iterations),substeps=1,tape=True)
+                                      torch.zeros((1,3),device='cuda'),iterations=int(model.opt.iterations),substeps=args.substeps,tape=True)
                 torch.cuda.synchronize()
                 md=mujoco.MjData(model);md.qpos[:]=qi;md.qvel[:]=vi;md.ctrl[:]=ui;md.qacc_warmstart[:]=warm
-                mujoco.mj_step(model,md)
+                for _ in range(args.substeps):mujoco.mj_step(model,md)
                 nq=native[0].cpu().numpy()[0];nv=native[1].cpu().numpy()[0]
-                flags=tape.decode(native[4].cpu().numpy().reshape(1,-1),model)['flags'].tolist()
+                flags=tape.decode(native[4].cpu().numpy().reshape(args.substeps,-1),model)['flags'].tolist()
                 trials.append(dict(sign=sign,input_qpos=qi.tolist(),input_qvel=vi.tolist(),input_ctrl=ui.tolist(),
                                    native_qpos=nq.tolist(),native_qvel=nv.tolist(),native_flags=flags,
                                    mujoco_qpos=md.qpos.tolist(),mujoco_qvel=md.qvel.tolist(),
