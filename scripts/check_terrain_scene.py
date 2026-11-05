@@ -34,6 +34,7 @@ def point_edge_squared(points, start, edge):
 def segment_hull(starts, ends, hull):
     """Exact segment-surface distance and tolerance-expanded solid intersection.
 
+    Intersecting centerlines return an unavailable distance and an explicit flag.
     Outside a convex solid, the nearest pair is an endpoint/face, endpoint/edge,
     vertex/segment or interior segment/edge pair. Segment/face intersections are
     caught by clipping against every outward halfspace.
@@ -90,7 +91,8 @@ def segment_hull(starts, ends, hull):
     interior = (det > 1e-20) & (s > 0) & (s < 1) & (t > 0) & (t < 1)
     squared = np.minimum(squared, np.where(interior, np.einsum('ned,ned->ne', residual, residual), np.inf).min(axis=1))
     intersects |= squared <= tolerance*tolerance
-    return np.sqrt(np.maximum(squared, 0)), intersects
+    distance = np.where(intersects, np.nan, np.sqrt(np.maximum(squared, 0)))
+    return distance, intersects
 
 
 def hull_geometry(vertices, faces, normals=None):
@@ -214,8 +216,10 @@ def screen(args, report, out):
     for index, frame in enumerate(frames):
         report['rows'].append(dict(frame=int(frame), unsupported_pair_ids=[pairs[p][0] for p in np.flatnonzero(intersects[index])],
                                    capsule_contact_candidate_pair_ids=[pairs[p][0] for p in np.flatnonzero(contact[index])],
-                                   closest_foot_surface_distance_m=float(distance[index, foot].min()),
-                                   minimum_surface_distance_m=float(distance[index].min())))
+                                   closest_foot_surface_distance_m=(float(np.nanmin(distance[index, foot]))
+                                       if np.isfinite(distance[index, foot]).any() else None),
+                                   minimum_surface_distance_m=(float(np.nanmin(distance[index]))
+                                       if np.isfinite(distance[index]).any() else None)))
     np.savez_compressed(out/'geometry.npz', frames=frames, pair_ids=np.array([p[0] for p in pairs]),
                         distance=distance, centerline_intersects=intersects, foot_pair_mask=foot,
                         qpos=qpos[frames], qvel=qvel[frames])
