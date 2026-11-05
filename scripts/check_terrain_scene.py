@@ -213,15 +213,15 @@ def screen(args, report, out):
     report.update(scene_contract=contract, reference_artifact_id=motion_contract['artifact_id'],
                   reference_path=str(args.reference), motion=args.motion, frames=frames.tolist(),
                   capability=validation.to_dict(), selected_frame_count=len(frames),
-                  centerline_invalid_frames=int(intersects.any(axis=1).sum()),
-                  centerline_invalid_fraction=float(intersects.any(axis=1).mean()),
+                  centerline_intersecting_frames=int(intersects.any(axis=1).sum()),
+                  centerline_intersecting_fraction=float(intersects.any(axis=1).mean()),
                   terrain_pair_bindings=[dict(pair=p, robot_geom=model.geom(r).name, hull_geom=model.geom(h).name)
                                          for p, r, h in pairs],
-                  foot_contact_candidate_frames=int(contact[:, foot].any(axis=1).sum()),
-                  foot_near_support_frames=int(near[:, foot].any(axis=1).sum()), rows=[])
+                  outside_centerline_foot_contact_candidate_frames=int(contact[:, foot].any(axis=1).sum()),
+                  outside_centerline_foot_near_support_frames=int(near[:, foot].any(axis=1).sum()), rows=[])
     for index, frame in enumerate(frames):
-        report['rows'].append(dict(frame=int(frame), unsupported_pair_ids=[pairs[p][0] for p in np.flatnonzero(intersects[index])],
-                                   capsule_contact_candidate_pair_ids=[pairs[p][0] for p in np.flatnonzero(contact[index])],
+        report['rows'].append(dict(frame=int(frame), centerline_intersection_pair_ids=[pairs[p][0] for p in np.flatnonzero(intersects[index])],
+                                   outside_centerline_contact_candidate_pair_ids=[pairs[p][0] for p in np.flatnonzero(contact[index])],
                                    closest_foot_surface_distance_m=(float(np.nanmin(distance[index, foot]))
                                        if np.isfinite(distance[index, foot]).any() else None),
                                    minimum_surface_distance_m=(float(np.nanmin(distance[index]))
