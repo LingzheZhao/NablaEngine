@@ -59,6 +59,14 @@ def main():
         direction=np.asarray(selected['direction'],dtype=np.float64)
         cq=np.asarray(qualification['terminal_cotangent']['qpos'])
         cv=np.asarray(qualification['terminal_cotangent']['qvel'])
+        gradient=engine.backward(result[4],torch.ones(1,device='cuda'),torch.zeros((1,3),device='cuda'),
+                                 tensor(cq.astype(np.float32)),tensor(cv.astype(np.float32)),substeps=1,ctrl=tensor(ctrl))
+        torch.cuda.synchronize()
+        if selected['block']=='qvel':
+            report['analytic_directional_derivative']=float(gradient[1].cpu().numpy()[0]@direction)
+        elif selected['block']=='ctrl':
+            report['analytic_directional_derivative']=float(gradient[2].cpu().numpy()[0]@direction)
+        report['analytic_flags']=gradient[3].cpu().numpy().tolist()
         report['finite_differences']=[]
         report['direction']=selected
         for epsilon in [1e-3,5e-4,1e-4,5e-5,1e-5,5e-6]:
