@@ -229,7 +229,7 @@ def screen(args, report, out):
     np.savez_compressed(out/'geometry.npz', frames=frames, pair_ids=np.array([p[0] for p in pairs]),
                         distance=distance, centerline_intersects=intersects, foot_pair_mask=foot,
                         qpos=qpos[frames], qvel=qvel[frames])
-    report['completed'] = True
+    report['screen_completed'] = True
     return dict(model=model, foot_pairs=foot_pairs, qpos=qpos, qvel=qvel, frames=frames,
                 contract=contract, packed_hulls=packed, hull_geoms=list(hulls),
                 fps=json.loads((args.reference/'index.json').read_text())['fps'])
@@ -508,7 +508,9 @@ def main():
         context = screen(args, report, out)
         if args.execute:
             execute(args, context, report, out)
+            report['completed'] = True
             return 0 if report['execution_pass'] else 1
+        report['completed'] = True
         return 0
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
