@@ -57,6 +57,11 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
             edges[edge] = edges.get(edge, 0) + 1
     if any(count != 2 for count in edges.values()):
         raise ValueError('closed two-manifold triangle topology required')
+    # Translation is not geometry: perform subtraction and witness construction
+    # near the fixed hull, then restore world position only at the output.
+    origin=vertices.mean(0).detach()
+    vertices=vertices-origin
+    center=center-origin
     tri = vertices[faces]
     n = torch.linalg.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0])
     norm = torch.linalg.vector_norm(n,dim=1)
@@ -138,4 +143,4 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
     if float(distance.detach())<=tolerance:
         raise UnsupportedContact('zero-distance centerline witness')
     normal=(q-c)/distance
-    return Contact(distance-radius,(q+c+normal*radius)*.5,normal,t,feature)
+    return Contact(distance-radius,(q+c+normal*radius)*.5+origin,normal,t,feature)
