@@ -124,7 +124,7 @@ own codes by `capability.require` and by `jax_ffi.init(model=...)`, before anyth
 These checks use generated inputs and write their reports and compiled libraries to new directories outside the
 checkout. They do not use the benchmark corpora as pass inputs. The static-box implementation admits explicit
 sphere/capsule pairs only when the box belongs to the world body. Moving boxes, plane–box and box–box adjoints,
-meshes and heightfields remain outside that capability. The box primitive differentiates the selected continuous
+and heightfields remain outside that static-box capability. Static convex mesh contacts have their own checks below. The box primitive differentiates the selected continuous
 witness parameters as well as distance, position and frame; feature boundaries are not smooth derivatives.
 
 `scripts/check_box_contact_gradients.py` declares forward and gradient tolerances before execution. On an RTX 3090,
@@ -164,7 +164,7 @@ These are the decomposed collision inputs, not proof of physical parity or exact
 retains the upstream crop, adaptive settings and top alignment. Its failed AST/global-variable preparation and
 dependency-download attempts remain separate from the successful offline-dependency execution.
 
-`nablaengine.convex_contact` is a separate Torch reference primitive, **not an engine mesh dispatch**. It admits
+`nablaengine.convex_contact` provides the separately checked Torch reference primitive. It admits
 only a unique closest witness with the sphere center or capsule centerline outside a closed convex hull. It allows
 radius overlap, but refuses centerline entry, intersection, touching and nonunique witnesses. Continuous witness
 parameters retain gradients. A common static local origin avoids subtracting rounded world-space projections
@@ -182,10 +182,31 @@ The physical oracle checks distance, not an independent physical-engine gradient
 Earlier complete readings were 60/80, because an area-versus-length degeneracy check rejected thin float32 hull
 faces, and 78/80, because float32 world-coordinate cancellation made one normal finite difference unstable on
 both devices. The corrected implementation passed the unchanged protocol; those failed readings were retained.
-This single-hull primitive does not qualify deep penetration, all 18 hulls, contact-manifold generation, solver
-integration, throughput or terrain tracking. Retaining all 502 baseline pairs and replacing the 33 floor pairs by
-33 pairs for each of 18 hulls would require 1,063 explicit pairs, exceeding the current tape's 512-pair limit.
-Full-scene integration therefore also needs a consistent pair representation or justified collision selection.
+The engine now packs static convex meshes selected by explicit sphere/capsule pairs. Its CUDA primitive
+handles signed penetration and emits up to two capsule surface-edge contacts projected onto an incident hull
+face. Continuous clipping parameters and the original surface-edge offset retain pose gradients. Invalid
+geometry and invalid slots propagate through the forward status and stop unsupported backward replay.
+
+Tape records use an 11-bit pair index and support 2,048 candidate pairs. Their 16-bit contact entries and record
+length remain unchanged. The reserved word identifies the new encoding, and Torch artifacts declare version 2
+and the matching encoding. Current primitives use slots 0 through 7. Active-contact capacity remains 96 and
+constraint-row capacity 416. Candidate-pair capacity does not change either physical capacity.
+
+The terrain-4 scene contains 40 CoACD hulls and 1,789 explicit pairs. The fixture's robot geometry, self pairs and
+pelvis-root dynamics are retained, with terrain pairs replacing the plane. The physical check used reference
+frames 0, 190, 235 and 320, each for one and four controls, on an RTX 3090 with PyTorch 2.13.0+cu129,
+NumPy 2.5.1 and MuJoCo 3.17.0. At the [fixed incident-face implementation](https://github.com/LingzheZhao/NablaEngine/tree/495252b),
+all eight conditions met the declared forward comparison with MuJoCo. Frame 190 differed by at most
+3.41e-5 in generalized position and 8.14e-4 in generalized velocity after one control, and 1.83e-4 and 0.0045 after
+four controls. Twenty-two of the twenty-four directional gradient conditions passed. The two frame-235 tangent
+conditions retained unstable finite differences, giving six of eight complete forward-and-gradient passes.
+These checks cover the declared short trajectories. Terrain-policy training and executed tracking have separate
+readings.
+
+Earlier full-scene attempts exposed a convex dispatch nested inside the box compile guard and missing secondary
+contacts on near-parallel capsules. A per-substep comparison localized the latter to pairs 462 and 477 after the
+first five milliseconds of frame 190. MuJoCo's first compatible incident-face rule restored both contacts and
+resolved the large forward discrepancy. The original failed runs remain separate from the corrected readings.
 
 ## Labels
 
