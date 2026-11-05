@@ -45,7 +45,7 @@ def pack_static_convex_hulls(model, collision_geoms):
     world_lower = np.zeros((max(1,len(collision_geoms)),3),dtype=np.float32)
     world_upper = np.zeros_like(world_lower)
     vertex_addresses, vertex_counts, face_addresses, face_counts = [], [], [], []
-    vertices, faces, normals, origins = [], [], [], []
+    vertices, faces, normals, origins, thin_faces = [], [], [], [], []
     mesh_indices = {}
     vertex_count, face_count = 0, 0
     for local_geom, geom in enumerate(collision_geoms):
@@ -77,7 +77,10 @@ def pack_static_convex_hulls(model, collision_geoms):
         # that same convex body after compilation, keeping all input vertices.
         # Reusing a pre-compilation near-coplanar triangulation can produce
         # nonconvex thin faces after the compiler's float32 frame transform.
-        indices = np.asarray(ConvexHull(points).simplices, dtype=np.int32)
+        hull_geometry = ConvexHull(points)
+        if not np.isfinite(hull_geometry.volume) or hull_geometry.volume <= 0:
+            raise ValueError(f'mesh {mesh} requires positive finite convex volume')
+        indices = np.asarray(hull_geometry.simplices, dtype=np.int32)
         triangles = len(indices)
         if indices.shape != (triangles, 3) or indices.min() < 0 or indices.max() >= count:
             raise ValueError(f'mesh {mesh} has invalid triangle indices')
@@ -95,10 +98,18 @@ def pack_static_convex_hulls(model, collision_geoms):
         lengths = np.linalg.norm(cross, axis=1)
         edge_scale = np.max(np.stack([np.linalg.norm(triangle_points[:, (i+1) % 3]-triangle_points[:, i], axis=1)
                                      for i in range(3)]), axis=0)
-        if np.any(lengths <= np.finfo(np.float32).eps*edge_scale**2):
-            raise ValueError(f'mesh {mesh} has unresolved degenerate triangles')
-        face_normals = cross/lengths[:, None]
-        face_normals *= np.where(np.sum(triangle_points[:, 0]*face_normals, axis=1) >= 0, 1., -1.)[:, None]
+        if not np.isfinite(lengths).all() or np.any(lengths <= 0):
+            raise ValueError(f'mesh {mesh} has zero-area or nonfinite triangles')
+        # A valid supporting facet can have nearly collinear vertices. Its
+        # float32 cross product and barycentric denominator are ill-conditioned,
+        # even when the complete convex solid has positive volume. Preserve the
+        # facet and select a halfspace-based face query for that condition.
+        thin = lengths <= np.finfo(np.float32).eps*edge_scale**2
+        face_normals = hull_geometry.equations[:, :3].copy()
+        normal_lengths = np.linalg.norm(face_normals, axis=1)
+        if not np.isfinite(normal_lengths).all() or np.any(normal_lengths <= 0):
+            raise ValueError(f'mesh {mesh} has invalid supporting normals')
+        face_normals /= normal_lengths[:, None]
         offsets = np.sum((points[None]-triangle_points[:, 0, None])*face_normals[:, None], axis=2)
         if np.max(offsets) > 2e-5:
             raise ValueError(f'mesh {mesh} is not convex within the declared 2e-5 meter geometry tolerance')
@@ -112,6 +123,7 @@ def pack_static_convex_hulls(model, collision_geoms):
         vertices.append(points.astype(np.float32))
         faces.append(indices)
         normals.append(face_normals.astype(np.float32))
+        thin_faces.append(thin.astype(np.int32))
         origins.append(origin.astype(np.float32))
         vertex_count += count
         face_count += triangles
@@ -130,6 +142,7 @@ def pack_static_convex_hulls(model, collision_geoms):
         ('c_hull_vertices', 'f', np.concatenate(vertices) if vertices else np.zeros((1, 3), np.float32)),
         ('c_hull_faces', 'i', np.concatenate(faces) if faces else np.zeros((1, 3), np.int32)),
         ('c_hull_normals', 'f', np.concatenate(normals) if normals else np.zeros((1, 3), np.float32)),
+        ('c_hull_face_thin', 'i', np.concatenate(thin_faces) if thin_faces else np.zeros(1, np.int32)),
         ('c_hull_origin', 'f', np.asarray(origins, np.float32) if origins else np.zeros((1, 3), np.float32)),
     )
     return PackedConvexHulls(packed)

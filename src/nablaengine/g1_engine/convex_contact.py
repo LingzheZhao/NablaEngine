@@ -231,11 +231,28 @@ __device__ void candidates(int hull, const Vector<0>& start, const Vector<0>& de
     for (int endpoint = 0; endpoint < 2; ++endpoint) {
       Vector<0> point = start+delta*Scalar<0>(float(endpoint));
       Vector<0> projection = point-normal*dot(normal, point-a);
-      Vector<0> offset = projection-a;
-      float u = (dot(cross_product(offset, e1), triangle_cross)/triangle_squared).value;
-      float v = (dot(cross_product(e0, offset), triangle_cross)/triangle_squared).value;
-      if (u >= 0.f && v >= 0.f && __fadd_rn(u, v) <= 1.f)
-        consider(hull, {face, 0, 0, endpoint}, start, delta, phase, selection);
+      bool inside;
+      if (c_hull_face_thin[face]) {
+        // The intersection of this supporting plane and all convex halfspaces
+        // is the same exposed face. It avoids dividing by a thin triangle's
+        // area or normalizing its unstable float32 cross product.
+        inside = true;
+        for (int j = 0; j < c_hull_facenum[hull]; ++j) {
+          int plane = c_hull_faceadr[hull]+j;
+          Vector<0> bound_normal = face_normal<0>(plane);
+          Vector<0> bound_point = vertex<0>(hull, c_hull_faces[3*plane]);
+          if (dot(bound_normal, projection-bound_point).value > geometry_tolerance) {
+            inside = false;
+            break;
+          }
+        }
+      } else {
+        Vector<0> offset = projection-a;
+        float u = (dot(cross_product(offset, e1), triangle_cross)/triangle_squared).value;
+        float v = (dot(cross_product(e0, offset), triangle_cross)/triangle_squared).value;
+        inside = u >= 0.f && v >= 0.f && __fadd_rn(u, v) <= 1.f;
+      }
+      if (inside) consider(hull, {face, 0, 0, endpoint}, start, delta, phase, selection);
     }
     for (int edge_index = 0; edge_index < 3; ++edge_index) {
       for (int endpoint = 0; endpoint < 2; ++endpoint)
