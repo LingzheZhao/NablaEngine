@@ -505,7 +505,11 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
 // gx[NGEOMC][3], gq[NGEOMC][4] (struct Sim's gx / gq layout, or the adjoint's copy)
 __device__ __forceinline__ int adj_pair_geom(int pair, int slot, const float (*gx)[3], const float (*gq)[4],
                                              float* dist, float* pos, float* fr, float* nu, const float* cot,
-                                             float* gb) {
+                                             float* gb
+#if HAS_CONVEX
+                                             , static_convex::PreparedContact* convex_selection=nullptr
+#endif
+                                             ) {
   int g1 = PG1(pair), g2 = PG2(pair);
 #if HAS_CONVEX
   if ((c_gtype[g1]==1 || c_gtype[g1]==2) && c_gtype[g2]==4) {
@@ -513,9 +517,16 @@ __device__ __forceinline__ int adj_pair_geom(int pair, int slot, const float (*g
     if(cot)for(int k=0;k<12;k++)gb[k]=0.f;
     float axis[3]={0.f,0.f,1.f};if(c_gtype[g1]==2)zaxis_rn(gq[g1],axis);
     float radius=c_gsize[3*g1],hl=c_gtype[g1]==2?c_gsize[3*g1+1]:0.f;
-    int status=static_convex_contact(g2,slot,gx[g1],axis,radius,hl,gx[g2],gq[g2],dist,pos,fr);
-    if(status!=1)return -1;
-    if(cot && static_convex_vjp(g2,slot,gx[g1],axis,radius,hl,gx[g2],gq[g2],cot,gb)!=1)return -1;
+    static_convex::PreparedContact local_selection;
+    static_convex::PreparedContact& selected=convex_selection?*convex_selection:local_selection;
+    // adj_contact_one supplies one cache: its primal call prepares it and its
+    // later VJP consumes that same unchanged physical input's selected features.
+    if(!cot || !convex_selection){
+      int status=static_convex_prepare(g2,gx[g1],axis,radius,hl,gx[g2],gq[g2],selected);
+      if(status!=1)return -1;
+    }
+    if(static_convex_contact_selected(selected,slot,radius,gx[g2],gq[g2],dist,pos,fr)!=1)return -1;
+    if(cot && static_convex_vjp_selected(selected,slot,gx[g1],axis,radius,hl,gx[g2],gq[g2],cot,gb)!=1)return -1;
     return 0;
   }
 #endif

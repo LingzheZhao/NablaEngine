@@ -1207,8 +1207,11 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
     }
 #endif
     float dist,pos[3],fr[9];
+    static_convex::PreparedContact prepared;
+    int prepared_status=static_convex_prepare(g2,p1,axis,sz1[0],t1==2?sz1[1]:0.f,p2,q2,prepared);
     for(int slot=0;slot<2;++slot){
-      int status=static_convex_contact(g2,slot,p1,axis,sz1[0],t1==2?sz1[1]:0.f,p2,q2,&dist,pos,fr);
+      int status=prepared_status;
+      if(status==1)status=static_convex_contact_selected(prepared,slot,sz1[0],p2,q2,&dist,pos,fr);
       if(status<0){
 #ifdef DK_CONVEX_STATUS_DEBUG
         printf("CONVEX_STATUS pair=%d slot=%d status=%d g1=%d g2=%d hull=%d type=%d radius=%.9g hl=%.9g cp=(%.9g %.9g %.9g) axis=(%.9g %.9g %.9g) hp=(%.9g %.9g %.9g) hq=(%.9g %.9g %.9g %.9g)\n",

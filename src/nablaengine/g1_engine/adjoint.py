@@ -957,7 +957,14 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
                                                  float* dbg) {
   const int g1 = PG1(pair), g2 = PG2(pair), b1 = c_gbody[g1], b2 = c_gbody[g2], dim = PDIM(pair);
   float d, p[3], fr[9], nu;
-  const int br = adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr);
+#if HAS_CONVEX
+  static_convex::PreparedContact convex_selection;
+#endif
+  const int br = adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr
+#if HAS_CONVEX
+                               , &convex_selection
+#endif
+                               );
   if (br < 0) { asm volatile("trap;"); return 0.f; }
   const float mu = PFOOT(pair) ? s.fric : PMU(pair);
   float ri[6];
@@ -996,7 +1003,11 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   for (int t = 0; t < 12; t++) fg[t] = 0.f;
   if (zone) {  // the primitive's VJP (it replays again) and the geoms' pose cotangents on their bodies
     float d2, p2[3], fr2[9], nu2, gb[12];
-    if (adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb) < 0) {
+    if (adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb
+#if HAS_CONVEX
+                      , &convex_selection
+#endif
+                      ) < 0) {
       asm volatile("trap;"); return 0.f;
     }
     if (b1) geom_to_body_vjp(s.gx[g1], s.X[b1], gb, gb + 3, fg, fg + 3);
