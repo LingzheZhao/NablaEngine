@@ -259,10 +259,47 @@ extern "C" void @PFX@_sizes(long long* o) {  // checked by the Python side again
 @FWD_SHIM@
 """
 
+FWD_ATTRIBUTES = r"""
+#if DK_SPLIT
+  e = cudaFuncSetAttribute(k_pre, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(SimP));
+  if (e != cudaSuccess) return (int)e;
+  e = cudaFuncSetAttribute(k_post, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(SimN));
+#else
+  e = cudaFuncSetAttribute(k_substep, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(Sim));
+#endif
+  if (e != cudaSuccess) return (int)e;
+"""
+
+
 FWD_SHIM = r"""
 // the forward (host.KERNEL, DK_SPLIT): the split kernels with work memory of @PFX@_work_bytes(nw) bytes (the handler's
 // scratch memory), or k_substep (none)
 extern "C" long long @PFX@_work_bytes(int nw) { return DK_SPLIT ? (long long)dk_work_bytes(nw) : 0; }
+// Per forward kernel: requested dynamic bytes, static bytes, opted-in dynamic limit; then the device opt-in limit.
+extern "C" int @PFX@_forward_shared_memory(long long* o) {
+  auto read = [](auto kernel, size_t dynamic, long long* dst) {
+    cudaFuncAttributes attr;
+    cudaError_t e = cudaFuncGetAttributes(&attr, kernel);
+    if (e != cudaSuccess) return e;
+    dst[0] = (long long)dynamic; dst[1] = (long long)attr.sharedSizeBytes;
+    dst[2] = (long long)attr.maxDynamicSharedSizeBytes;
+    return cudaSuccess;
+  };
+  cudaError_t e = read(k_substep, sizeof(Sim), o);
+  if (e != cudaSuccess) return (int)e;
+  e = read(k_pre, sizeof(SimP), o + 3);
+  if (e != cudaSuccess) return (int)e;
+  e = read(k_post, sizeof(SimN), o + 6);
+  if (e != cudaSuccess) return (int)e;
+  int dev, limit;
+  e = cudaGetDevice(&dev);
+  if (e != cudaSuccess) return (int)e;
+  e = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  if (e != cudaSuccess) return (int)e;
+  o[9] = limit;
+  return 0;
+}
+
 extern "C" int @PFX@_forward(cudaStream_t st, int nw, const float* qpos, const float* qvel, const float* warm,
                            const float* ctrl, const float* fric, const float* com, int iterations, int nsub, float* oq,
                            float* ov, float* ow, int* info, float* ocon, float* tape, void* work) {
@@ -851,8 +888,7 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
 
     def unit(v, fwd, pfx):
         src = (VARIANT_UNIT.replace("@FWD_SHIM@", FWD_SHIM if fwd else "")
-               .replace("@FWD_ATTR@", "  cudaFuncSetAttribute(k_substep, cudaFuncAttributeMaxDynamicSharedMemorySize, "
-                                      "(int)sizeof(Sim));" if fwd else "")
+               .replace("@FWD_ATTR@", FWD_ATTRIBUTES if fwd else "")
                .replace("@PFX@", pfx).replace("@MAX_DEVICES@", str(MAX_DEVICES))
                .replace("@UPLOAD_ERR_SMEM@", str(UPLOAD_ERR_SMEM)).replace("@LOAD_CONSTS@", load)
                .replace("@ENGINE@", engine + (host.KERNEL + g1_kin.KIN_DEVICE if fwd else "")))  # last: never scanned

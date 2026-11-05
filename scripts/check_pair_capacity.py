@@ -211,6 +211,17 @@ def run_condition(condition, out, report):
     sizes_fn(sizes.ctypes.data)
     report["compiled_memory"] = dict(sim_bytes=int(sizes[0]), adjoint_bytes=int(sizes[1]),
                                      tape_record_bytes=int(sizes[2])*4)
+    memory = np.zeros(10, np.int64)
+    memory_fn = getattr(library, f"{info['forward_unit']}_forward_shared_memory")
+    memory_fn.argtypes = [ctypes.c_void_p]
+    code = memory_fn(memory.ctypes.data)
+    if code:
+        raise RuntimeError(f"forward shared-memory query failed (CUDA error {code})")
+    report["compiled_memory"]["forward_shared_memory"] = {
+        kernel: dict(dynamic_bytes=int(memory[3*i]), static_bytes=int(memory[3*i+1]),
+                     max_dynamic_bytes=int(memory[3*i+2]))
+        for i, kernel in enumerate(("k_substep", "k_pre", "k_post"))}
+    report["compiled_memory"]["device_optin_per_block_bytes"] = int(memory[9])
     state = next(s for s in box_check.states(m, fp) if s["name"] == PROTOCOL["initial_state"])
     report["initial_state"] = {key: value.tolist() if isinstance(value, np.ndarray) else value
                                for key, value in state.items()}
