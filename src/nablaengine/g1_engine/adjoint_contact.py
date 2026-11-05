@@ -557,7 +557,6 @@ def static_box_dual_source():
 struct BoxDual {
   float v, d[6];
   __device__ BoxDual(float x=0.f):v(x) { for(int i=0;i<6;i++)d[i]=0.f; }
-  __device__ operator int() const { return int(v); }
   __device__ BoxDual& operator+=(BoxDual b);
   __device__ BoxDual& operator-=(BoxDual b);
   __device__ BoxDual& operator*=(BoxDual b);
