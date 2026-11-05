@@ -119,6 +119,74 @@ own codes by `capability.require` and by `jax_ffi.init(model=...)`, before anyth
 - The benchmark harness (`benchmarks/README.md`) scores the forward and the gradients of every engine against the
   same truth files: `docs/results/paper_accuracy_heldout_v100.md`.
 
+## Terrain contact checks
+
+These checks use generated inputs and write their reports and compiled libraries to new directories outside the
+checkout. They do not use the benchmark corpora as pass inputs. The static-box implementation admits explicit
+sphere/capsule pairs only when the box belongs to the world body. Moving boxes, plane–box and box–box adjoints,
+meshes and heightfields remain outside that capability. The box primitive differentiates the selected continuous
+witness parameters as well as distance, position and frame; feature boundaries are not smooth derivatives.
+
+`scripts/check_box_contact_gradients.py` declares forward and gradient tolerances before execution. On an RTX 3090,
+Python 3.12.15, NumPy 2.5.1, MuJoCo 3.17.0 and CUDA 12.9.86, all 16 smooth conditions passed, including rotated boxes,
+inside spheres and two capsule contact slots. All 13 output basis cotangents were compared in six robot-pose
+directions with two-step float64 finite differences. The maximum absolute gradient difference was 2.10e-5.
+Four non-smooth boundaries were retained without a gradient pass decision. The reference shares the capsule
+forward formulas, so this result alone does not establish independent collision-model equivalence. The production
+sphere wrapper and namespace-isolated implementation were rechecked at
+[this revision](https://github.com/LingzheZhao/NablaEngine/tree/2cd042cc78af975f6c2b36f3e981304e4c413a6d).
+
+`scripts/check_box_step_gradients.py` uses the G1 fixture with an in-memory static box whose top is at zero, two
+generated initial contact states, one/four controls, four substeps per control and 50 Newton iterations. It checks
+the compiled box's derived geometry fields and realized pose, explicit contact support, tape/no-tape equality,
+diagnostics and MuJoCo float64 forward results. At
+[the checked revision](https://github.com/LingzheZhao/NablaEngine/tree/bfde8aae4f35874d99ff196e07cdc16eea8afb89),
+all four conditions passed those forward/contact checks, with no overflow, nonfinite or replay-mismatch counters.
+The full predeclared qualification passed **one of four windows**: 143/144 directional-gradient comparisons and
+138/144 finite-difference stability checks passed. All six stability failures concerned the same initial-position
+direction; these failures remain part of the result.
+
+`scripts/diagnose_box_step_gradient_epsilon.py` separately compares that direction at five smaller perturbations
+with MuJoCo float64 finite differences. Across its 12 box readings the analytic derivative differed from the finest
+MuJoCo difference by at most 3.98e-4; the corresponding plane maximum was 3.71e-4. The float32 engine differences
+became noisy at small perturbations. This supports a numerical explanation for the failed finite-difference checks,
+but the diagnostic does not replace the qualification rule or turn its failed windows into passes.
+
+Failed conditions retained with the successful checks include a leftover blanket no-box assertion in full code
+generation, CUDA overload name shadowing, and an incorrectly retained MuJoCo `geom_sameframe` flag in the generated
+test model. The flag put MuJoCo's box ten centimetres above its intended position; the corrected test obtains that
+field from a separately compiled box and verifies the realized pose before execution. No failed output was reused
+as a passing reading. These short flat-box conditions do not qualify general terrain, long gradient windows or training.
+
+`scripts/coacd_audit.py` applies the inspected InstinctMJ upstream functions to terrain 0. With CoACD 1.0.7,
+trimesh 4.11.2, NumPy 2.4.2, SciPy 1.17.1 and Shapely 2.1.2 it produced 18 hulls, 1,194 vertices and 2,316 faces.
+These are the decomposed collision inputs, not proof of physical parity or exact replacement by boxes. The audit
+retains the upstream crop, adaptive settings and top alignment. Its failed AST/global-variable preparation and
+dependency-download attempts remain separate from the successful offline-dependency execution.
+
+`nablaengine.convex_contact` is a separate Torch reference primitive, **not an engine mesh dispatch**. It admits
+only a unique closest witness with the sphere center or capsule centerline outside a closed convex hull. It allows
+radius overlap, but refuses centerline entry, intersection, touching and nonunique witnesses. Continuous witness
+parameters retain gradients. A common static local origin avoids subtracting rounded world-space projections
+when computing distance and normal; only the final contact position is translated back.
+
+At [the fixed primitive revision](https://github.com/LingzheZhao/NablaEngine/tree/ffe712f710d6297a54ed0943883e611f47063b06),
+`scripts/check_convex_contact_gradients.py` passed all **80 declared conditions**: a generated box and one actual
+terrain-0 hull (46 vertices, 88 faces), CPU/CUDA, float32/float64, six smooth queries and four explicit rejections
+per combination. The 48 smooth queries passed independent MuJoCo distance checks, finite-difference stability and
+all eight-output/six-pose Jacobian checks; the 32 rejection conditions failed in the declared way. Compiled mesh
+world vertices were checked independently of MuJoCo's mesh-centering transform. The largest distance difference
+was 1.34e-7 m, largest Jacobian/FD difference 0.00412 (float32), and largest CUDA/CPU Jacobian difference 1.95e-10.
+The physical oracle checks distance, not an independent physical-engine gradient or contact manifold.
+
+Earlier complete readings were 60/80, because an area-versus-length degeneracy check rejected thin float32 hull
+faces, and 78/80, because float32 world-coordinate cancellation made one normal finite difference unstable on
+both devices. The corrected implementation passed the unchanged protocol; those failed readings were retained.
+This single-hull primitive does not qualify deep penetration, all 18 hulls, contact-manifold generation, solver
+integration, throughput or terrain tracking. Retaining all 502 baseline pairs and replacing the 33 floor pairs by
+33 pairs for each of 18 hulls would require 1,063 explicit pairs, exceeding the current tape's 512-pair limit.
+Full-scene integration therefore also needs a consistent pair representation or justified collision selection.
+
 ## Labels
 
 ### Forward-tape checks T1-T8 (`engine_step_check.py --tape`)

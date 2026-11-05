@@ -38,6 +38,11 @@ NablaEngine is specialized for the Unitree G1 (the mjlab model), the first robot
 spheres, capsules and the floor, joint limits, PD position actuators, MuJoCo's Newton solver and implicitfast
 integration, in float32. Other models are rejected with an error that names the unsupported features.
 
+This research branch adds experimental sphere/capsule contacts against static world boxes. Moving boxes,
+plane–box and box–box adjoints remain rejected. The [terrain contact checks](docs/verification.md#terrain-contact-checks)
+separate primitive gradients, short robot steps and the remaining terrain limitations; they do not establish a
+terrain-tracking policy.
+
 Requirements: Linux x86_64, an NVIDIA GPU of compute capability 7.0 or newer (tested: V100, RTX 3090, H100, RTX PRO
 6000), Python 3.12, and a CUDA 12.x toolkit (nvcc) for the one-time build of the CUDA library (about 15 s, cached).
 
