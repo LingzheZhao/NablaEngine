@@ -1746,7 +1746,7 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned (&world)[
 // the contact table (end of substep_pre), the final zones with their Hessian factor L_H, and after the implicitfast
 // solve L_Q, a*, a_adv and the header (substep_post). The forward results do not depend on rec.
 template <class S>
-__device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec) {
+__device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, float* actuator_torque=nullptr) {
   const float h = c_misc[0];
   int b = lane, d = (b < NB) ? c_depth[b] : -1, p = (b < NB) ? c_parent[b] : 0;
   if (rec) {  // tape: the substep's input state
@@ -1866,6 +1866,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec) {
         act = c_kp[i] * (ctrl[i - 6] - s.qpos[i + 1]) - c_kv[i] * s.qvel[i];
         act = fminf(fmaxf(act, -c_frclim[i]), c_frclim[i]);
         clamp = act <= -c_frclim[i] || act >= c_frclim[i];  // at the limit: MuJoCo Warp's actuator_lam test
+        if(actuator_torque)actuator_torque[i-6]=act;
       }
       s.qsm[i] = act - c_damping[i] * s.qvel[i] - s.qsm[i];
     }
