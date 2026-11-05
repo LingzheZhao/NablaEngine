@@ -338,6 +338,14 @@ def main():
     if not hull_names:
         raise ValueError("Empty terrain decomposition")
     model = spec.compile()
+    # Preserve the exact constructed geometry if a later numerical source gate
+    # rejects it. The runnable model.mjb and contract are written after checks.
+    mujoco.mj_saveModel(model, str(args.output / 'constructed_model.mjb'))
+    (args.output / 'construction.json').write_text(json.dumps(dict(
+        format='nablaengine-terrain-construction-v1', artifact_id=args.artifact_id,
+        code_revision=args.code_revision, terrain_artifact_id=args.terrain_artifact_id,
+        terrains=terrain_contracts,
+        counts=dict(hulls=len(hull_names), geoms=model.ngeom, pairs=model.npair)), indent=2))
     robot_error = verify_robot(fixture, model)
     for terrain in terrain_contracts:
         terrain["hull_geom_ids"] = [model.geom(name).id for name in terrain["hull_geom_names"]]
