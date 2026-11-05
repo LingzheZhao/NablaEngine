@@ -235,6 +235,19 @@ def screen(args, report, out):
                 fps=json.loads((args.reference/'index.json').read_text())['fps'])
 
 
+def gradient_probes(model):
+    rng = np.random.default_rng(20261105)
+    cq, cv = rng.normal(size=model.nq), rng.normal(size=model.nv)
+    cq /= np.linalg.norm(cq)
+    cv /= np.linalg.norm(cv)
+    directions = []
+    for block, width in (('qpos_tangent', model.nv), ('qvel', model.nv), ('ctrl', model.nu)):
+        direction = rng.normal(size=width)
+        direction /= np.linalg.norm(direction)
+        directions.append(dict(block=block, index=0, direction=direction))
+    return cq, cv, directions
+
+
 EXECUTION_PROTOCOL = dict(horizons=[1, 4], substeps=4, iterations=50, friction=1., com=[0., 0., 0.],
                           fd_steps=[1e-5, 5e-6], gradient_atol=.01, gradient_rtol=.03,
                           fd_stability_atol=.001, fd_stability_rtol=.01,
@@ -350,15 +363,7 @@ def execute(args, context, report, out):
             for _ in range(4):
                 mujoco.mj_step(model, data)
         return np.r_[data.qpos.copy(), data.qvel.copy()]
-    rng = np.random.default_rng(20261105)
-    cq, cv = rng.normal(size=model.nq), rng.normal(size=model.nv)
-    cq /= np.linalg.norm(cq)
-    cv /= np.linalg.norm(cv)
-    directions = []
-    for block, width in (('qpos_tangent', model.nv), ('qvel', model.nv), ('ctrl', model.nu)):
-        direction = rng.normal(size=width)
-        direction /= np.linalg.norm(direction)
-        directions.append(dict(block=block, index=0, direction=direction))
+    cq, cv, directions = gradient_probes(model)
     report['execution_directions'] = [dict(d, direction=d['direction'].tolist()) for d in directions]
     report['terminal_cotangent'] = dict(qpos=cq.tolist(), qvel=cv.tolist())
     for frame in frames:
