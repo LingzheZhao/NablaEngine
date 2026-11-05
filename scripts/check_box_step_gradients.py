@@ -365,7 +365,10 @@ def run_condition(condition, out, report, *, diagnostic=None, artifact=None, art
             row["pass_"] = bool(identical and strict_ok(base) and strict_ok(fdtraj) and physical_ok and contact_ok
                                  and all(c["pass_"] for d in row["directions"] for c in d["cotangents"]))
             report["conditions"].append(row)
-            print(condition, state["name"], horizon, "PASS" if row["pass_"] else "FAIL", flush=True)
+            if diagnostic is None:
+                print(condition, state["name"], horizon, "PASS" if row["pass_"] else "FAIL", flush=True)
+            else:
+                print(condition, state["name"], horizon, "DIAGNOSTIC recorded; qualification unchanged", flush=True)
     report["diagnostics"] = F.read_diagnostics()
     report["pass_"] = all(c["pass_"] for c in report["conditions"])
 
