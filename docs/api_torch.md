@@ -62,7 +62,7 @@ stream of the inputs' device, with that device made current for the call.
 ## Rollouts and memory
 
 A rollout is a Python loop over `step`. Each differentiated step keeps its tape until the backward:
-`tape_bytes(4096) = 98.6 MB` per control step at 4096 worlds (24.1 kB per world), 6.3 GB for 64 steps. `torch.utils.checkpoint` can drop
+`tape_bytes(4096) = 104.9 MB` per control step at 4096 worlds (25.6 kB per world), 6.7 GB for 64 steps. `torch.utils.checkpoint` can drop
 the tapes and rerun the steps in the backward: the forward is deterministic, so a recomputed tape is bitwise the first
 one.
 

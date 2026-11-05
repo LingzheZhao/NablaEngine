@@ -41,8 +41,8 @@ import warnings
 import mujoco
 import numpy as np
 
-MAX_CONTACTS = 96
-NEFC = 416  # 96 pyramid contacts + 29 hinge limits = 413 rows (NFLOSS == 0)
+MAX_CONTACTS = 128
+NEFC = 576  # 128 pyramid contacts + 35 dof frictionloss + 29 hinge limits
 PROF_PHASES = ("smooth", "qacc_smooth", "collision", "contact_jac", "rows", "newton_init", "newton_grad",
                "newton_hessian", "newton_chol", "newton_linesearch", "newton_update", "integrate", "ls_jv_Mp",
                "count_ls_steps",
@@ -83,7 +83,7 @@ def validate_maxcon(value):
 
 
 def maxcon(m):
-    """Contact capacity per world: 32 for the Menagerie model (49 pairs, at most 11 contacts seen), 96 for the mjlab
+    """Contact capacity per world: 32 for the Menagerie model (49 pairs, at most 11 contacts seen), 128 for the mjlab
     model (502 pairs; up to 28 foot contacts alone). $DK_MAXCON overrides it (experiments); it
     changes every build, the FFI library included, so it warns."""
     default = 32 if m.npair <= 64 else MAX_CONTACTS
@@ -1396,7 +1396,7 @@ __device__ __forceinline__ void con_force(const S& s, const float* f, int c, flo
 }
 template <class S>
 __device__ void rows_jtf(S& s, const float* f, float* out, int lane) {
-  int ncon = uniform_int(min(s.ncon, MAXCON), 7);
+  int ncon = uniform_int(min(s.ncon, MAXCON), 8);
 #if DK_JTF_GATHER
   // per dof in registers (lane l: dofs l and l + 32): the dof rows, then the contacts in contact order (the sums of the
   // scatter below, bitwise). Lane i of a block of 32 contacts holds contact c0 + i's forces and support mask
@@ -1497,7 +1497,7 @@ __device__ __forceinline__ int row_zone(const S& s, int r, float x) {
 template <class S>
 __device__ __noinline__ unsigned zone_word(const S& s, int lane) {
   unsigned z = 0u;
-  const int nefc = uniform_int(s.nefc, 9);
+  const int nefc = uniform_int(s.nefc, 10);
   for (int r0 = 0; r0 < nefc; r0 += 32) {
     int r = r0 + lane;
     unsigned b = __ballot_sync(0xffffffffu, r < nefc && row_zone(s, r, s.efc_jar[r]) == 1);
@@ -1935,12 +1935,12 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, float
   }
   PROF(2);
   if (lane == 0 && s.ncon > MAXCON) s.unsupported |= 4;
-  int ncon = uniform_int(min(s.ncon, MAXCON), 7);
+  int ncon = uniform_int(min(s.ncon, MAXCON), 8);
   {  // contact Jacobians: frame rows of J(body2, pos) - J(body1, pos) on the dofs on exactly one chain, packed in
      // ascending order. Lane l keeps the motion subspaces (w, v about O) of dofs l and l + 32, and the two bodies'
      // ancestor masks of contacts l + 32*t (shuffled to all lanes per contact).
      // DOF and contact tiles are separate: this robot still has at most two DOFs per lane.
-    static_assert(NV <= 64 && MAXCON > 0 && MAXCON <= 96, "two dofs and up to three contacts per lane");
+    static_assert(NV <= 64 && MAXCON > 0 && MAXCON <= 128, "two dofs and up to four contacts per lane");
     float dw[2][3], dv[2][3];
     int dbody[2];
     unsigned am1[CONTACT_TILES], am2[CONTACT_TILES];
@@ -2082,7 +2082,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, float
 template <class S>
 __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, float* rec) {
   const float h = c_misc[0];
-  int ncon = uniform_int(min(s.ncon, MAXCON), 7);
+  int ncon = uniform_int(min(s.ncon, MAXCON), 8);
   PROF_START();
   // Newton solver from the warm start (or qacc_smooth when that is cheaper)
   const float scale = 1.f / (c_sopt[1] * NV), tol = c_sopt[2];
@@ -2109,7 +2109,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   // __syncwarp() between them. The world contacts on one body have the same support and are summed in registers before
   // one update of L (groups[t]: lane masks of contacts 32*t..32*t+31 on the same body). A contact between two
   // bodies (support: the dofs on exactly one chain) is fenced on both sides.
-  static_assert(MAXCON > 0 && MAXCON <= 96 && KDOF <= 32, "three contact tiles; hess_columns fits 32 lanes");
+  static_assert(MAXCON > 0 && MAXCON <= 128 && KDOF <= 32, "four contact tiles; hess_columns fits 32 lanes");
   unsigned world[CONTACT_TILES] = {}, groups[CONTACT_TILES] = {};
   for (int c0 = 0; c0 < ncon; c0 += 32) {
     int c = c0 + lane, pr = c < ncon ? s.con_pair[c] : 0, b1 = c_gbody[PG1(pr)], b2 = c_gbody[PG2(pr)];
@@ -2157,6 +2157,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
     // nefc: inactive, no contribution), their pieces as 2-bit codes; a Newton step's test whether it kept every row on
     // its piece (then it landed on the exact minimizer) is done by the next pass over the rows
     constexpr int RT = (NEFC + 31) / 32;
+    static_assert(2 * RT <= 64, "two-bit line-search pieces fit in uint64");
     const int nefc = s.nefc;
     float rx[RT], rj[RT], rD[RT], rF[RT];
 #pragma unroll
@@ -2167,16 +2168,16 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       rF[t] = row_floss(s, r);
     }
     float alpha = 0.f, lo = 0.f, hi = 1e30f, d0 = 0.f;
-    unsigned zprev = 0u;
+    unsigned long long zprev = 0ull;
     bool newton = false;
     for (int k = 0; k <= 40; k++) {
       float fd = 0.f, fdd = 0.f;
-      unsigned z = 0u;
+      unsigned long long z = 0ull;
 #pragma unroll
       for (int t = 0; t < RT; t++) {
         if (32 * t >= nefc) break;
         float ds, dd, jv = rj[t];
-        z |= (unsigned)row_piece(lane + 32 * t, rx[t] + alpha * jv, rD[t], rF[t], &ds, &dd) << (2 * t);
+        z |= (unsigned long long)row_piece(lane + 32 * t, rx[t] + alpha * jv, rD[t], rF[t], &ds, &dd) << (2 * t);
         fd += ds * jv; fdd += dd * jv * jv;
       }
       if (__all_sync(0xffffffffu, newton && z == zprev)) break;  // the last Newton step kept every row on its piece
@@ -2280,7 +2281,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
 #ifdef DK_TAPE_VERIFY
       if (vdiff) fl |= TAPE_VERIFY_DIFF;
 #endif
-      unsigned hd = (unsigned)ncon | (unsigned)s.nefc << 7 | (unsigned)(s.nefc_dof - NFLOSS) << 16
+      unsigned hd = (unsigned)ncon | (unsigned)s.nefc << 8 | (unsigned)(s.nefc_dof - NFLOSS) << 18
                     | (unsigned)min(it, 255) << 24;
       __stcs(rec + OFF_HDR, __uint_as_float(hd));
       __stcs(rec + OFF_FLAGS, __uint_as_float(fl));

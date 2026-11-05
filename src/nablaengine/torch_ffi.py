@@ -10,11 +10,11 @@ Arguments and outputs as jax_ffi.step / jax_ffi.kinematics (see that module's do
 device, contiguous, leading dimension B (the worlds): qpos (B, nq), qvel (B, nv), warm (B, nv), ctrl (B, nu), friction
 (B,), com (B, 3) (mjlab G1: nq 36, nv 35, nu 29). Other dtypes, devices or shapes raise TypeError; nothing is cast or
 copied implicitly. step is differentiable (torch.autograd): when any input requires grad, the forward also writes the
-tape (B, substeps * REC_WORDS float32, 6016 B per world and substep) and keeps it for the backward (the analytic
+tape (B, substeps * REC_WORDS float32, 6400 B per world and substep) and keeps it for the backward (the analytic
 adjoint, deterministic), which returns d/dqpos (36-dimensional qpos form), d/dqvel and d/dctrl, no gradient for warm,
 friction and com. The outputs and gradients are bitwise those of jax_ffi on the same GPU (scripts/torch_ffi_check.py).
 
-A rollout is a Python loop: every differentiated step keeps its tape until the backward (tape_bytes(); 6.3 GB for
+A rollout is a Python loop: every differentiated step keeps its tape until the backward (tape_bytes(); 6.7 GB for
 4096 worlds x 64 steps). torch.utils.checkpoint may rerun a step: the forward is deterministic, so a recomputed tape
 is bitwise the first one.
 
@@ -62,8 +62,8 @@ _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # s
 NONFINITE_QPOS, NONFINITE_QVEL, NONFINITE_CTRL, NONFINITE_COT, NONFINITE_SHIFT = 1, 2, 4, 8, 16
 VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint builds (clamp_kv, normal)
 FWD_UNIT = "dk_fwd"
-ARTIFACT_VERSION = 3
-TAPE_ENCODING = dict(contact_bits=32, pair_bits=16, slot_capacity=8, format_marker=0x4E540310)
+ARTIFACT_VERSION = 4
+TAPE_ENCODING = dict(contact_bits=32, pair_bits=16, slot_capacity=8, header_bits=[8, 10, 6, 8], format_marker=0x4E540410)
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
 SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
 

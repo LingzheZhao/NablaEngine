@@ -7,7 +7,7 @@ uint32 tape decoding and backward for one and four controls. MuJoCo double preci
 finite differences and the sparse control compare physical forward and VJP results.
 Masking actual contact IDs to 8 or 11 bits supplies deliberate corruption controls.
 Compiled state sizes, tape bytes, timing and allocation are reported. MAXCON remains
-96 and NEFC 416; zero overflow is required. This is sparse-contact index qualification,
+128 and NEFC 576; zero overflow is required. This is sparse-contact index qualification,
 not qualification of dense terrain contacts or complete task behavior.
 """
 import argparse
@@ -25,7 +25,7 @@ from capability_check import spec_from_model
 
 ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL = dict(seed=20261105, conditions=["fixture502", "control47", "capacity15231"],
-                horizons=[1, 4], substeps=4, iterations=50, max_contacts=96,
+                horizons=[1, 4], substeps=4, iterations=50, max_contacts=128,
                 padding_pairs=15184, support_insertion_after_padding_pairs=500, distant_boxes=507,
                 noncollision_visual_geoms=35, distant_box_start=[100., 20., 0.],
                 distant_box_stride=1., distant_box_half_size=[.1, .1, .1],

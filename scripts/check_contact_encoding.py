@@ -47,8 +47,8 @@ class ContactEncoding(unittest.TestCase):
             self.assertEqual((meta >> 12) & 1, int(pair in feet))
         header = step.step_header(model)
         self.assertIn("#define NGEOMC 542", header)
-        self.assertIn("#define MAXCON 96", header)
-        self.assertIn("#define NEFC 416", header)
+        self.assertIn("#define MAXCON 128", header)
+        self.assertIn("#define NEFC 576", header)
         loader = host.loader([(symbol, kind, count, 1) for symbol, kind, count in layout], {})
         self.assertIn("cudaMemcpyToSymbol(c_pgeom,", loader)
         self.assertIn("cudaMemcpyToSymbol(c_pword,", loader)
@@ -62,7 +62,7 @@ class ContactEncoding(unittest.TestCase):
         words[layout["hdr"][0]] = len(entries)
         words[layout["reserved"][0]] = tape.FORMAT_MARKER
         start, length = layout["con"]
-        self.assertEqual(length, 96)
+        self.assertEqual(length, 128)
         words[start:start+length] = tape.CON_NONE
         words[start:start+len(entries)] = entries
         decoded = tape.decode(raw, model)
@@ -77,10 +77,27 @@ class ContactEncoding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incompatible"):
             tape.decode(raw, model)
 
+    def test_full_contact_and_row_header(self):
+        model = SimpleNamespace(nq=36, nv=35, npair=65536)
+        raw = np.zeros(tape.rec_words(model), np.float32)
+        self.assertEqual(tape.rec_words(model), 1600)
+        words, layout = raw.view(np.uint32), tape.layout(model)
+        words[layout["reserved"][0]] = tape.FORMAT_MARKER
+        words[layout["hdr"][0]] = 128 | 576 << 8 | 29 << 18 | 255 << 24
+        start, length = layout["con"]
+        words[start:start+length] = tape.pack_contact(65535, 7)
+        decoded = tape.decode(raw, model)
+        self.assertEqual(tuple(int(decoded[key]) for key in ("ncon", "nefc", "nlim", "niter")),
+                         (128, 576, 29, 255))
+        np.testing.assert_array_equal(decoded["pair"], np.full(128, 65535))
+        np.testing.assert_array_equal(decoded["slot"], np.full(128, 7))
+        with self.assertRaises(ValueError):
+            step.validate_maxcon(129)
+
     def test_artifact_schema(self):
-        self.assertEqual(torch_ffi.ARTIFACT_VERSION, 3)
+        self.assertEqual(torch_ffi.ARTIFACT_VERSION, 4)
         self.assertEqual(torch_ffi.TAPE_ENCODING,
-                         dict(contact_bits=32, pair_bits=tape.PAIR_BITS, slot_capacity=tape.SLOT_CAPACITY,
+                         dict(contact_bits=32, pair_bits=tape.PAIR_BITS, slot_capacity=tape.SLOT_CAPACITY, header_bits=[8, 10, 6, 8],
                               format_marker=tape.FORMAT_MARKER))
 
 

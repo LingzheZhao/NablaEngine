@@ -27,12 +27,12 @@ PAIR_MASK = (1 << PAIR_BITS) - 1
 PAIR_CAPACITY = 1 << PAIR_BITS
 SLOT_FIELD_CAPACITY = 1 << (32 - PAIR_BITS)
 SLOT_CAPACITY = 8  # current collision primitives emit slots 0 through 7
-FORMAT_MARKER = 0x4E540310  # NT, format 3, 16-bit pair index
+FORMAT_MARKER = 0x4E540410  # NT, format 4: uint32 contacts, 8/10/6/8-bit header
 CON_NONE = 0xFFFFFFFF  # contact table entry past ncon
 
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
 _FIELDS = (
-    ("hdr", "OFF_HDR", 1),  # ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24
+    ("hdr", "OFF_HDR", 1),  # ncon[8] | nefc[10] << 8 | nlim[6] << 18 | niter[8] << 24
     ("flags", "OFF_FLAGS", 1),  # FLAG_*
     ("min_nu", "OFF_MIN_NU", 1),  # float: smallest centre / axis distance of a sphere or capsule self contact, else +inf
     ("reserved", "OFF_RESERVED", 1),
@@ -54,7 +54,7 @@ _FIELDS = (
 def _table(m, max_contacts=None):
     nc = step.maxcon(m) if max_contacts is None else step.validate_maxcon(max_contacts)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    assert nv <= 64 and m.npair <= PAIR_CAPACITY and nc <= 127 and step.NEFC <= 511, "field widths (clamp u64, pair 16 bits, ncon 7 / nefc 9 bits)"
+    assert nv <= 64 and m.npair <= PAIR_CAPACITY and nc <= 255 and step.NEFC <= 1023, "field widths (clamp u64, pair 16 bits, ncon 8 / nefc 10 bits)"
     out, off = [], 0
     for name, define, n in _FIELDS:
         if name is None:
@@ -111,7 +111,7 @@ def decode(arr, m, max_contacts=None):
     lay = layout(m, max_contacts)
     sl = lambda name: slice(lay[name][0], lay[name][0] + lay[name][1])  # noqa: E731
     hdr, flags = u[..., lay["hdr"][0]].astype(np.int64), u[..., lay["flags"][0]].astype(np.int64)
-    out = dict(ncon=hdr & 127, nefc=(hdr >> 7) & 511, nlim=(hdr >> 16) & 255, niter=hdr >> 24, flags=flags,
+    out = dict(ncon=hdr & 255, nefc=(hdr >> 8) & 1023, nlim=(hdr >> 18) & 63, niter=hdr >> 24, flags=flags,
                unsupported=flags & FLAG_UNSUPPORTED, refact=(flags & FLAG_REFACT) != 0,
                nonconv=(flags & FLAG_NONCONV) != 0, singular=(flags & FLAG_SINGULAR) != 0,
                verify_diff=(flags & FLAG_VERIFY_DIFF) != 0, min_nu=a[..., lay["min_nu"][0]])

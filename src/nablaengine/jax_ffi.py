@@ -9,7 +9,7 @@ one control step (substeps engine substeps of h = 5 ms) for B worlds; all float3
 (B, nu), (B,), (B, 3) (mjlab G1: nq 36, nv 35, nu 29); warm is the Newton warm start (warm' = the last substep's
 acceleration, for the next call); friction is each world's foot-floor friction, com its torso COM offset. B is read
 from the arrays at run time: one library serves every batch size, and JAX traces once per shape. jax.custom_vjp: the
-forward under differentiation (dk_step_fwd) also writes the tape, (B, substeps * REC_WORDS) float32 (6016 B per world
+forward under differentiation (dk_step_fwd) also writes the tape, (B, substeps * REC_WORDS) float32 (6400 B per world
 and substep), kept with friction and com as the residuals; the backward (dk_step_bwd, the analytic adjoint k_adjoint,
 deterministic) returns d/dqpos (36-dimensional qpos form, as MuJoCo Warp), d/dqvel and d/dctrl (summed over the
 substeps), zeros for warm, friction and com; the cotangent of warm' is ignored. Without differentiation step runs
@@ -1114,7 +1114,7 @@ def init(model_dir=None, model=None, foot_pairs=None):
 
 
 def rec_words():
-    """Words (float32) per tape record (one world, one substep): 1504 for the mjlab model."""
+    """Words (float32) per tape record (one world, one substep): 1600 for the mjlab model at 128 contacts."""
     return init()["rec_words"]
 
 
