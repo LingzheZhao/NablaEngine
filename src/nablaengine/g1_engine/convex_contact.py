@@ -450,7 +450,9 @@ __device__ void select_face_manifold(int hull, const Vector<0>& start,
   Vector<0> axis = delta*(Scalar<0>(1.f)/square_root(dot(delta, delta)));
   Vector<0> skin_start = capsule_surface_start(hull, selection, start, delta, radius);
   Vector<0> hull_witness = selection.witness.surface;
-  float best_alignment = 0.f;
+  // MuJoCo's edge/face recovery uses the first compatible incident face.
+  // Replacing it with the closest normal can select the opposite side of a
+  // thin bevel and move the clipped contact interval to a different polygon.
   for (int i = 0; i < c_hull_facenum[hull]; ++i) {
     int face = c_hull_faceadr[hull]+i;
     Vector<0> normal = face_normal<0>(face);
@@ -458,7 +460,7 @@ __device__ void select_face_manifold(int hull, const Vector<0>& start,
     Vector<0> a = vertex<0>(hull, c_hull_faces[3*face]);
     if (fabsf(dot(normal, hull_witness-a).value) > geometry_tolerance) continue;
     float alignment = -dot(normal, initial_normal).value;
-    if (alignment <= best_alignment) continue;
+    if (alignment <= 0.f) continue;
     FaceManifold manifold;
     if (!clip_face(hull, face, skin_start, delta, manifold)) continue;
     Scalar<0> lower = face_parameter(hull, manifold, manifold.lower, skin_start, delta);
@@ -466,9 +468,9 @@ __device__ void select_face_manifold(int hull, const Vector<0>& start,
     float d0 = dot(normal, skin_start+delta*lower-a).value;
     float d1 = dot(normal, skin_start+delta*upper-a).value;
     if (fminf(d0, d1) >= 0.f) continue;
-    best_alignment = alignment;
     selection.manifold = manifold;
     selection.face_manifold = true;
+    return;
   }
 }
 
