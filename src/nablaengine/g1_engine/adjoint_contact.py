@@ -483,6 +483,36 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
   return br;
 }
 
+// Experimental numerical primitive VJP for a static box. Not used by the engine
+// dispatcher: capability remains unchanged until primitive and rollout qualification.
+// axisw is the capsule's world unit axis; cot is (dist, pos[3], frame[9]).
+__device__ bool static_box_capsule_fd_vjp(int slot, const float* cp, const float* axisw, float radius, float half_length,
+                                         const float* bp, const float* R, const float* bs,
+                                         const float* cot, float epsilon, float* robot_gb) {
+  if (!(epsilon > 0.f)) return false;
+  for (int j = 0; j < 6; j++) {
+    float values[2];
+    for (int side = 0; side < 2; side++) {
+      float delta = (side == 0 ? -epsilon : epsilon), p[3], a[3];
+      for (int k = 0; k < 3; k++) { p[k] = cp[k]; a[k] = axisw[k]; }
+      if (j < 3) p[j] += delta;
+      else { // exact world-axis rotation of the capsule axis (torque coordinates)
+        int ax = j - 3, u = (ax + 1) % 3, v = (ax + 2) % 3;
+        a[u] = cosf(delta) * axisw[u] - sinf(delta) * axisw[v];
+        a[v] = sinf(delta) * axisw[u] + cosf(delta) * axisw[v];
+      }
+      float dist, pos[3], frame[9];
+      if (!capsule_box_contact(slot, p, a, radius, half_length, bp, R, bs, &dist, pos, frame)) return false;
+      float value = cot[0] * dist;
+      for (int k = 0; k < 3; k++) value += cot[1+k] * pos[k];
+      for (int k = 0; k < 9; k++) value += cot[4+k] * frame[k];
+      values[side] = value;
+    }
+    robot_gb[j] = (values[1] - values[0]) / (2.f * epsilon);
+  }
+  return true;
+}
+
 // adj_contact_geom for contact (pair, slot) of the engine's pair table, from the collision geoms' world poses
 // gx[NGEOMC][3], gq[NGEOMC][4] (struct Sim's gx / gq layout, or the adjoint's copy)
 __device__ __forceinline__ int adj_pair_geom(int pair, int slot, const float (*gx)[3], const float (*gq)[4],
