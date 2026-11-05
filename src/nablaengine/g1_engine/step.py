@@ -2279,10 +2279,26 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   }
 #endif
 
-  // implicitfast: (M + h kv) qacc' = M qacc; then qvel, qpos
+  // MuJoCo implicitfast integrates smooth plus constraint forces. M*a differs
+  // by the optimizer residual when Newton stops before the exact minimum.
+  for(int row=lane;row<s.nefc;row+=32){
+    float derivative,curvature,cost;
+    row_eval(s,row,s.efc_jar[row],&derivative,&curvature,&cost);
+    s.efc_jv[row]=-derivative;
+  }
+  __syncwarp();
+  rows_jtf(s,s.efc_jv,s.tmp,lane);
+  __syncwarp();
+  for(int i=lane;i<NV;i+=32){
+#ifdef DK_NEWTON_STOP_DEBUG
+    printf("IMPLICIT_RHS dof=%d solver_ma=%.9g force_rhs=%.9g residual=%.9g\n",i,s.Ma[i],s.qsm[i]+s.tmp[i],s.Ma[i]-s.qsm[i]-s.tmp[i]);
+#endif
+    s.tmp[i]+=s.qsm[i];
+  }
+  __syncwarp();
   for (int e = lane; e < NTRI; e += 32) s.L[e] = s.M[e];
   __syncwarp();
-  for (int i = lane; i < NV; i += 32) { s.L[TRI(i, i)] += h * (c_kv[i] + c_damping[i]); s.tmp[i] = s.Ma[i]; }
+  for (int i = lane; i < NV; i += 32) { s.L[TRI(i, i)] += h * (c_kv[i] + c_damping[i]); }
   __syncwarp();
   CHOL_SOLVE(s.L, s.L, s.tmp, lane, s.cbuf);
   if (rec) {  // tape: L_Q = chol(M + h kv), a* and a_adv (qvel' = qvel + h a_adv), header
