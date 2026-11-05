@@ -36,11 +36,18 @@ PROTOCOL = {
     'numerical_reference': 'same rounded primal formulas widened to float64 for forward and FD',
     'gradient_coverage': '13 basis output cotangents by six robot world translation/rotation directions, two FD steps',
     'manifold_gradient_gate': 'both endpoint slots gated on full 13 by 6 FD inside the near-tie band',
-    'unsupported': 'inside/intersection/touch centerline returns negative status in both slots, host must stop batch',
+    'inside': 'minimum support facet of hull plus segment, signed distance, continuously reconstructed witnesses',
+    'side_facet_support_tolerance': '8*float32_epsilon*max(1,max_abs_local_vertex)',
+    'near_zero': 'centerline separation at most 2e-5m uses supporting facet signed distance and normal',
+    'unsupported': 'invalid geometry or failed witness reconstruction returns negative status, host must stop batch',
+    'nonsmooth_gate': 'medial-axis cases require independent distance and finite outputs/AD; forward/FD differences recorded',
+    'side_input_selection': 'first deterministic seed11205 inside query whose extruded-hull nearest facet is not an original face',
     'coverage': ['generated_box', 'every supplied real hull', 'sphere_face', 'sphere_edge', 'sphere_corner',
                  'sphere_radius_penetration', 'capsule_endpoint', 'capsule_interior', 'parallel_face_two_contacts',
                  'capsule_nearparallel_two_contacts', 'capsule_nearparallel_unique',
-                 'inside_rejected', 'intersection_rejected', 'touch_rejected'],
+                 'sphere_inside_medial_axis', 'capsule_intersection_medial_axis', 'touch_supported',
+                 'sphere_inside_face', 'capsule_inside_face_endpoint', 'capsule_inside_parallel_face',
+                 'capsule_inside_side_facet'],
 }
 
 CUDA_RUNNER = r'''
@@ -162,20 +169,57 @@ def finite_differences(reference, x):
     return baseline, matrices
 
 
-def run_hull(vertices, faces, directory, stream):
-    from nablaengine.model.convex import pack_static_convex_hulls
+def qualification_cases(vertices, faces):
+    from scipy.spatial import ConvexHull
     matrix = cases(vertices, faces)
+    for case in matrix:
+        case['expected_contacts'] = 1
+        if case['name'] == 'inside_rejected':
+            case.update(name='sphere_inside_medial_axis', reject=False, smooth=False)
+        elif case['name'] == 'intersection_rejected':
+            case.update(name='capsule_intersection_medial_axis', reject=False, smooth=False, expected_contacts=None)
+        elif case['name'] == 'touch_rejected':
+            case.update(name='touch_supported', reject=False, smooth=True)
     parallel = next(case for case in matrix if case['name'] == 'parallel_face_rejected')
-    parallel.update(name='parallel_face_two_contacts', reject=False, smooth=True)
-    # Tilt within and beyond the distance band. Perturbations at both declared
-    # FD steps remain within their respective support regions.
+    parallel.update(name='parallel_face_two_contacts', reject=False, smooth=True, expected_contacts=2)
     outward = next(case['axis'] for case in matrix if case['name'] == 'sphere_face')
-    for name, angle in [('capsule_nearparallel_two_contacts', 1e-5),
-                        ('capsule_nearparallel_unique', 1e-4)]:
-        near_parallel = dict(parallel, name=name)
+    for name, angle, contacts in [('capsule_nearparallel_two_contacts', 1e-5, 2),
+                                   ('capsule_nearparallel_unique', 1e-4, 1)]:
+        near_parallel = dict(parallel, name=name, expected_contacts=contacts)
         near_parallel['axis'] = parallel['axis']*np.cos(angle)+outward*np.sin(angle)
         matrix.append(near_parallel)
-    two_contact_cases = {'parallel_face_two_contacts', 'capsule_nearparallel_two_contacts'}
+    face = next(case for case in matrix if case['name'] == 'sphere_face')
+    face_point = face['center']-outward*.08
+    inside = .9*face_point+.1*vertices.mean(axis=0)
+    face_depth = float(np.dot(face_point-inside, outward))
+    base = dict(face, center=inside, reject=False, smooth=True, expected_contacts=1)
+    matrix.append(dict(base, name='sphere_inside_face'))
+    matrix.append(dict(base, name='capsule_inside_face_endpoint', half_length=.4*face_depth))
+    matrix.append(dict(parallel, name='capsule_inside_parallel_face', center=inside))
+    # This is geometric generation from the declared source vertices, with an
+    # independent explicit Minkowski convex hull selecting a side-facet input.
+    original_normals = ConvexHull(vertices).equations[:, :3]
+    rng = np.random.default_rng(11205)
+    half_length = .2*float(np.ptp(vertices, axis=0).max())
+    for _ in range(100):
+        axis = rng.normal(size=3)
+        axis /= np.linalg.norm(axis)
+        center = .4*vertices[rng.integers(len(vertices))]+.6*vertices.mean(axis=0)
+        extruded = ConvexHull(np.concatenate([vertices-axis*half_length, vertices+axis*half_length]))
+        depths = -extruded.equations[:, :3]@center-extruded.equations[:, 3]
+        normal = extruded.equations[int(np.argmin(depths)), :3]
+        if np.max(np.abs(original_normals@normal)) < 1-1e-6:
+            matrix.append(dict(base, name='capsule_inside_side_facet', center=center,
+                               axis=axis, half_length=half_length))
+            break
+    else:
+        raise ValueError('declared generated side-facet coverage could not be constructed')
+    return matrix
+
+
+def run_hull(vertices, faces, directory, stream):
+    from nablaengine.model.convex import pack_static_convex_hulls
+    matrix = qualification_cases(vertices, faces)
     # One compiled mesh owns the packed representation. Robot sphere/capsule
     # models for the independent oracle all use the same compiled terrain pose.
     packed_oracle = MujocoOracle(vertices, faces, matrix[0])
@@ -199,10 +243,8 @@ def run_hull(vertices, faces, directory, stream):
         row = dict(hull=directory.name, case=case['name'], slot=slot, status=int(statuses[index]),
                    input=x.tolist(), smooth=case['smooth'])
         try:
-            if case['reject']:
-                row['passed'] = row['status'] == -1
-            elif row['status'] == 0:
-                row['passed'] = slot == 1 and case['name'] not in two_contact_cases
+            if row['status'] == 0:
+                row['passed'] = slot == 1 and case['expected_contacts'] in (1, None)
             elif row['status'] != 1:
                 row['passed'] = False
             else:
@@ -212,19 +254,30 @@ def run_hull(vertices, faces, directory, stream):
                            oracle_distance=distance, oracle_witness=witness,
                            compiled_mesh_transform=oracle.transform)
                 row['distance_error'] = abs(float(values[index, 0])-distance)
-                baseline, fds = finite_differences(reference, x)
-                row['forward_max_error'] = float(np.abs(values[index]-baseline).max())
-                row['forward_passed'] = bool(np.allclose(values[index], baseline,
+                row['finite_output_and_jacobian'] = bool(np.isfinite(values[index]).all() and np.isfinite(jacobians[index]).all())
+                reference_value = np.full(13, np.nan)
+                reference_input = x.astype(np.float64)
+                reference_status = reference(reference_input.ctypes.data, reference_value.ctypes.data)
+                row['reference_status'] = reference_status
+                row['forward_max_error'] = float(np.abs(values[index]-reference_value).max())
+                row['forward_passed'] = bool(reference_status == 1 and np.allclose(values[index], reference_value,
                     atol=PROTOCOL['forward_atol'], rtol=PROTOCOL['forward_rtol']))
-                row['finite_differences'] = [fd.tolist() for fd in fds]
-                row['fd_stable'] = bool(np.allclose(*fds, atol=PROTOCOL['fd_stability_atol'],
-                                                   rtol=PROTOCOL['fd_stability_rtol']))
-                row['gradient_passed'] = all(np.allclose(jacobians[index], fd,
-                    atol=PROTOCOL['jacobian_atol'], rtol=PROTOCOL['jacobian_rtol']) for fd in fds)
-                row['jacobian_max_error'] = max(float(np.abs(jacobians[index]-fd).max()) for fd in fds)
-                row['passed'] = bool(row['distance_error'] <= PROTOCOL['distance_atol'] and row['forward_passed']
-                    and (not case['smooth'] or row['fd_stable'] and row['gradient_passed']))
-                if slot == 1 and case['name'] not in two_contact_cases:
+                row['passed'] = bool(row['distance_error'] <= PROTOCOL['distance_atol'] and row['finite_output_and_jacobian'])
+                try:
+                    baseline, fds = finite_differences(reference, x)
+                    row['finite_differences'] = [fd.tolist() for fd in fds]
+                    row['fd_stable'] = bool(np.allclose(*fds, atol=PROTOCOL['fd_stability_atol'],
+                                                       rtol=PROTOCOL['fd_stability_rtol']))
+                    row['gradient_passed'] = all(np.allclose(jacobians[index], fd,
+                        atol=PROTOCOL['jacobian_atol'], rtol=PROTOCOL['jacobian_rtol']) for fd in fds)
+                    row['jacobian_max_error'] = max(float(np.abs(jacobians[index]-fd).max()) for fd in fds)
+                except Exception:
+                    row.update(fd_stable=False, gradient_passed=False, fd_error=traceback.format_exc())
+                if case['smooth']:
+                    row['passed'] = bool(row['passed'] and row['forward_passed'] and row['fd_stable'] and row['gradient_passed'])
+                else:
+                    row['gradient_gate_unavailable'] = 'declared medial-axis condition has no unique smooth contact derivative'
+                if slot == 1 and case['expected_contacts'] == 1:
                     row.update(passed=False, unexpected_second_contact=True)
         except Exception:
             row.update(passed=False, error=traceback.format_exc())
@@ -260,7 +313,11 @@ def main():
                 failure = dict(hull=name, passed=False, setup_error=traceback.format_exc())
                 stream.write(json.dumps(failure)+'\n'); stream.flush(); rows.append(failure)
     result = dict(passed=bool(rows) and all(row['passed'] for row in rows), records=len(rows),
-                  failed=sum(not row['passed'] for row in rows), scope=PROTOCOL['scope'])
+                  failed=sum(not row['passed'] for row in rows), scope=PROTOCOL['scope'],
+                  smooth_contacts=sum(row.get('status') == 1 and row.get('smooth', False) for row in rows),
+                  smooth_gradient_failures=sum(row.get('status') == 1 and row.get('smooth', False)
+                                               and not row.get('gradient_passed', False) for row in rows),
+                  nonsmooth_contacts=sum('gradient_gate_unavailable' in row for row in rows))
     (args.out/'summary.json').write_text(json.dumps(result, indent=2)+'\n')
     raise SystemExit(0 if result['passed'] else 1)
 
