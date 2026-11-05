@@ -176,7 +176,7 @@ def perturb(m, state, direction, h):
     return q, v, u
 
 
-def run_condition(condition, out, report):
+def run_condition(condition, out, report, *, diagnostic=None, artifact=None, artifact_validator=None):
     import mujoco
     import torch
     from nablaengine import torch_ffi as F
@@ -191,7 +191,12 @@ def run_condition(condition, out, report):
     report["environment"] = dict(python=platform.python_version(), numpy=np.__version__, mujoco=mujoco.__version__,
                                  torch=torch.__version__, cuda=torch.version.cuda, gpu=torch.cuda.get_device_name())
     print(f"building {condition} {arch}", flush=True)
-    artifact = F.build(arch, model=m, foot_pairs=fp, set_current=False)
+    if artifact is None:
+        artifact = F.build(arch, model=m, foot_pairs=fp, set_current=False)
+    else:
+        if artifact_validator is None:
+            raise ValueError("reusing an artifact requires a source and model binding validator")
+        report["artifact_binding"] = artifact_validator(m, fp, arch)
     F.init(artifact=artifact)
     report["artifact"] = str(artifact)
     def tensor(a):
@@ -237,7 +242,13 @@ def run_condition(condition, out, report):
                                 foot_contacts_by_side={side: sum(p in ps for p in active)
                                                        for side, ps in foot_geom_pairs.items()}))
         return d.qpos.copy(), d.qvel.copy(), support
-    all_directions = directions(m); cots = cotangents(m)
+    steps = PROTOCOL["fd_steps"] if diagnostic is None else diagnostic["fd_steps"]
+    all_directions = directions(m)
+    if diagnostic is not None:
+        all_directions = [d for d in all_directions if d["block"] == diagnostic["block"]
+                          and d["index"] == diagnostic["direction_index"]]
+        report["diagnostic_protocol"] = diagnostic
+    cots = cotangents(m)
     report["directions"] = [dict(d, direction=d["direction"].tolist()) for d in all_directions]
     report["cotangents"] = [dict(name=n, qpos=q.tolist(), qvel=v.tolist()) for n, q, v in cots]
     generated_states = states(m, fp)
@@ -265,7 +276,7 @@ def run_condition(condition, out, report):
                        foot_contacts_by_side=foot_counts, final_qpos=qn.tolist(), final_qvel=vn.tolist(), directions=[],
                        tape=[{k: v.tolist() for k, v in s.items()} for s in base["summary"]])
             # Finite difference batches keep all requested worlds, including failures.
-            requests = [(di, h, sign) for di in range(len(all_directions)) for h in PROTOCOL["fd_steps"] for sign in (-1, 1)]
+            requests = [(di, h, sign) for di in range(len(all_directions)) for h in steps for sign in (-1, 1)]
             inputs = [perturb(m, state, all_directions[di], h*sign) for di, h, sign in requests]
             fdtraj = forward(*[np.stack([x[k] for x in inputs]) for k in range(3)], horizon)
             fd_outputs = np.c_[fdtraj["q"].cpu().numpy(), fdtraj["v"].cpu().numpy()].astype(float)
@@ -283,6 +294,21 @@ def run_condition(condition, out, report):
                                       nefc=[s["nefc"][j].tolist() for s in fdtraj["summary"]],
                                       flags=[s["flags"][j].tolist() for s in fdtraj["summary"]])
                                 for j, (di, h, sign) in enumerate(requests)]
+            physical_fd_outputs = None
+            if diagnostic is not None:
+                physical_fd_outputs = []
+                physical_fd_support = []
+                for qin, vin, uin in inputs:
+                    perturbed_state = dict(state, q=qin, v=vin, u=uin)
+                    qp, vp, support = physical_reference(perturbed_state, horizon)
+                    physical_fd_outputs.append(np.r_[qp, vp])
+                    physical_fd_support.append(support)
+                physical_fd_outputs = np.stack(physical_fd_outputs)
+                row["mujoco_fd_contact_support"] = physical_fd_support
+                np.savez_compressed(out / f"{state['name']}_{horizon}_controls_mujoco_fd.npz",
+                                    input_qpos=np.stack([x[0] for x in inputs]),
+                                    input_qvel=np.stack([x[1] for x in inputs]),
+                                    input_ctrl=np.stack([x[2] for x in inputs]), output=physical_fd_outputs)
             g_results = []
             for cotname, cq, cv in cots:
                 gq, gv = tensor(cq[None]), tensor(cv[None]); gu = torch.zeros((1, m.nu), device="cuda"); backward_flags = []
@@ -295,13 +321,13 @@ def run_condition(condition, out, report):
                 bwd_ok = finite_g and all(not (f & bad_bwd) for f in backward_flags)
                 g_results.append((cotname, cq, cv, gq.cpu().numpy()[0], gv.cpu().numpy()[0], gu.cpu().numpy()[0], bwd_ok, backward_flags))
             for di, direction in enumerate(all_directions):
-                ix = np.arange(di*6, (di+1)*6)
+                ix = np.arange(di*2*len(steps), (di+1)*2*len(steps))
                 topology_ok = all(np.array_equal(sig[ix], np.broadcast_to(basesig, sig[ix].shape))
                                   for sig, basesig in zip(fdtraj["signatures"], base["signatures"]))
                 dr = dict(block=direction["block"], index=direction["index"], topology_stable=topology_ok, cotangents=[])
                 for cotname, cq, cv, gq, gv, gu, bwd_ok, flags in g_results:
                     scalar = fd_outputs[ix]@np.r_[cq, cv]
-                    fds = np.array([(scalar[j+1]-scalar[j])/(2*h) for j, h in zip((0, 2, 4), PROTOCOL["fd_steps"])])
+                    fds = np.array([(scalar[j+1]-scalar[j])/(2*h) for j, h in zip(range(0, 2*len(steps), 2), steps)])
                     if direction["block"] == "qpos_tangent":
                         qp, _, _ = perturb(m, state, direction, 1e-6); qm, _, _ = perturb(m, state, direction, -1e-6)
                         analytic = float(gq@((qp-qm)/(2e-6)))
@@ -311,7 +337,13 @@ def run_condition(condition, out, report):
                     correct = close(np.asarray(analytic), fds[-1], PROTOCOL["gradient_atol"], PROTOCOL["gradient_rtol"])
                     negative = not close(np.asarray(analytic+PROTOCOL["negative_control_offset"]+PROTOCOL["negative_control_relative"]*abs(analytic)), fds[-1],
                                          PROTOCOL["gradient_atol"], PROTOCOL["gradient_rtol"])
+                    mujoco_fds = None
+                    if physical_fd_outputs is not None:
+                        physical_scalar = physical_fd_outputs[ix]@np.r_[cq, cv]
+                        mujoco_fds = [(physical_scalar[j+1]-physical_scalar[j])/(2*h)
+                                      for j, h in zip(range(0, 2*len(steps), 2), steps)]
                     dr["cotangents"].append(dict(name=cotname, analytic=analytic, finite_differences=fds.tolist(),
+                                                   mujoco_double_finite_differences=mujoco_fds,
                                                    fd_stable=stable, gradient_ok=correct, backward_ok=bwd_ok,
                                                    backward_flags=flags, negative_control_rejected=negative,
                                                    pass_=bool(stable and correct and negative and bwd_ok and topology_ok)))
