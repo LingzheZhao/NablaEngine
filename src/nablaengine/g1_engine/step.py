@@ -2204,6 +2204,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       s.qacc[i] = qa; s.Ma[i] = ma;
       g += 0.5f * (ma - s.qsm[i]) * (qa - s.qacc0[i]);
     }
+    float row_change = 0.f;
     bool chg = false;  // a row of this lane changes its zone (tape: the Hessian factored above is then out of date)
 #pragma unroll
     for (int t = 0; t < RT; t++) {
@@ -2213,23 +2214,30 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
         float xn = rx[t] + alpha * rj[t], ds, dd;
         int z0 = row_piece(r, rx[t], rD[t], rF[t], &ds, &dd), z1 = row_piece(r, xn, rD[t], rF[t], &ds, &dd);
         chg |= z0 != z1;
+        // Evaluate the cost change locally, avoiding subtraction of total costs.
+        float dx=alpha*rj[t];
+        if(z0==z1){
+          if(z1==1)row_change+=rD[t]*dx*(rx[t]+.5f*dx);
+          else if(z1>=2)row_change+=(z1==2?-rF[t]:rF[t])*dx;
+        }else row_change+=row_cost(z1,xn,rD[t],rF[t])-row_cost(z0,rx[t],rD[t],rF[t]);
         g += row_cost(z1, xn, rD[t], rF[t]);
         s.efc_jar[r] = xn;
         s.efc_jv[r] = -ds;  // the line search's J p is not needed any more
       }
     }
     zsame = !__any_sync(0xffffffffu, chg);  // then the next H is this one
+    float line_improvement=-(alpha*(a1+.5f*alpha*a2)+warp_sum(row_change));
     PROF(9);
 #if DK_GRAD_COST
     PROF(10);
     const float2 gc = newton_grad(s, lane, false, g);  // gradient at the new point (the stopping test and the next
     const float gn = gc.x, newcost = gc.y;             // step), the new cost
-    float improvement = scale * (cost - newcost);
+    float improvement = scale * line_improvement;
     cost = newcost;
 #else
     float newcost = warp_sum(g);
     PROF(10);
-    float improvement = scale * (cost - newcost);
+    float improvement = scale * line_improvement;
     cost = newcost;
     float gn = newton_grad(s, lane, false);  // gradient at the new point: the stopping test and the next step
 #endif
