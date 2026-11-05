@@ -178,10 +178,13 @@ def cotangents(m):
 
 def perturb(m, state, direction, h):
     import mujoco
-    q, v, u = (state[k].copy() for k in ("q", "v", "u"))
-    block, d = direction["block"], direction["direction"]
+    # MuJoCo pose integration owns a writable float64 buffer. Prepared motion
+    # rows are float32, so make this precision boundary explicit for every block.
+    q, v, u = (np.array(state[k], dtype=np.float64, order="C", copy=True) for k in ("q", "v", "u"))
+    block = direction["block"]
+    d = np.ascontiguousarray(direction["direction"], dtype=np.float64)
     if block == "qpos_tangent":
-        mujoco.mj_integratePos(m, q, d, h)
+        mujoco.mj_integratePos(m, q, d, float(h))
     elif block == "qvel":
         v += h*d
     else:
