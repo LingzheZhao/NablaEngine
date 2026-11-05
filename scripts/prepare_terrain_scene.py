@@ -326,7 +326,7 @@ def main():
             expected_vertices.append(vertices + tile["translation_m"])
             spec.add_mesh(name=name, uservert=vertices.ravel().tolist(), userface=faces.ravel().tolist())
             spec.worldbody.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_MESH,
-                                    meshname=name, pos=tile["translation_m"], contype=0, conaffinity=0, mass=0)
+                                    meshname=name, pos=tile["translation_m"], contype=0, conaffinity=0, group=0, mass=0)
             for robot in robots:
                 # Foot names preserve the environment's established foot-pair selector.
                 suffix = "floor" if robot in foot_robots else "terrain"
@@ -405,6 +405,10 @@ def main():
         frame=frame,
         counts=dict(terrains=len(tiles), collision_geoms=len(step.collision_geoms(model)), robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom, robot_visual_geoms=int(np.count_nonzero((model.geom_bodyid != 0) & (model.geom_group == 2))),
                     self_pairs=self_pairs, terrain_pairs=len(robots) * len(hull_names), pairs=model.npair),
+        terrain_camera_surface=dict(collision_coacd_visualize_collision_hulls=True,
+                                    skip_source_mesh_import=True, collision_hull_geom_group=0,
+                                    include_geom_groups=[0, 2], exclude_parent_body=False,
+                                    source="pinned PerceptiveShadowingSceneCfg and motion_matched_terrain"),
         hull_surface="ConvexHull triangulation of stored CoACD vertices, with outward winding. All vertices retained.",
         hull_face_counts=hull_face_counts,
         robot_visuals=visual_contract if fixture_contract is None else dict(
