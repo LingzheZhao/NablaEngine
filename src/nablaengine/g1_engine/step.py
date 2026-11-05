@@ -2085,7 +2085,11 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   int ncon = uniform_int(min(s.ncon, MAXCON), 8);
   PROF_START();
   // Newton solver from the warm start (or qacc_smooth when that is cheaper)
-  const float scale = 1.f / (c_sopt[1] * NV), tol = c_sopt[2];
+  // MuJoCo 3.17 normalizes the stopping tests by the current inertia trace.
+  float inertia_trace=0.f;
+  for(int i=lane;i<NV;i+=32)inertia_trace+=s.M[TRI(i,i)];
+  inertia_trace=warp_sum(inertia_trace);
+  const float scale = 1.f / inertia_trace, tol = c_sopt[2];
   refresh(s, lane);
   float cost = total_cost(s, lane);
   // the warm start's qacc, Ma and jar kept in tmp, p and efc_jv (all free here; SimN's Mp shares tmp's storage) in
