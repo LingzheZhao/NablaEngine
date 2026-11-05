@@ -566,7 +566,7 @@ __device__ BoxDual& BoxDual::operator*=(BoxDual b){*this=*this*b;return *this;}
 __device__ BoxDual fabsf(BoxDual a){return a.v<0.f?-a:a;}
 __device__ BoxDual fminf(BoxDual a,BoxDual b){return a.v<=b.v?a:b;}
 __device__ BoxDual fmaxf(BoxDual a,BoxDual b){return a.v>=b.v?a:b;}
-__device__ BoxDual sqrtf(BoxDual a){BoxDual c(sqrtf(a.v));for(int i=0;i<6;i++)c.d[i]=a.d[i]/(2.f*c.v);return c;}
+__device__ BoxDual sqrtf(BoxDual a){BoxDual c(::sqrtf(a.v));for(int i=0;i<6;i++)c.d[i]=a.d[i]/(2.f*c.v);return c;}
 __device__ BoxDual safe_div(BoxDual a,BoxDual b){return a/(b.v!=0.f?b:BoxDual(1e-15f));}
 __device__ BoxDual dot3(const BoxDual*a,const BoxDual*b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
 __device__ void mtv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i++)b[i]=R[i]*a[0]+R[3+i]*a[1]+R[6+i]*a[2];}
