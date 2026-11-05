@@ -132,6 +132,8 @@ def decode(arr, m, max_contacts=None):
 
 def pack_contact(pair, slot):
     """Pack one active contact. The all-ones entry remains reserved."""
+    import operator
+    pair, slot = operator.index(pair), operator.index(slot)
     if not 0 <= pair < PAIR_CAPACITY or not 0 <= slot < SLOT_CAPACITY:
         raise ValueError('contact pair or slot exceeds its field')
     entry = int(pair) | int(slot) << PAIR_BITS
