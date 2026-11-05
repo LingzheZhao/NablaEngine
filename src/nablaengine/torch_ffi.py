@@ -341,6 +341,9 @@ def _bind(lib, info):
     fns = dict(forward=getattr(lib, f"{fwd}_forward"), work_bytes=getattr(lib, f"{fwd}_work_bytes"),
                kin=getattr(lib, f"{fwd}_kinematics"), kin_vjp=getattr(lib, f"{fwd}_kinematics_vjp"))
     fns["forward"].argtypes = [vp, i32] + [vp] * 6 + [i32, i32] + [vp] * 7
+    fns["forward_measurements"] = getattr(lib, f"{fwd}_forward_measurements", None)
+    if fns["forward_measurements"] is not None:
+        fns["forward_measurements"].argtypes = fns["forward"].argtypes + [vp] * 4
     fns["work_bytes"].argtypes, fns["work_bytes"].restype = [i32], ctypes.c_longlong
     fns["kin"].argtypes = [vp, i32] + [vp] * 8
     fns["kin_vjp"].argtypes = [vp, i32] + [vp] * 12
@@ -464,7 +467,7 @@ def tape_bytes(nworld, substeps=SUBSTEPS, steps=1):
 # ---- custom ops (torch.library): the library calls, opaque to torch.compile ------------------------------------------
 
 @_on_input_device
-def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics):
+def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics, measurements=False):
     import torch
     dev = _ready(qpos)
     nq, nv, nu, nb, rec = _sizes()
@@ -479,20 +482,30 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, t
     info = torch.empty((B, 4), dtype=torch.int32, device=qpos.device)
     tp = torch.empty((B, substeps * rec), **kw) if tape else torch.empty((0, substeps * rec), **kw)
     kin = _kin_empty(B, qpos.device) if kinematics else []
+    measured = []
+    if measurements:
+        measured = [torch.empty((B, substeps, nb, 6), **kw),
+                    torch.empty((B, substeps, nb), dtype=torch.int32, device=qpos.device),
+                    torch.empty((B, substeps, nv-6), **kw),
+                    torch.empty((B, substeps, 4), dtype=torch.int32, device=qpos.device)]
     if B == 0:
-        return [q1, v1, w1, info, tp] + kin
+        return [q1, v1, w1, info, tp] + kin + measured
     fns = _STATE["fns"]
     con = torch.empty((B, _STATE["info"]["maxcon"] * 8), **kw)  # the last substep's contacts (unused, as jax_ffi)
     work = torch.empty((max(int(fns["work_bytes"](B)), 1),), dtype=torch.uint8, device=qpos.device)
     st = torch.cuda.current_stream(dev).cuda_stream
-    _rc(fns["forward"](st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),
-                       _ptr(v1), _ptr(w1), _ptr(info), _ptr(con), _ptr(tp) if tape else None, _ptr(work)),
+    launch = fns["forward_measurements"] if measurements else fns["forward"]
+    if launch is None:
+        raise _err("loaded artifact has no native measurement entry; build this source revision", RuntimeError)
+    extra = list(map(_ptr, measured))
+    _rc(launch(st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),
+               _ptr(v1), _ptr(w1), _ptr(info), _ptr(con), _ptr(tp) if tape else None, _ptr(work), *extra),
         "the forward launch")
     if kinematics:
         _rc(fns["kin"](st, B, _ptr(q1), _ptr(v1), _ptr(com), *map(_ptr, kin)), "the kinematics launch")
     if _DIAG_ON[0]:
         _diag_forward(dev, st, info, tp if tape else None, iterations, substeps)
-    return [q1, v1, w1, info, tp] + kin
+    return [q1, v1, w1, info, tp] + kin + measured
 
 
 def _kin_empty(B, device):
@@ -618,6 +631,21 @@ def _custom_ops():
             out += [qpos.new_empty(s) for s in ((B, nq), (B, nb, 3), (B, nb, 4), (B, nb, 6), (B, nb, 3))]
         return out
 
+    @torch.library.custom_op("nablaengine::forward_measurements", mutates_args=())
+    def measured_op(qpos: Tensor, qvel: Tensor, warm: Tensor, ctrl: Tensor, friction: Tensor, com: Tensor,
+                    iterations: int, substeps: int, tape: bool) -> List[Tensor]:
+        return _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, False, True)
+
+    @measured_op.register_fake
+    def _(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape):
+        nq, nv, _, nb, rec = _fake_sizes()
+        B = qpos.shape[0]
+        return [qpos.new_empty((B, nq)), qpos.new_empty((B, nv)), qpos.new_empty((B, nv)),
+                qpos.new_empty((B, 4), dtype=torch.int32), qpos.new_empty((B if tape else 0, substeps*rec)),
+                qpos.new_empty((B, substeps, nb, 6)),
+                qpos.new_empty((B, substeps, nb), dtype=torch.int32),
+                qpos.new_empty((B, substeps, nv-6)), qpos.new_empty((B, substeps, 4), dtype=torch.int32)]
+
     @torch.library.custom_op("nablaengine::backward", mutates_args=())
     def backward_op(tape: Tensor, friction: Tensor, com: Tensor, g_qpos: Tensor, g_qvel: Tensor,
                     ctrl: Optional[Tensor], kin_state: List[Tensor], kin_cot: List[Tensor], substeps: int,
@@ -653,7 +681,8 @@ def _custom_ops():
         B = qpos.shape[0]
         return [qpos.new_empty((B, nq)), qpos.new_empty((B, nv))]
 
-    _OPS.update(forward=forward_op, backward=backward_op, kinematics=kinematics_op,
+    _OPS.update(forward=forward_op, forward_measurements=measured_op,
+                backward=backward_op, kinematics=kinematics_op,
                 kinematics_backward=kinematics_backward_op)
     return _OPS
 
@@ -852,6 +881,39 @@ def forward(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, sub
     r = _ops()["forward"](qpos, qvel, warm, ctrl, friction, com, int(iterations), int(substeps), bool(tape),
                           bool(kinematics))
     return tuple(r[:4]) + ((r[4],) if tape else ()) + tuple(r[5:])
+
+
+def forward_measurements(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, substeps=SUBSTEPS,
+                         tape=False):
+    """Execute a forward call with native solver measurements at every substep.
+
+    Returns a dictionary with qpos, qvel, warm and info, plus tape when requested.
+    terrain_wrench has shape (B, substeps, nbody, 6), ordered world force (N),
+    moment about world origin (N m). Each contact applies +force to canonical
+    geom 2 and -force to geom 1. Only pairs with one world-body geom contribute.
+    Body zero holds the opposite terrain reaction. terrain_contact_count counts
+    retained geometric contacts, including those whose final solved force is zero.
+    actuator_torque (B, substeps, nv-6) is the executed clamped actuator generalized
+    torque in actuated dof order, in N m. It excludes passive damping/friction.
+    substep_info (B, substeps, 4) holds iterations, contacts, rows and unsupported
+    bits. Counts/forces from unsupported or overflowed records remain partial.
+
+    Samples refer to each substep input t_k and its solved acceleration, before
+    implicitfast advances to t_k+dt. At dt=.005 and substeps=4 this is 200 Hz.
+    These observational outputs have no autograd rule. Use step for state VJPs.
+    """
+    import torch
+    if torch.compiler.is_compiling():
+        result = _custom_ops()["forward_measurements"](qpos, qvel, warm, ctrl, friction, com,
+                                                       int(iterations), int(substeps), bool(tape))
+    else:
+        result = _forward_impl(qpos, qvel, warm, ctrl, friction, com,
+                               int(iterations), int(substeps), bool(tape), False, True)
+    output = dict(zip(("qpos", "qvel", "warm", "info", "tape", "terrain_wrench", "terrain_contact_count",
+                       "actuator_torque", "substep_info"), result))
+    if not tape:
+        output.pop("tape")
+    return output
 
 
 def backward(tape, friction, com, g_qpos, g_qvel, *, substeps=SUBSTEPS, clamp_kv=CLAMP_KV, normal=NORMAL, ctrl=None,

@@ -7,7 +7,10 @@ kernels' DKC arrays (scripts/engine_step_check.py re-exports both).
 """
 
 
-KERNEL = r"""
+from nablaengine.g1_engine.measurements import DEVICE as MEASUREMENT_DEVICE
+
+
+KERNEL = MEASUREMENT_DEVICE + r"""
 #ifndef DK_SPLIT
 #define DK_SPLIT 1  // engine_step_check.py's and the FFI's forward: 1 the split kernels (dk_forward_split), 0 k_substep
 #endif
@@ -18,7 +21,9 @@ __device__ unsigned long long g_prof[NPROF];
 // tape: null, or nw * nsub records of REC_WORDS (tape.py), record w * nsub + k for world w and substep k
 __global__ void k_substep(int nw, const float* qpos, const float* qvel, const float* warm, const float* ctrl,
                           const float* fric, const float* com, int iterations, int nsub, float* oqpos, float* oqvel,
-                          float* owarm, int* info, float* ocon, float* tape) {
+                          float* owarm, int* info, float* ocon, float* tape,
+                          float* measured_wrench = nullptr, int* measured_count = nullptr,
+                          float* measured_actuator = nullptr, int* measured_info = nullptr) {
   extern __shared__ __align__(16) unsigned char dk_smem[];  // dynamic: struct Sim can exceed the 48 KB static limit
   Sim& s = *reinterpret_cast<Sim*>(dk_smem);
   // lane = threadIdx.x & 31, not threadIdx.x (also in k_pre, k_post, k_adjoint): the block is one warp, but the
@@ -40,9 +45,18 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
 #endif
   __syncwarp();
   int nit = 0;
-  for (int k = 0; k < nsub; k++)
-    substep(s, ctrl + (size_t)w * (NV - 6), iterations, lane, &nit,
-            tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr);
+  for (int k = 0; k < nsub; k++) {
+    float* record = tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr;
+    float* actuator = measured_actuator ? measured_actuator + ((size_t)w*nsub+k)*(NV-6) : nullptr;
+    substep_pre(s, ctrl + (size_t)w*(NV-6), lane, record, actuator);
+    substep_post(s, iterations, lane, &nit, record);
+    if (measured_wrench) measure_terrain_wrenches(s, s, lane,
+        measured_wrench + ((size_t)w*nsub+k)*NB*6, measured_count + ((size_t)w*nsub+k)*NB);
+    if (measured_info && lane == 0) {
+      int* output = measured_info + ((size_t)w*nsub+k)*4;
+      output[0] = nit; output[1] = s.ncon; output[2] = s.nefc; output[3] = s.unsupported;
+    }
+  }
   for (int i = lane; i < NQ; i += 32) oqpos[(size_t)w * NQ + i] = s.qpos[i];
   for (int i = lane; i < NV; i += 32) { oqvel[(size_t)w * NV + i] = s.qvel[i]; owarm[(size_t)w * NV + i] = s.qacc[i]; }
 #ifdef DK_PROFILE
@@ -132,7 +146,7 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
 // the pre half of substep k for world w
 __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, const float* qpos, const float* qvel,
                                           const float* ctrl, const float* fric, const float* com, int k, int nsub,
-                                          float* ocon, float* tape) {
+                                          float* ocon, float* tape, float* measured_actuator = nullptr) {
   for (int i = lane; i < NQ; i += 32) s.qpos[i] = qpos[(size_t)w * NQ + i];
   for (int i = lane; i < NV; i += 32) s.qvel[i] = qvel[(size_t)w * NV + i];
   if (lane < 3) s.com[lane] = com[w * 3 + lane];
@@ -147,7 +161,9 @@ __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, con
   if (lane < NPROF) s.prof[lane] = 0;
 #endif
   __syncwarp();
-  substep_pre(s, ctrl + (size_t)w * (NV - 6), lane, tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr);
+  substep_pre(s, ctrl + (size_t)w * (NV - 6), lane,
+              tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr,
+              measured_actuator ? measured_actuator + ((size_t)w*nsub+k)*(NV-6) : nullptr);
   int ncon = min(s.ncon, MAXCON);
   for (int i = lane; i < NV; i += 32) { g.qsm[i] = s.qsm[i]; g.qacc0[i] = s.qacc0[i]; }
   for (int c = lane; c < ncon; c += 32) {
@@ -175,7 +191,9 @@ __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, con
 template <class S>  // the post half of substep k for world w on its state s (SimN in shared memory, or Hand::big)
 __device__ __forceinline__ void post_world_on(S& s, const Hand& g, int w, int lane, const float* qpos,
                                               const float* qvel, const float* warm, int iterations, int k, int nsub,
-                                              float* oqpos, float* oqvel, float* owarm, int* info, float* tape) {
+                                              float* oqpos, float* oqvel, float* owarm, int* info, float* tape,
+                                              float* measured_wrench = nullptr, int* measured_count = nullptr,
+                                              int* measured_info = nullptr) {
   const int ncon = min(g.ncon, MAXCON), nefc = g.nefc;
   float *q = oqpos + (size_t)w * NQ, *v = oqvel + (size_t)w * NV;  // implicitfast updates the outputs in place
   if (k == 0) {  // (from substep 1 on, the inputs are the outputs)
@@ -202,6 +220,12 @@ __device__ __forceinline__ void post_world_on(S& s, const Hand& g, int w, int la
   __syncwarp();
   int nit = 0;
   substep_post(s, iterations, lane, &nit, tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr);
+  if (measured_wrench) measure_terrain_wrenches(s, g, lane,
+      measured_wrench + ((size_t)w*nsub+k)*NB*6, measured_count + ((size_t)w*nsub+k)*NB);
+  if (measured_info && lane == 0) {
+    int* output = measured_info + ((size_t)w*nsub+k)*4;
+    output[0] = nit; output[1] = s.ncon; output[2] = s.nefc; output[3] = s.unsupported;
+  }
   for (int i = lane; i < NV; i += 32) owarm[(size_t)w * NV + i] = s.qacc[i];
   if (k == nsub - 1 && lane == 0) {
     info[w * 4] = nit; info[w * 4 + 1] = s.ncon; info[w * 4 + 2] = s.nefc; info[w * 4 + 3] = s.unsupported;
@@ -216,14 +240,17 @@ __device__ __forceinline__ void post_world_on(S& s, const Hand& g, int w, int la
 // the post half: on SimN in shared memory (smem) when the world's contacts and rows fit, else on Hand::big
 __device__ __forceinline__ void post_world(unsigned char* smem, Hand& g, int w, int lane, const float* qpos,
                                            const float* qvel, const float* warm, int iterations, int k, int nsub,
-                                           float* oqpos, float* oqvel, float* owarm, int* info, float* tape) {
+                                           float* oqpos, float* oqvel, float* owarm, int* info, float* tape,
+                                           float* measured_wrench = nullptr, int* measured_count = nullptr,
+                                           int* measured_info = nullptr) {
 #ifndef DK_SPLIT_ALL_BIG  // (debug: every world on the full-capacity state in global memory)
   if (min(g.ncon, MAXCON) <= SPLIT_NCON && g.nefc <= SPLIT_NEFC)
     post_world_on(*reinterpret_cast<SimN*>(smem), g, w, lane, qpos, qvel, warm, iterations, k, nsub, oqpos, oqvel,
-                  owarm, info, tape);
+                  owarm, info, tape, measured_wrench, measured_count, measured_info);
   else
 #endif
-    post_world_on(g.big, g, w, lane, qpos, qvel, warm, iterations, k, nsub, oqpos, oqvel, owarm, info, tape);
+    post_world_on(g.big, g, w, lane, qpos, qvel, warm, iterations, k, nsub, oqpos, oqvel, owarm, info, tape,
+                  measured_wrench, measured_count, measured_info);
 }
 
 // DK_SPLIT_ORDER's ordering memory (after the Hand records): counters cnt[SPLIT_MAXSUB][SPLIT_NBUCKET] (zero at the
@@ -265,11 +292,12 @@ __device__ __forceinline__ int dk_order_world(const int* cnt, const int* order, 
 #endif
 __global__ void SPLIT_PRE_BOUNDS k_pre(int nw, const float* qpos, const float* qvel, const float* ctrl,
                                        const float* fric, const float* com, int k, int nsub, Hand* work, float* ocon,
-                                       float* tape) {
+                                       float* tape, float* measured_actuator = nullptr) {
   extern __shared__ __align__(16) unsigned char dk_smem[];
   const int lane = threadIdx.x & 31, w = blockIdx.x;  // (& 31: see k_substep)
   if (w >= nw) return;
-  pre_world(*reinterpret_cast<SimP*>(dk_smem), work[w], w, lane, qpos, qvel, ctrl, fric, com, k, nsub, ocon, tape);
+  pre_world(*reinterpret_cast<SimP*>(dk_smem), work[w], w, lane, qpos, qvel, ctrl, fric, com, k, nsub,
+            ocon, tape, measured_actuator);
 #if DK_SPLIT_ORDER
   if (lane == 0) {
     int* cnt = reinterpret_cast<int*>(work + nw);
@@ -282,7 +310,9 @@ __global__ void SPLIT_PRE_BOUNDS k_pre(int nw, const float* qpos, const float* q
 
 __global__ void SPLIT_POST_BOUNDS k_post(int nw, const float* qpos, const float* qvel, const float* warm,
                                          int iterations, int k, int nsub, Hand* work, float* oqpos, float* oqvel,
-                                         float* owarm, int* info, float* tape) {
+                                         float* owarm, int* info, float* tape,
+                                         float* measured_wrench = nullptr, int* measured_count = nullptr,
+                                         int* measured_info = nullptr) {
   extern __shared__ __align__(16) unsigned char dk_smem[];
   const int lane = threadIdx.x & 31;  // (& 31: see k_substep)
   int w = blockIdx.x;
@@ -294,7 +324,8 @@ __global__ void SPLIT_POST_BOUNDS k_post(int nw, const float* qpos, const float*
                        cnt + SPLIT_MAXSUB * SPLIT_NBUCKET + (size_t)(k & 1) * SPLIT_NBUCKET * nw, nw, w, lane);
   }
 #endif
-  post_world(dk_smem, work[w], w, lane, qpos, qvel, warm, iterations, k, nsub, oqpos, oqvel, owarm, info, tape);
+  post_world(dk_smem, work[w], w, lane, qpos, qvel, warm, iterations, k, nsub, oqpos, oqvel, owarm, info, tape,
+             measured_wrench, measured_count, measured_info);
 }
 
 // work memory of dk_forward_split for nw worlds: nw records of struct Hand (and DK_SPLIT_ORDER's ordering memory)
@@ -311,7 +342,9 @@ static inline cudaError_t dk_forward_split(cudaStream_t st, int nw, const float*
                                            const float* warm, const float* ctrl, const float* fric, const float* com,
                                            int iterations, int nsub, float* oqpos, float* oqvel, float* owarm,
                                            int* info, float* ocon, float* tape, void* work,
-                                           size_t smem_pre = sizeof(SimP), size_t smem_post = sizeof(SimN)) {
+                                           size_t smem_pre = sizeof(SimP), size_t smem_post = sizeof(SimN),
+                                           float* measured_wrench = nullptr, int* measured_count = nullptr,
+                                           float* measured_actuator = nullptr, int* measured_info = nullptr) {
   Hand* hand = reinterpret_cast<Hand*>(work);
 #if DK_SPLIT_ORDER
   if (nsub > SPLIT_MAXSUB) return cudaErrorInvalidValue;
@@ -321,10 +354,10 @@ static inline cudaError_t dk_forward_split(cudaStream_t st, int nw, const float*
   for (int k = 0; k < nsub; k++) {
     if (dk_split_only != 2)
       k_pre<<<nw, 32, smem_pre, st>>>(nw, k ? oqpos : qpos, k ? oqvel : qvel, ctrl, fric, com, k, nsub, hand, ocon,
-                                      tape);
+                                      tape, measured_actuator);
     if (dk_split_only != 1)
       k_post<<<nw, 32, smem_post, st>>>(nw, k ? oqpos : qpos, k ? oqvel : qvel, k ? owarm : warm, iterations, k, nsub,
-                                        hand, oqpos, oqvel, owarm, info, tape);
+                                        hand, oqpos, oqvel, owarm, info, tape, measured_wrench, measured_count, measured_info);
   }
   return cudaGetLastError();
 }
