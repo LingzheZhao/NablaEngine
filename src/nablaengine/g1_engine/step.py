@@ -1181,7 +1181,6 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
     }
     return;
   }
-#if HAS_BOX
 #if HAS_CONVEX
   if ((t1 == 1 || t1 == 2) && t2 == 4) {
     float axis[3]={0.f,0.f,1.f}; if(t1==2)zaxis_rn(q1,axis);
@@ -1201,6 +1200,7 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
     return;
   }
 #endif
+#if HAS_BOX
   if (t1 == 1 && t2 == 3) {
     float R[9],dist,pos[3],normal[3],fr[9]; quat2mat(q2,R);
     sphere_box(p1,sz1[0],p2,R,sz2,&dist,pos,normal);
