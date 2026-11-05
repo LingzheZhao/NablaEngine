@@ -220,6 +220,252 @@ def screen(args, report, out):
                         distance=distance, centerline_intersects=intersects, foot_pair_mask=foot,
                         qpos=qpos[frames], qvel=qvel[frames])
     report['completed'] = True
+    return dict(model=model, foot_pairs=foot_pairs, qpos=qpos, qvel=qvel, frames=frames,
+                contract=contract, packed_hulls=packed, hull_geoms=list(hulls),
+                fps=json.loads((args.reference/'index.json').read_text())['fps'])
+
+
+EXECUTION_PROTOCOL = dict(horizons=[1, 4], substeps=4, iterations=50, friction=1., com=[0., 0., 0.],
+                          fd_steps=[1e-5, 5e-6], gradient_atol=.01, gradient_rtol=.03,
+                          fd_stability_atol=.001, fd_stability_rtol=.01,
+                          qpos_atol=.0005, qvel_atol=.05, sensor_ray_atol_m=.0005, continuous_controls=32,
+                          term_height=.25, term_gravity_z=.8, update_learning_rate=1e-4,
+                          update="29-parameter residual action, native Torch F.step and SGD",
+                          control="reference actuator joint targets plus one constant residual vector")
+
+
+def execute(args, context, report, out):
+    import os
+    import mujoco
+    import torch
+    from nablaengine import torch_ffi as F
+    from nablaengine.g1_engine import tape
+    from nablamimic.terrain_observation import ConvexTerrain, height_scan
+    from check_pair_capacity import backward_chain
+    import check_box_step_gradients as box_check
+    model, foot_pairs = context['model'], context['foot_pairs']
+    qpos, qvel, frames = context['qpos'], context['qvel'], context['frames']
+    sensor_contract = json.loads((args.sensor/'contract.json').read_text())
+    if sensor_contract['artifact_id'] != context['contract']['terrain_artifact_id']:
+        raise ValueError('Physical terrain and height sensor artifact identities differ')
+    sensor_data = np.load(args.sensor/'terrain.npz', allow_pickle=False)
+    device = 'cuda'
+    def tensor(values):
+        return torch.tensor(values, dtype=torch.float32, device=device).contiguous()
+    terrain = ConvexTerrain(tensor(sensor_data['normals']), tensor(sensor_data['offsets']),
+                            torch.tensor(sensor_data['valid_faces'], dtype=torch.bool, device=device))
+    scan_offsets = torch.cartesian_prod(torch.linspace(-.8, 1.2, 11, device=device),
+                                       torch.linspace(-.5, .5, 7, device=device))
+    if (terrain.normals.ndim != 3 or terrain.normals.shape[-1] != 3
+            or terrain.offsets.shape != terrain.normals.shape[:2]
+            or terrain.valid_faces.shape != terrain.offsets.shape
+            or not bool(torch.isfinite(terrain.normals).all() & torch.isfinite(terrain.offsets).all())
+            or not bool(terrain.valid_faces.any(dim=-1).all())):
+        raise ValueError('Malformed sensor halfspaces')
+    normal_lengths = torch.linalg.vector_norm(terrain.normals[terrain.valid_faces], dim=-1)
+    if not bool(torch.allclose(normal_lengths, torch.ones_like(normal_lengths), atol=1e-5, rtol=0)):
+        raise ValueError('Sensor face normals require unit length')
+    report['sensor_rays'] = []
+    ray_data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, ray_data)
+    offsets_numpy = scan_offsets.cpu().numpy().astype(float)
+    for frame in frames:
+        q = qpos[int(frame)]
+        w, x, y, z = q[3:7]
+        yaw = np.arctan2(2*(w*z+x*y), 1-2*(y*y+z*z))
+        c, s = np.cos(yaw), np.sin(yaw)
+        origins = np.repeat(q[None, :3], len(offsets_numpy), axis=0)
+        origins[:, 0] += c*offsets_numpy[:, 0]-s*offsets_numpy[:, 1]
+        origins[:, 1] += s*offsets_numpy[:, 0]+c*offsets_numpy[:, 1]
+        origins[:, 2] += 1.
+        reference_distances = []
+        for origin in origins:
+            hits = [mujoco.mj_rayMesh(model, ray_data, geom, origin, np.array([0., 0., -1.]))
+                    for geom in context['hull_geoms']]
+            reference_distances.append(min([hit for hit in hits if hit >= 0]+[3.]))
+        measured = height_scan(terrain, tensor(q[None, :3]), tensor(q[None, 3:7]), scan_offsets).cpu().numpy()[0]
+        error = float(np.max(np.abs(measured-reference_distances)))
+        report['sensor_rays'].append(dict(frame=int(frame), measured_m=measured.tolist(),
+                                          mujoco_mesh_ray_reference_m=reference_distances,
+                                          max_error_m=error, pass_=error <= EXECUTION_PROTOCOL['sensor_ray_atol_m']))
+    model.opt.iterations = EXECUTION_PROTOCOL['iterations']
+    if not np.isclose(model.opt.timestep*4, 1./context['fps'], atol=1e-12, rtol=0):
+        raise ValueError('Reference control rate differs from four physics substeps')
+    os.environ['DK_CACHE_DIR'] = str(out/'build')
+    os.environ.pop('DK_TORCH_ARTIFACT', None)
+    cc = torch.cuda.get_device_capability()
+    artifact = F.build(f'sm_{cc[0]}{cc[1]}', model=model, foot_pairs=foot_pairs, set_current=False)
+    F.init(artifact=artifact)
+    report['execution_protocol'] = EXECUTION_PROTOCOL
+    report['environment'] = dict(torch=torch.__version__, cuda=torch.version.cuda,
+                                 gpu=torch.cuda.get_device_name(), mujoco=mujoco.__version__, numpy=np.__version__)
+    report['artifact'] = str(artifact)
+    report['executions'] = []
+    joint_columns = [int(model.jnt_qposadr[int(j)]) for j in model.actuator_trnid[:, 0]]
+    bad_mask = 31 | tape.FLAG_NONCONV | tape.FLAG_SINGULAR | tape.FLAG_VERIFY_DIFF
+    def forward(frame, q, v, residual, controls, initial_warm=None):
+        qt, vt = tensor(q[None]), tensor(v[None])
+        warm = torch.zeros_like(vt) if initial_warm is None else tensor(initial_warm[None])
+        friction, com = torch.ones(1, device=device), torch.zeros((1, 3), device=device)
+        saved, decoded, trace = [], [], []
+        valid = True
+        for control in range(controls):
+            target = qpos[frame+control, joint_columns]+residual
+            result = F.forward(qt, vt, warm, tensor(target[None]), friction, com,
+                               iterations=50, substeps=4, tape=True)
+            qt, vt, warm, info = result[:4]
+            saved.append(result[4])
+            decoded_record = tape.decode(result[4].cpu().numpy().reshape(1, 4, tape.rec_words(model)), model)
+            decoded.append(decoded_record)
+            valid = (all(bool(torch.isfinite(value).all()) for value in (qt, vt, warm))
+                     and not np.any(info.cpu().numpy()[:, 3]) and not np.any(decoded_record['flags'] & bad_mask))
+            trace.append(dict(control=control, qpos=qt.cpu().numpy()[0].tolist(), qvel=vt.cpu().numpy()[0].tolist(),
+                              info=info.cpu().numpy().tolist(),
+                              tape={key: decoded_record[key].tolist() for key in ('ncon', 'nefc', 'flags', 'pair', 'slot')}))
+            if not valid:
+                break
+        return dict(q=qt, v=vt, warm=warm, ctrl=tensor(residual[None]), friction=friction, com=com,
+                    tapes=saved, decoded=decoded, valid=valid and len(saved) == controls, trace=trace)
+    def physical(frame, q, v, residual, controls):
+        data = mujoco.MjData(model)
+        data.qpos[:], data.qvel[:] = q, v
+        data.qacc_warmstart[:] = 0
+        for control in range(controls):
+            data.ctrl[:] = qpos[frame+control, joint_columns]+residual
+            for _ in range(4):
+                mujoco.mj_step(model, data)
+        return np.r_[data.qpos.copy(), data.qvel.copy()]
+    rng = np.random.default_rng(20261105)
+    cq, cv = rng.normal(size=model.nq), rng.normal(size=model.nv)
+    cq /= np.linalg.norm(cq)
+    cv /= np.linalg.norm(cv)
+    directions = []
+    for block, width in (('qpos_tangent', model.nv), ('qvel', model.nv), ('ctrl', model.nu)):
+        direction = rng.normal(size=width)
+        direction /= np.linalg.norm(direction)
+        directions.append(dict(block=block, index=0, direction=direction))
+    report['execution_directions'] = [dict(d, direction=d['direction'].tolist()) for d in directions]
+    report['terminal_cotangent'] = dict(qpos=cq.tolist(), qvel=cv.tolist())
+    for frame in frames:
+        frame = int(frame)
+        for controls in EXECUTION_PROTOCOL['horizons']:
+            row = dict(frame=frame, requested_controls=controls, requested_seconds=controls*4*float(model.opt.timestep),
+                       pass_=False)
+            report['executions'].append(row)
+            if frame+controls >= len(qpos):
+                row['failure'] = 'reference support does not cover requested controls'
+                continue
+            initial = dict(q=qpos[frame].copy(), v=qvel[frame].copy(), u=np.zeros(model.nu))
+            nominal = forward(frame, initial['q'], initial['v'], initial['u'], controls)
+            row.update(executed_controls=len(nominal['tapes']), trace=nominal['trace'], strict_valid=nominal['valid'])
+            if not nominal['valid']:
+                row['failure'] = 'strict engine flags or nonfinite trajectory'
+                continue
+            actual = np.r_[nominal['q'].cpu().numpy()[0], nominal['v'].cpu().numpy()[0]]
+            reference = physical(frame, initial['q'], initial['v'], initial['u'], controls)
+            row['qpos_reference_max_error'] = float(abs(actual[:model.nq]-reference[:model.nq]).max())
+            row['qvel_reference_max_error'] = float(abs(actual[model.nq:]-reference[model.nq:]).max())
+            row['physical_reference_ok'] = (box_check.close(actual[:model.nq], reference[:model.nq], EXECUTION_PROTOCOL['qpos_atol'], 0)
+                                            and box_check.close(actual[model.nq:], reference[model.nq:], EXECUTION_PROTOCOL['qvel_atol'], 0))
+            gq, gv, gu, flags = backward_chain(F, nominal, tensor(cq[None]), tensor(cv[None]), 4)
+            gradient = np.r_[gq.cpu().numpy()[0], gv.cpu().numpy()[0], gu.cpu().numpy()[0]]
+            row['backward_flags'] = flags
+            row['backward_ok'] = bool(np.isfinite(gradient).all() and all(not (flag & (bad_mask | (3 << 12) | (15 << 16))) for flag in flags))
+            row['directions'] = []
+            for direction in directions:
+                fds = []
+                for step in EXECUTION_PROTOCOL['fd_steps']:
+                    values = []
+                    for sign in (-1, 1):
+                        q, v, u = box_check.perturb(model, initial, direction, sign*step)
+                        values.append(physical(frame, q, v, u, controls)@np.r_[cq, cv])
+                    fds.append((values[1]-values[0])/(2*step))
+                if direction['block'] == 'qpos_tangent':
+                    qp, _, _ = box_check.perturb(model, initial, direction, 1e-6)
+                    qm, _, _ = box_check.perturb(model, initial, direction, -1e-6)
+                    analytic = float(gq.cpu().numpy()[0]@((qp-qm)/(2e-6)))
+                else:
+                    gradient_block = gv if direction['block'] == 'qvel' else gu
+                    analytic = float(gradient_block.cpu().numpy()[0]@direction['direction'])
+                stable = box_check.close(np.array(fds), fds[-1], EXECUTION_PROTOCOL['fd_stability_atol'], EXECUTION_PROTOCOL['fd_stability_rtol'])
+                accurate = box_check.close(np.array(analytic), fds[-1], EXECUTION_PROTOCOL['gradient_atol'], EXECUTION_PROTOCOL['gradient_rtol'])
+                row['directions'].append(dict(block=direction['block'], analytic=analytic, mujoco_double_fd=fds,
+                                               fd_stable=stable, gradient_ok=accurate))
+            row['pass_'] = row['physical_reference_ok'] and row['backward_ok'] and all(d['fd_stable'] and d['gradient_ok'] for d in row['directions'])
+            np.savez_compressed(out/f'frame_{frame}_{controls}_controls.npz',
+                                gradients=gradient, tapes=np.stack([t.cpu().numpy() for t in nominal['tapes']]))
+        # One continuous physical state chain with an explicit termination reading.
+        if frame+EXECUTION_PROTOCOL['continuous_controls'] < len(qpos):
+            chain = []
+            state_q, state_v = qpos[frame].copy(), qvel[frame].copy()
+            state_warm = None
+            for control in range(EXECUTION_PROTOCOL['continuous_controls']):
+                result = forward(frame+control, state_q, state_v, np.zeros(model.nu), 1, state_warm)
+                state_warm = result['warm'].cpu().numpy()[0]
+                state_q, state_v = result['q'].cpu().numpy()[0], result['v'].cpu().numpy()[0]
+                target = qpos[frame+control+1]
+                gravity_z = 1-2*(state_q[4]**2+state_q[5]**2)
+                target_gravity_z = 1-2*(target[4]**2+target[5]**2)
+                terminated = bool(abs(state_q[2]-target[2]) > EXECUTION_PROTOCOL['term_height']
+                                  or abs(gravity_z-target_gravity_z) > EXECUTION_PROTOCOL['term_gravity_z'])
+                chain.append(dict(control=control, qpos=state_q.tolist(), qvel=state_v.tolist(), strict_valid=result['valid'],
+                                  terminated=terminated, root_position_error_m=float(np.linalg.norm(state_q[:3]-target[:3])),
+                                  contacts=result['trace'][0]['tape']))
+                if not result['valid'] or terminated:
+                    break
+            report.setdefault('continuous_chains', []).append(dict(frame=frame, requested_controls=EXECUTION_PROTOCOL['continuous_controls'],
+                                                                   executed_controls=len(chain), trajectory=chain))
+        else:
+            report.setdefault('continuous_chains', []).append(dict(frame=frame, requested_controls=EXECUTION_PROTOCOL['continuous_controls'],
+                                                                   executed_controls=0, trajectory=[],
+                                                                   failure='reference support does not cover chain'))
+        # Native autograd and optimizer, reached only on a valid one-control prefix.
+        update = dict(frame=frame, completed=False)
+        report.setdefault('native_updates', []).append(update)
+        if frame+1 >= len(qpos):
+            update['failure'] = 'reference support does not cover one control'
+            continue
+        prefix = forward(frame, qpos[frame], qvel[frame], np.zeros(model.nu), 1)
+        if not prefix['valid']:
+            update['failure'] = 'strict-invalid one-control prefix'
+            continue
+        parameter = torch.nn.Parameter(torch.zeros((1, model.nu), device=device))
+        optimizer = torch.optim.SGD([parameter], lr=EXECUTION_PROTOCOL['update_learning_rate'])
+        target_q, target_v = tensor(qpos[frame+1][None]), tensor(qvel[frame+1][None])
+        def loss():
+            q, v, _ = F.step(tensor(qpos[frame][None]), tensor(qvel[frame][None]),
+                             torch.zeros((1, model.nv), device=device),
+                             tensor(qpos[frame, joint_columns][None])+parameter,
+                             torch.ones(1, device=device), torch.zeros((1, 3), device=device),
+                             iterations=50, substeps=4, clamp_kv=1, normal=0)
+            scan = height_scan(terrain, q[:, :3], q[:, 3:7], scan_offsets)
+            return ((q-target_q)**2).mean()+.01*((v-target_v)**2).mean(), scan
+        F.read_diagnostics(reset=True)
+        before, scan = loss()
+        before.backward()
+        gradient = parameter.grad.detach().clone()
+        optimizer.step()
+        after, after_scan = loss()
+        diagnostics = F.read_diagnostics(reset=True)
+        strict = all(diagnostics[key] == 0 for key in ('fwd_unsupported_worlds', 'nonfinite_rows', 'replay_mismatch_worlds',
+                                                       'fwd_contact_overflow_worlds', 'fwd_row_overflow_worlds', 'nonconv_records'))
+        update.update(loss_before=float(before.detach()), loss_after=float(after.detach()),
+                      gradient_norm=float(gradient.norm()), parameter_change_norm=float(parameter.detach().norm()),
+                      scan_min_m=float(scan.min()), scan_max_m=float(scan.max()), diagnostics=diagnostics,
+                      completed=bool(strict and torch.isfinite(gradient).all() and torch.isfinite(after)
+                                     and torch.isfinite(scan).all() and torch.isfinite(after_scan).all()
+                                     and parameter.detach().norm() > 0))
+    report['continuous_chain_strict_valid'] = all(
+        'failure' not in chain and all(step['strict_valid'] for step in chain['trajectory'])
+        for chain in report.get('continuous_chains', []))
+    report['continuous_chain_task_completion'] = [dict(frame=chain['frame'], complete=
+        chain['executed_controls'] == chain['requested_controls']
+        and not any(step['terminated'] for step in chain['trajectory']))
+        for chain in report.get('continuous_chains', [])]
+    report['execution_pass'] = (report['continuous_chain_strict_valid']
+                                and all(ray['pass_'] for ray in report['sensor_rays'])
+                                and all(row['pass_'] for row in report['executions'])
+                                and all(update['completed'] for update in report['native_updates']))
 
 
 def main():
@@ -231,19 +477,26 @@ def main():
     parser.add_argument('--code-revision')
     parser.add_argument('--out', type=Path)
     parser.add_argument('--self-test', action='store_true')
+    parser.add_argument('--execute', action='store_true', help='run GPU whole-step, chain and native optimizer on provisioned compute')
+    parser.add_argument('--sensor', type=Path)
     args = parser.parse_args()
     if args.self_test:
         print(json.dumps(self_test()))
         return 0
     if any(getattr(args, key) is None for key in ('scene', 'reference', 'code_revision', 'out')):
         parser.error('--scene, --reference, --code-revision and --out are required')
+    if args.execute and (args.sensor is None or args.frames == 'all'):
+        parser.error('--execute requires --sensor and explicit comma-separated --frames')
     out = args.out.resolve()
     if out.is_relative_to(ROOT):
         parser.error('--out must be outside checkout')
     out.mkdir(parents=True, exist_ok=False)
     report = dict(protocol=PROTOCOL, code_revision=args.code_revision, completed=False)
     try:
-        screen(args, report, out)
+        context = screen(args, report, out)
+        if args.execute:
+            execute(args, context, report, out)
+            return 0 if report['execution_pass'] else 1
         return 0
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
