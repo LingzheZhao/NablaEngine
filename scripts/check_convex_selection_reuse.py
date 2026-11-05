@@ -32,8 +32,7 @@ inline float __fmul_rn(float a,float b){return a*b;}
 '''+ '\n'.join(declarations)+source
     prepare = '''static_convex::PreparedContact prepared;
 int prepared_status=static_convex_prepare(0,x,x+3,x[6],x[7],x+8,x+11,prepared);'''
-    contact = ('static_convex_contact_selected(prepared,slot,x[6],x+8,x+11,y+13*slot,y+13*slot+1,y+13*slot+4)'
-               if reuse else 'static_convex_contact(0,slot,x,x+3,x[6],x[7],x+8,x+11,y+13*slot,y+13*slot+1,y+13*slot+4)')
+    contact = 'static_convex_contact(0,slot,x,x+3,x[6],x[7],x+8,x+11,y+13*slot,y+13*slot+1,y+13*slot+4)'
     vjp = ('static_convex_vjp_selected(prepared,slot,x,x+3,x[6],x[7],x+8,x+11,cot,gradient)'
            if reuse else 'static_convex_vjp(0,slot,x,x+3,x[6],x[7],x+8,x+11,cot,gradient)')
     wrapper = '''
@@ -135,7 +134,7 @@ def math_check(args):
             evaluate(query.ctypes.data, value.ctypes.data, jac.ctypes.data, status.ctypes.data)
             values.append(value); gradients.append(jac); statuses.append(status)
         row = dict(case=case['name'], comparisons={})
-        for index, name in [(1, 'shared_slots'), (2, 'adjoint_primal_vjp')]:
+        for index, name in [(1, 'standalone_forward_selected_vjp'), (2, 'adjoint_primal_vjp')]:
             row['comparisons'][name] = dict(status=bit_comparison(statuses[0], statuses[index]),
                 values=bit_comparison(values[0], values[index]),
                 jacobians=bit_comparison(gradients[0], gradients[index]))

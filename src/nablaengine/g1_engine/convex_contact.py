@@ -658,27 +658,55 @@ __device__ int static_convex_contact(int geom, int slot, const float* center, co
                                       float radius, float half_length, const float* hull_position,
                                       const float* hull_quaternion, float* distance, float* position,
                                       float* frame) {
-  if (slot < 0 || slot > 1) return static_convex::InvalidSlot;
-  static_convex::PreparedContact prepared;
-  int status = static_convex_prepare(geom, center, axis, radius, half_length,
-                                     hull_position, hull_quaternion, prepared);
-  if (status != static_convex::Valid) return status;
-  return static_convex_contact_selected(prepared, slot, radius, hull_position, hull_quaternion,
-                                        distance, position, frame);
+  using namespace static_convex;
+  if (slot < 0 || slot > 1) return InvalidSlot;
+  int hull = c_ghull[geom];
+  if (hull < 0) return InvalidGeometry;
+  Vector<0> start, delta;
+  local_inputs(hull, center, axis, half_length, hull_position, hull_quaternion, start, delta);
+  Selection selected;
+  int status = select(hull, start, delta, selected);
+  if (status != Valid) return status;
+  select_face_manifold(hull, start, delta, radius, selected);
+  Feature feature;
+  status = select_slot(selected, slot, feature);
+  if (status != Valid) return status;
+  Scalar<0> output[13];
+  outputs(hull, feature, start, delta, radius, hull_position, hull_quaternion,
+          selected, slot, output);
+  *distance = output[0].value;
+  for (int i = 0; i < 3; ++i) position[i] = output[1+i].value;
+  for (int i = 0; i < 9; ++i) frame[i] = output[4+i].value;
+  return Valid;
 }
 __device__ int static_convex_vjp(int geom, int slot, const float* center, const float* axis,
                                   float radius, float half_length, const float* hull_position,
                                   const float* hull_quaternion, const float* cotangent, float* gradient) {
+  using namespace static_convex;
   for (int i = 0; i < 6; ++i) gradient[i] = 0.f;
-  if (slot < 0 || slot > 1) return static_convex::InvalidSlot;
-  static_convex::PreparedContact prepared;
-  int status = static_convex_prepare(geom, center, axis, radius, half_length,
-                                     hull_position, hull_quaternion, prepared);
-  if (status != static_convex::Valid) return status;
-  return static_convex_vjp_selected(prepared, slot, center, axis, radius, half_length,
-                                    hull_position, hull_quaternion, cotangent, gradient);
+  if (slot < 0 || slot > 1) return InvalidSlot;
+  int hull = c_ghull[geom];
+  if (hull < 0) return InvalidGeometry;
+  Vector<0> start, delta;
+  local_inputs(hull, center, axis, half_length, hull_position, hull_quaternion, start, delta);
+  Selection selected;
+  int status = select(hull, start, delta, selected);
+  if (status != Valid) return status;
+  select_face_manifold(hull, start, delta, radius, selected);
+  Feature feature;
+  status = select_slot(selected, slot, feature);
+  if (status != Valid) return status;
+  Vector<6> differentiable_start, differentiable_delta;
+  local_inputs(hull, center, axis, half_length, hull_position, hull_quaternion,
+               differentiable_start, differentiable_delta);
+  Scalar<6> output[13];
+  outputs(hull, feature, differentiable_start, differentiable_delta, radius,
+          hull_position, hull_quaternion,
+          selected, slot, output);
+  for (int i = 0; i < 6; ++i)
+    for (int k = 0; k < 13; ++k) gradient[i] += cotangent[k]*output[k].derivative[i];
+  return Valid;
 }
-
 '''
 
 
