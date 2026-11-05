@@ -168,8 +168,7 @@ def solimp_powers(m):
 
 def header(m):
     """#defines of the adjoint (stage, options, debug layout, the model's solimp power); asserts the mjlab-only scope."""
-    assert not any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX for g in step.collision_geoms(m)), \
-        "the adjoint is for the mjlab model: no box geoms"
+    adjoint_contact.check_model(m)
     assert not (m.dof_frictionloss > 0).any(), "the adjoint is for the mjlab model: no frictionloss rows"
     assert m.nu == m.nv - 6, "one position actuator per hinge dof"
     lay, nw = debug_layout(m)
@@ -206,7 +205,7 @@ static_assert(DK_ADJ_CLAMP_KV >= 0 && DK_ADJ_CLAMP_KV <= 2, "DK_ADJ_CLAMP_KV: 0,
 #define ADJ_SOFT_PARAM
 #define ADJ_SOFT_ARG(x)
 #endif
-static_assert(HAS_BOX == 0 && NFLOSS == 0, "the adjoint is for the mjlab model (no boxes, no frictionloss rows)");
+static_assert(NFLOSS == 0, "the adjoint has no frictionloss rows");
 static_assert(DK_ADJ_STAGE >= 1 && DK_ADJ_STAGE <= 3, "DK_ADJ_STAGE: 1, 2 or 3");
 static_assert(NB <= 31, "the contact reduction: lanes 0 and 31 take two of the root rotation dofs");
 #define CS_N 24  // per-contact words (A6, in registers of the contact's lane): W_v, W_a, W_lam (0-8), contact point
