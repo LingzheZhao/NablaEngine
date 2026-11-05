@@ -605,4 +605,9 @@ __device__ bool static_box_capsule_vjp(int slot,const float*cp,const float*axis,
  return true;
 }
 '''
-    return prelude + frame + code + wrapper
+    generated = prelude + frame + code + wrapper
+    # Keep overloads out of the engine namespace: CUDA's global float overloads
+    # must remain visible to every existing solver function.
+    generated = 'namespace box_ad {\n' + generated + '\n}\n'
+    generated += 'using box_ad::static_box_capsule_vjp;\nusing box_ad::static_box_sphere_vjp;\n'
+    return generated
