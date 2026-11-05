@@ -290,7 +290,11 @@ __device__ void consider_penetration_facet(int hull, int face, int edge_index, b
   Scalar<0> depth;
   penetration_geometry(hull, facet, start, delta, reconstructed_normal, depth);
   if (!isfinite(depth.value)) return;
-  if (!found || depth.value < minimum_depth) {
+  // Original hull faces take priority when a side plane is the same facet
+  // within arithmetic resolution. A coplanar triangle diagonal crossed with
+  // an exactly parallel axis must not introduce a spurious normal derivative.
+  float comparison_margin = side ? support_tolerance : 0.f;
+  if (!found || depth.value < __fsub_rn(minimum_depth, comparison_margin)) {
     found = true;
     minimum_depth = depth.value;
     selected = facet;
@@ -304,6 +308,9 @@ __device__ int select_penetration(int hull, const Vector<0>& start,
     int face = c_hull_faceadr[hull]+i;
     consider_penetration_facet(hull, face, 0, false, start, delta,
                                found, depth, selection.penetration_facet);
+  }
+  for (int i = 0; i < c_hull_facenum[hull]; ++i) {
+    int face = c_hull_faceadr[hull]+i;
     for (int edge = 0; edge < 3; ++edge)
       consider_penetration_facet(hull, face, edge, true, start, delta,
                                  found, depth, selection.penetration_facet);

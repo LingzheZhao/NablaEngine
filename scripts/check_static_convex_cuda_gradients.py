@@ -38,6 +38,7 @@ PROTOCOL = {
     'manifold_gradient_gate': 'both endpoint slots gated on full 13 by 6 FD inside the near-tie band',
     'inside': 'minimum support facet of hull plus segment, signed distance, continuously reconstructed witnesses',
     'side_facet_support_tolerance': '8*float32_epsilon*max(1,max_abs_local_vertex)',
+    'facet_depth_ties': 'original faces first, side facet must improve depth by 8*float32_epsilon*max(1,max_abs_local_vertex)',
     'near_zero': 'centerline separation at most 2e-5m uses supporting facet signed distance and normal',
     'unsupported': 'invalid geometry or failed witness reconstruction returns negative status, host must stop batch',
     'nonsmooth_gate': 'medial-axis cases require independent distance and finite outputs/AD; forward/FD differences recorded',
