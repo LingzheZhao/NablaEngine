@@ -86,18 +86,26 @@ class DepthGeometry:
     """Model-owned visible geometry packed once on the observation device."""
     geoms: tuple[VisibleGeom, ...]
     body_count: int
+    cuda_backend: object = None
 
     @classmethod
-    def from_model(cls, model, *, device, dtype=torch.float32, groups=(0, 2)):
+    def from_model(cls, model, *, device, dtype=torch.float32, groups=(0, 2), backend=None):
         import mujoco
 
         selected = set(groups)
+        backend = ('cuda' if torch.device(device).type == 'cuda' else 'torch') if backend is None else backend
+        if backend not in ('cuda', 'torch'):
+            raise ValueError('Depth backend must be cuda or torch')
+        if backend == 'cuda' and (torch.device(device).type != 'cuda' or dtype != torch.float32):
+            raise ValueError('Native CUDA depth requires a CUDA device and float32')
+        packing_device = 'cpu' if backend == 'cuda' else device
+        meshes = {}
         supported = {int(mujoco.mjtGeom.mjGEOM_SPHERE), int(mujoco.mjtGeom.mjGEOM_CAPSULE),
                      int(mujoco.mjtGeom.mjGEOM_MESH), int(mujoco.mjtGeom.mjGEOM_BOX),
                      int(mujoco.mjtGeom.mjGEOM_PLANE)}
         geoms = []
         def tensor(value):
-            return torch.tensor(np.array(value, copy=True), device=device, dtype=dtype)
+            return torch.tensor(np.array(value, copy=True), device=packing_device, dtype=dtype)
         for geom in range(model.ngeom):
             if int(model.geom_group[geom]) not in selected or model.geom_rgba[geom, 3] == 0:
                 continue
@@ -111,11 +119,18 @@ class DepthGeometry:
                 fa, fn = int(model.mesh_faceadr[mesh]), int(model.mesh_facenum[mesh])
                 vertices = np.asarray(model.mesh_vert[va:va+vn])
                 faces = np.asarray(model.mesh_face[fa:fa+fn])
-                triangles = tensor(vertices[faces])
+                if mesh not in meshes:
+                    meshes[mesh] = tensor(vertices[faces])
+                triangles = meshes[mesh]
             geoms.append(VisibleGeom(geom, int(model.geom_bodyid[geom]), kind,
                                      tensor(model.geom_pos[geom]), tensor(model.geom_quat[geom]),
                                      tensor(model.geom_size[geom]), triangles))
-        return cls(tuple(geoms), int(model.nbody))
+        if backend == 'cuda':
+            from .depth_cuda import CudaDepthGeometry
+            native = CudaDepthGeometry(geoms, int(model.nbody), device)
+        else:
+            native = None
+        return cls(tuple(geoms), int(model.nbody), native)
 
     @torch.no_grad()
     def raycast(self, body_positions, body_quaternions, ray_origins, ray_directions,
@@ -132,6 +147,10 @@ class DepthGeometry:
                 or ray_origins.shape != ray_directions.shape or ray_origins.ndim != 3
                 or ray_origins.shape[-1] != 3 or ray_origins.shape[0] != body_positions.shape[0]):
             raise ValueError('Body poses and rays require matching batch and model dimensions')
+        if self.cuda_backend is not None:
+            return self.cuda_backend.raycast(body_positions, body_quaternions, ray_origins, ray_directions,
+                max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+                surface_epsilon=surface_epsilon)
         ranges, geom_ids = [], []
         for first in range(0, ray_origins.shape[1], ray_chunk):
             origin = ray_origins[:, first:first+ray_chunk]

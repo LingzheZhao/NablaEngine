@@ -30,18 +30,26 @@ def main():
     parser.add_argument('--frames', type=int, nargs='+', default=[0, 190, 235, 320])
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--benchmark-batch', type=int, default=128)
+    parser.add_argument('--warmup', type=int, default=3)
+    parser.add_argument('--repeats', type=int, default=5)
+    parser.add_argument('--torch-reference-rays', type=int, default=32)
     parser.add_argument('--code-revision', required=True)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out/'protocol.json').write_text(json.dumps(dict(PROTOCOL, code_revision=args.code_revision,
-        model=str(args.model), states=str(args.states), frames=args.frames, device=args.device), indent=2)+'\n')
+        model=str(args.model), states=str(args.states), frames=args.frames, device=args.device,
+        benchmark_batch=args.benchmark_batch, warmup=args.warmup, repeats=args.repeats), indent=2)+'\n')
     import mujoco
     import torch
     from nablaengine.depth_geometry import DepthGeometry, _rotate
 
     model = mujoco.MjModel.from_binary_path(str(args.model))
     data = mujoco.MjData(model)
+    import time
+    construction_start = time.perf_counter()
     geometry = DepthGeometry.from_model(model, device=args.device)
+    construction_seconds = time.perf_counter()-construction_start
     states = np.load(args.states, allow_pickle=False)
     frame_ids = states['frames'] if 'frames' in states else np.arange(len(states['qpos']))
     positions, quaternions = [], []
@@ -81,6 +89,35 @@ def main():
         torch.cuda.synchronize()
     seconds = time.perf_counter()-begin
     actual, actual_ids = ranges.cpu().numpy(), ids.cpu().numpy()
+    # Warmup and steady-state measurements use the same geometry owner and the
+    # full raw camera. Construction and CUDA compilation are recorded separately.
+    selected = torch.arange(args.benchmark_batch, device=args.device) % len(q)
+    benchmark_inputs = [value[selected].contiguous() for value in
+                        (body_positions, body_quaternions, origins, directions)]
+    def synchronize():
+        if args.device.startswith('cuda'):
+            torch.cuda.synchronize()
+    for _ in range(args.warmup):
+        geometry.raycast(*benchmark_inputs)
+    synchronize()
+    durations = []
+    for _ in range(args.repeats):
+        begin = time.perf_counter()
+        geometry.raycast(*benchmark_inputs)
+        synchronize()
+        durations.append(time.perf_counter()-begin)
+    torch_comparison = None
+    if args.torch_reference_rays:
+        verification = DepthGeometry.from_model(model, device=args.device, backend='torch')
+        subset = torch.linspace(0, len(local)-1, args.torch_reference_rays, device=args.device).long()
+        reference_ranges, reference_ids = verification.raycast(body_positions, body_quaternions,
+                                                               origins[:, subset], directions[:, subset])
+        errors = (ranges[:, subset]-reference_ranges).abs()
+        hit = (ids[:, subset] >= 0) & (reference_ids >= 0)
+        torch_comparison = dict(rays_per_frame=len(subset),
+            hit_mismatches=int(((ids[:, subset] >= 0) != (reference_ids >= 0)).sum()),
+            max_range_error_m=float(errors[hit].max()) if bool(hit.any()) else 0.,
+            geom_id_mismatches=int((ids[:, subset] != reference_ids).sum()))
     origins, directions = origins.cpu().numpy().astype(float), directions.cpu().numpy().astype(float)
     # Float32 quaternion rotation introduces tiny norm drift. Match the unit
     # direction contract for both backends before comparing metric ray ranges.
@@ -119,16 +156,29 @@ def main():
         self_hits = reference_ids[index] >= 0
         self_hits[self_hits] = model.geom_bodyid[reference_ids[index, self_hits]] != 0
         rows.append(dict(frame=frame, raw_pixels=1296, hits=int(both_hit.sum()),
-                         self_occlusion_pixels=int(self_hits.sum()), hit_mismatches=int(hit_mismatch.sum()),
+                         self_occlusion_pixels=int(self_hits.sum()),
+                         terrain_pixels=int(np.sum((reference_ids[index] >= 0) & ~self_hits)),
+                         miss_pixels=int(np.sum(reference_ids[index] < 0)), hit_mismatches=int(hit_mismatch.sum()),
                          geom_id_mismatches=int(np.sum(actual_ids[index] != reference_ids[index])),
                          max_range_error_m=float(error[both_hit].max(initial=0)),
                          max_clipped_optical_depth_error_m=float(depth_error.max()),
                          passed=bool(not hit_mismatch.any() and error[both_hit].max(initial=0) <= PROTOCOL['range_atol_m']
                                      and depth_error.max() <= PROTOCOL['optical_depth_atol_m'])))
     result = dict(passed=all(row['passed'] for row in rows), frames=rows,
+                  construction_seconds=construction_seconds,
+                  backend='cuda_bvh' if geometry.cuda_backend is not None else 'torch',
+                  benchmark=dict(batch=args.benchmark_batch, raw_shape=[27, 48], warmup=args.warmup,
+                      repeats=args.repeats, seconds=durations, median_seconds=float(np.median(durations)),
+                      frames_per_second=float(args.benchmark_batch/np.median(durations))),
+                  torch_reference=torch_comparison,
                   render_seconds=seconds, rendered_frames=len(args.frames),
                   torch=torch.__version__, mujoco=mujoco.__version__,
                   visible_geoms=len(geometry.geoms), code_revision=args.code_revision)
+    result['terrain_coverage'] = any(row['terrain_pixels'] > 0 for row in rows)
+    result['self_occlusion_coverage'] = any(row['self_occlusion_pixels'] > 0 for row in rows)
+    result['passed'] = result['passed'] and result['terrain_coverage'] and result['self_occlusion_coverage']
+    if torch_comparison is not None:
+        result['passed'] = result['passed'] and torch_comparison['hit_mismatches'] == 0 and torch_comparison['max_range_error_m'] <= PROTOCOL['range_atol_m']
     (args.out/'report.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result, indent=2), flush=True)
     raise SystemExit(0 if result['passed'] else 1)
