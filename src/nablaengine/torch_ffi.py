@@ -600,7 +600,7 @@ def _kinematics_backward_impl(qpos, qvel, com, g_qpos_n, g_xpos, g_xquat, g_cvel
 
 _OPS = {}
 _IMPL = dict(forward=lambda *a: _forward_impl(*a),
-             forward_measurements=lambda *a: _forward_impl(*a, measurements=True), backward=lambda *a: _backward_impl(*a),
+             forward_measurements=lambda *a: _forward_impl(*a, True), backward=lambda *a: _backward_impl(*a),
              kinematics=lambda *a: _kinematics_impl(*a), kinematics_backward=lambda *a: _kinematics_backward_impl(*a))
 
 
