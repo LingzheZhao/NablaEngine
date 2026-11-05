@@ -50,7 +50,7 @@ GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSU
 FORWARD_TYPES = {0, 1, 2, 3, 4}  # step.GEOM_TYPE: plane, sphere, capsule, box
 ADJOINT_TYPES = {0, 1, 2}  # adjoint_contact.check_model: no boxes
 DISPATCHED = {(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2), (1, 3), (2, 3), (3, 3), (1, 4), (2, 4)}  # step.py collide_pair's combinations
-CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (1, 3): 1, (2, 3): 2, (3, 3): 8, (1, 4): 1, (2, 4): 1}
+CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (1, 3): 1, (2, 3): 2, (3, 3): 8, (1, 4): 1, (2, 4): 2}
 D, E = mujoco.mjtDisableBit, mujoco.mjtEnableBit
 # disable flags that cannot change the engine's results: sensors (the engine computes none), Euler damping (Euler is
 # rejected), auto reset, midphase / island bookkeeping of MuJoCo's own collision and solver paths, the parent filter

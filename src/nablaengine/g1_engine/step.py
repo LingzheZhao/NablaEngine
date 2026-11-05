@@ -1186,9 +1186,11 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
   if ((t1 == 1 || t1 == 2) && t2 == 4) {
     float axis[3]={0.f,0.f,1.f}; if(t1==2)zaxis_rn(q1,axis);
     float dist,pos[3],fr[9];
-    int status=static_convex_contact(g2,0,p1,axis,sz1[0],t1==2?sz1[1]:0.f,p2,q2,&dist,pos,fr);
-    if(status<0){atomicOr(&s.unsupported,1);return;}
-    if(status==1 && dist<0.f)add_contact(s,pair,0,dist,pos,fr);
+    for(int slot=0;slot<2;++slot){
+      int status=static_convex_contact(g2,slot,p1,axis,sz1[0],t1==2?sz1[1]:0.f,p2,q2,&dist,pos,fr);
+      if(status<0){atomicOr(&s.unsupported,1);return;}
+      if(status==1 && dist<0.f)add_contact(s,pair,slot,dist,pos,fr);
+    }
     return;
   }
 #endif
