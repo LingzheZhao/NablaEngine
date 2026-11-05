@@ -29,6 +29,15 @@ def capsule_contact(center, axis, half_length, radius, vertices, faces, *, toler
     """
     import math
     import torch
+    tensors=(center,axis,vertices,faces)
+    if not all(isinstance(value,torch.Tensor) for value in tensors):
+        raise ValueError('geometry inputs must be Torch tensors')
+    if center.dtype not in (torch.float32,torch.float64):
+        raise ValueError('geometry requires float32 or float64')
+    if axis.dtype != center.dtype or vertices.dtype != center.dtype:
+        raise ValueError('center, axis and vertices must share dtype')
+    if any(value.device != center.device for value in tensors):
+        raise ValueError('all geometry tensors must share device')
     if center.shape != (3,) or axis.shape != (3,) or vertices.ndim != 2 or vertices.shape[1] != 3:
         raise ValueError('expected center/axis[3] and vertices[V,3]')
     if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 4:
