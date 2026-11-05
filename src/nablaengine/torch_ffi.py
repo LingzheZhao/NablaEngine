@@ -20,7 +20,7 @@ is bitwise the first one.
 
 The library: the engine's CUDA source for the model (jax_ffi.build_plan's units without the XLA FFI unit, plus
 dk_torch.cu's diagnostic counters), compiled by build() for one architecture into an artifact in the cache directory
-(libdk_g1_torch_<arch>_<key>.so with the CUDA runtime linked statically, the packed constants .npy, the model facts
+(libdk_g1_torch_v<artifact_version>_<arch>_<key>.so with the CUDA runtime linked statically, the packed constants .npy, the model facts
 .json): `python -m nablaengine.torch_ffi build [--arch sm_XY ...]` where mujoco 3.17 and nvcc are installed. init()
 loads the artifact for the GPU's architecture (or $DK_TORCH_ARTIFACT) with ctypes: a process that only loads it needs
 torch, NumPy and the NVIDIA driver, and imports no JAX, no mujoco and no nvcc. The artifact records a hash of the
@@ -64,7 +64,7 @@ VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint b
 MEASUREMENT_FIELDS = ("terrain_wrench", "terrain_contact_count", "actuator_torque", "substep_info",
                       "all_contact_wrench", "all_contact_count")
 FWD_UNIT = "dk_fwd"
-ARTIFACT_VERSION = 4
+ARTIFACT_VERSION = 5
 TAPE_ENCODING = dict(contact_bits=32, pair_bits=16, slot_capacity=8, header_bits=[8, 10, 6, 8], format_marker=0x4E540410)
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
 SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
@@ -197,7 +197,7 @@ def sources_sha256():
 
 def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
     """Generate and compile the library for the model and architecture arch (sm_XY) and write its artifact into the
-    cache directory: the library libdk_g1_torch_<arch>_<key>.so (the CUDA runtime linked statically), the packed model
+    cache directory: the library libdk_g1_torch_v<artifact_version>_<arch>_<key>.so (the CUDA runtime linked statically), the packed model
     constants (.npy) and the model facts (.json); returns the .json's path. Needs mujoco 3.17 and nvcc (CUDA 12.x), no
     torch and no JAX; cached (the same sources reuse the library). set_current: make it the architecture's artifact
     that init() loads by default (torch_<arch>_current.json); False for another model's, loaded by its path."""
@@ -217,7 +217,7 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
         if adj:
             unit_arch["dk_torch.cu"] = adj
     consts = np.ascontiguousarray(plan["consts"], np.float32)
-    path, built, key = jax_ffi._build(units, defines, arch, None, consts, unit_arch or None, prefix="libdk_g1_torch")
+    path, built, key = jax_ffi._build(units, defines, arch, None, consts, unit_arch or None, prefix=f"libdk_g1_torch_v{ARTIFACT_VERSION}")
     try:  # the kinematics outputs' assumptions (kinematics.check_model); the kinematics entries raise without them
         g1_kin.check_model(m)
         kin_error = None
