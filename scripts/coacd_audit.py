@@ -14,6 +14,7 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--upstream-revision", required=True)
     p.add_argument("--prepare-only", action="store_true")
+    p.add_argument("--wrapper-smoke", action="store_true")
     a = p.parse_args()
     out = pathlib.Path(a.output)
     out.mkdir(parents=True, exist_ok=False)
@@ -47,8 +48,20 @@ def main():
     base = pathlib.Path(a.upstream) / "src/instinct_mj/terrains/trimesh"
     tree = ast.parse((base / "mesh_terrains.py").read_text())
     ns = dict(np=np, trimesh=trimesh, coacd=coacd, os=os)
+    # Preserve every literal module assignment, including annotated globals.
+    # Do not execute imports, cache registration, or hash/cache functions.
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    ns[target.id] = value
     funcs = [x for x in tree.body if isinstance(x, ast.FunctionDef)]
-    utils_tree = ast.parse((base / 'utils.py').read_text())
+    utils_tree = ast.parse((base / "utils.py").read_text())
     funcs = [x for x in utils_tree.body if isinstance(x, ast.FunctionDef)] + funcs
     exec(
         compile(
@@ -105,6 +118,25 @@ def main():
         )
         write_status()
         return
+    if a.wrapper_smoke:
+
+        def fake_run_coacd(input_mesh, **kwargs):
+            status["spy_kwargs"] = kwargs
+            return [
+                (
+                    np.array(
+                        [[15, 8, 0], [16, 8, 0], [15, 9, 0], [15, 8, 1]], dtype=float
+                    ),
+                    np.array(
+                        [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int32
+                    ),
+                )
+            ]
+
+        ns["coacd"] = types.SimpleNamespace(
+            Mesh=coacd.Mesh, set_log_level=coacd.set_log_level, run_coacd=fake_run_coacd
+        )
+        status["synthetic_hulls_only"] = True
     parts = ns["_run_coacd_decomposition"](mesh, kw, "terrain0", "off")
     z = ns["_compute_coacd_auto_align_z"](c, mesh, parts)
     report = dict(
