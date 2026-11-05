@@ -323,6 +323,9 @@ def execute(args, context, report, out):
         valid = True
         for control in range(controls):
             target = qpos[frame+control, joint_columns]+residual
+            input_packet = dict(qpos=qt.cpu().numpy()[0].tolist(), qvel=vt.cpu().numpy()[0].tolist(),
+                                warm=warm.cpu().numpy()[0].tolist(), ctrl=target.tolist(),
+                                friction=friction.cpu().numpy().tolist(), com=com.cpu().numpy().tolist())
             result = F.forward(qt, vt, warm, tensor(target[None]), friction, com,
                                iterations=50, substeps=4, tape=True)
             qt, vt, warm, info = result[:4]
@@ -331,7 +334,7 @@ def execute(args, context, report, out):
             decoded.append(decoded_record)
             valid = (all(bool(torch.isfinite(value).all()) for value in (qt, vt, warm))
                      and not np.any(info.cpu().numpy()[:, 3]) and not np.any(decoded_record['flags'] & bad_mask))
-            trace.append(dict(control=control, qpos=qt.cpu().numpy()[0].tolist(), qvel=vt.cpu().numpy()[0].tolist(),
+            trace.append(dict(control=control, inputs=input_packet, qpos=qt.cpu().numpy()[0].tolist(), qvel=vt.cpu().numpy()[0].tolist(),
                               info=info.cpu().numpy().tolist(),
                               tape={key: decoded_record[key].tolist() for key in ('ncon', 'nefc', 'flags', 'pair', 'slot')}))
             if not valid:
@@ -370,6 +373,12 @@ def execute(args, context, report, out):
             initial = dict(q=qpos[frame].copy(), v=qvel[frame].copy(), u=np.zeros(model.nu))
             nominal = forward(frame, initial['q'], initial['v'], initial['u'], controls)
             row.update(executed_controls=len(nominal['tapes']), trace=nominal['trace'], strict_valid=nominal['valid'])
+            trajectory_path = out/f'frame_{frame}_{controls}_controls.npz'
+            np.savez_compressed(trajectory_path, input_qpos=initial['q'], input_qvel=initial['v'],
+                                input_residual=initial['u'], qpos=nominal['q'].cpu().numpy(),
+                                qvel=nominal['v'].cpu().numpy(),
+                                tapes=np.stack([t.cpu().numpy() for t in nominal['tapes']]))
+            row['trajectory_evidence'] = str(trajectory_path)
             if not nominal['valid']:
                 row['failure'] = 'strict engine flags or nonfinite trajectory'
                 continue
@@ -404,16 +413,19 @@ def execute(args, context, report, out):
                 row['directions'].append(dict(block=direction['block'], analytic=analytic, mujoco_double_fd=fds,
                                                fd_stable=stable, gradient_ok=accurate))
             row['pass_'] = row['physical_reference_ok'] and row['backward_ok'] and all(d['fd_stable'] and d['gradient_ok'] for d in row['directions'])
-            np.savez_compressed(out/f'frame_{frame}_{controls}_controls.npz',
-                                gradients=gradient, tapes=np.stack([t.cpu().numpy() for t in nominal['tapes']]))
+            gradient_path = out/f'frame_{frame}_{controls}_gradients.npz'
+            np.savez_compressed(gradient_path, gradients=gradient)
+            row['gradient_evidence'] = str(gradient_path)
         # One continuous physical state chain with an explicit termination reading.
         if frame+EXECUTION_PROTOCOL['continuous_controls'] < len(qpos):
             chain = []
+            chain_tapes = []
             state_q, state_v = qpos[frame].copy(), qvel[frame].copy()
             state_warm = None
             for control in range(EXECUTION_PROTOCOL['continuous_controls']):
                 result = forward(frame+control, state_q, state_v, np.zeros(model.nu), 1, state_warm)
                 state_warm = result['warm'].cpu().numpy()[0]
+                chain_tapes.append(result['tapes'][0].cpu().numpy())
                 state_q, state_v = result['q'].cpu().numpy()[0], result['v'].cpu().numpy()[0]
                 target = qpos[frame+control+1]
                 gravity_z = 1-2*(state_q[4]**2+state_q[5]**2)
@@ -425,8 +437,11 @@ def execute(args, context, report, out):
                                   contacts=result['trace'][0]['tape']))
                 if not result['valid'] or terminated:
                     break
+            chain_path = out/f'frame_{frame}_continuous_chain.npz'
+            np.savez_compressed(chain_path, tapes=np.stack(chain_tapes))
             report.setdefault('continuous_chains', []).append(dict(frame=frame, requested_controls=EXECUTION_PROTOCOL['continuous_controls'],
-                                                                   executed_controls=len(chain), trajectory=chain))
+                                                                   executed_controls=len(chain), trajectory=chain,
+                                                                   tape_evidence=str(chain_path)))
         else:
             report.setdefault('continuous_chains', []).append(dict(frame=frame, requested_controls=EXECUTION_PROTOCOL['continuous_controls'],
                                                                    executed_controls=0, trajectory=[],
