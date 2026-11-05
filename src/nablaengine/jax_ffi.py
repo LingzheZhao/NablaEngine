@@ -822,11 +822,14 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
     built with other architecture flags: cuda.arch_flags('forward')), every adjoint variant's unit without them. target:
     the build target (default cuda.arch()), whose forward-unit -D options (cuda.unit_defines: the register caps on
     sm_90) the unit with the forward kernels gets."""
-    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs)
+    from nablaengine.model.convex import pack_static_convex_hulls
+    selected_geoms=g1_step.collision_geoms(m)
+    convex_hulls=pack_static_convex_hulls(m,selected_geoms) if any(m.geom_type[g]==mujoco.mjtGeom.mjGEOM_MESH for g in selected_geoms) else None
+    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs, convex_hulls)
     load = host.loader(lays, sizes)
     load = re.sub(r"cudaMemcpyToSymbol\(([^;]*)\);", r"cudaMemcpyToSymbolAsync(\1, 0, cudaMemcpyHostToDevice, st);", load)
     assert "cudaMemcpyToSymbol(" not in load
-    engine = adjoint.cuda_source(m)
+    engine = adjoint.cuda_source(m, convex_hulls=convex_hulls)
     assert engine.count("#include <cuda_runtime.h>\n") == 1 and engine.count("#include") == 1, \
         "the engine source may only include cuda_runtime.h (it is wrapped in a namespace)"
     engine = engine.replace("#include <cuda_runtime.h>\n", "")

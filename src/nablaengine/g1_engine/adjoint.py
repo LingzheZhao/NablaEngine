@@ -85,7 +85,7 @@ functions) and the contact VJPs (adjoint_contact.source); the caller adds its __
 import mujoco
 import numpy as np
 
-from nablaengine.g1_engine import adjoint_contact, source, step, tape
+from nablaengine.g1_engine import convex_contact, adjoint_contact, source, step, tape
 
 ADJ_ROWS_SKIPPED = 1 << 12  # info: a record has contacts or constraint rows that this build does not differentiate
 ADJ_REPLAY_MISMATCH = 1 << 13  # info: a replayed contact is not penetrating, or the replayed limit rows differ in number
@@ -1475,24 +1475,26 @@ static inline size_t adj_launch_smem(int worlds_per_sm = -1, cudaError_t* err = 
 """
 
 
-def cuda_source(m, max_contacts=None):
+def cuda_source(m, max_contacts=None, convex_hulls=None):
     """The device code of the forward and the adjoint as one compilation unit, with k_adjoint's launch helpers
     (adj_launch_smem; no __global__ forward kernel, no host main)."""
     maxd = source.constants(m)[1]
-    return (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m, max_contacts)
-            + tape.header(m, max_contacts) + header(m) + source.DEVICE + step.STEP_DEVICE + step.STEP_KERNEL
+    return (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m, max_contacts, convex_hulls)
+            + tape.header(m, max_contacts) + header(m) + source.DEVICE
+            + ("" if convex_hulls is None else convex_contact.device_source())
+            + step.STEP_DEVICE + step.STEP_KERNEL
             + adjoint_contact.source(m) + ADJ_DEVICE + ADJ_KERNEL)
 
 
-def engine_constants(m, foot_pairs):
+def engine_constants(m, foot_pairs, convex_hulls=None):
     """(constants as one float32 array, [(symbol, kind, count, width)] in packing order, sizes) for the host loader
     (scripts/engine_step_check.py loader()), as engine_step_check packs them."""
     c1, _ = source.constants(m)
-    c2 = step.pair_constants(m, foot_pairs)
+    c2 = step.pair_constants(m, foot_pairs, convex_hulls)
     dofbody, mask = step.extra_constants(m)
     halves = np.stack([mask & 0xFFFF, mask >> 16], 1).ravel()
     consts = np.concatenate([c1, c2, dofbody.astype(np.float32), halves.astype(np.float32)])
     sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv}
-    lays = (list(source.CONST_LAYOUT) + [(s, k, n, 1) for s, k, n in step.const_layout(m)]
+    lays = (list(source.CONST_LAYOUT) + [(s, k, n, 1) for s, k, n in step.const_layout(m, convex_hulls)]
             + [("c_dofbody", "i", "nv", 1), ("c_ancmask", "u", "nb", 1)])
     return consts, lays, sizes

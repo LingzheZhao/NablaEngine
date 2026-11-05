@@ -46,11 +46,11 @@ ALLOW_VAR = "DK_ALLOW_UNSUPPORTED"
 COM_BODY = "torso_link"  # the body that takes the per-world COM offset (source.constants, jax_ffi.init)
 SCOPES = {"forward": ("forward",), "engine": ("forward", "adjoint"), "kinematics": ("kinematics",)}
 J, G, T = mujoco.mjtJoint, mujoco.mjtGeom, mujoco.mjtTrn
-GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSULE): 2, int(G.mjGEOM_BOX): 3}
-FORWARD_TYPES = {0, 1, 2, 3}  # step.GEOM_TYPE: plane, sphere, capsule, box
+GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSULE): 2, int(G.mjGEOM_BOX): 3, int(G.mjGEOM_MESH): 4}
+FORWARD_TYPES = {0, 1, 2, 3, 4}  # step.GEOM_TYPE: plane, sphere, capsule, box
 ADJOINT_TYPES = {0, 1, 2}  # adjoint_contact.check_model: no boxes
-DISPATCHED = {(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2), (1, 3), (2, 3), (3, 3)}  # step.py collide_pair's combinations
-CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (1, 3): 1, (2, 3): 2, (3, 3): 8}
+DISPATCHED = {(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2), (1, 3), (2, 3), (3, 3), (1, 4), (2, 4)}  # step.py collide_pair's combinations
+CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (1, 3): 1, (2, 3): 2, (3, 3): 8, (1, 4): 1, (2, 4): 1}
 D, E = mujoco.mjtDisableBit, mujoco.mjtEnableBit
 # disable flags that cannot change the engine's results: sensors (the engine computes none), Euler damping (Euler is
 # rejected), auto reset, midphase / island bookkeeping of MuJoCo's own collision and solver paths, the parent filter
@@ -204,7 +204,7 @@ def unsupported_adjoint_box_pairs(m):
     invalid = []
     for pair in range(m.npair):
         geoms = [int(m.pair_geom1[pair]), int(m.pair_geom2[pair])]
-        boxes = [g for g in geoms if int(m.geom_type[g]) == int(G.mjGEOM_BOX)]
+        boxes = [g for g in geoms if int(m.geom_type[g]) in (int(G.mjGEOM_BOX),int(G.mjGEOM_MESH))]
         if not boxes:
             continue
         if len(boxes) != 1 or int(m.geom_bodyid[boxes[0]]) != 0:
@@ -312,9 +312,9 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     cg = collision_geoms(m)
     types = {GEOM_CODE.get(int(m.geom_type[g]), -1) for g in cg}
     tnames = sorted({mujoco.mjtGeom(int(m.geom_type[g])).name for g in cg})
-    add("H14a", types <= FORWARD_TYPES, "error", "contact pair geoms are planes, spheres, capsules or boxes", tnames)
+    add("H14a", types <= FORWARD_TYPES and not [p for p in unsupported_adjoint_box_pairs(m) if any(m.geom_type[g] == G.mjGEOM_MESH for g in (m.pair_geom1[p],m.pair_geom2[p]))], "error", "supported primitive contacts and world-static convex meshes", tnames)
     planes_off_world = [g for g in cg if m.geom_type[g] == G.mjGEOM_PLANE and m.geom_bodyid[g] != 0]
-    add("H14b", types <= (ADJOINT_TYPES | {3}) and not planes_off_world and not unsupported_adjoint_box_pairs(m), "error", "contact pair geoms are planes (on the world "
+    add("H14b", types <= (ADJOINT_TYPES | {3,4}) and not planes_off_world and not unsupported_adjoint_box_pairs(m), "error", "contact pair geoms are planes (on the world "
         "body), spheres/capsules, or world-static boxes paired only with spheres/capsules in the adjoint", dict(types=tnames, planes_off_world=planes_off_world[:4]),
         ("adjoint",))
     combos = sorted({_pair_codes(m, p) for p in range(m.npair)} - DISPATCHED)

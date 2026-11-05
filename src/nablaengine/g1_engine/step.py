@@ -66,7 +66,7 @@ SOLVER_LAYOUT = (  # (symbol, kind, length in units of the body count, "nv", or 
     ("c_jlim", "f", "nv"), ("c_jsolref", "f", 2), ("c_jsolimp", "f", 5), ("c_dsolref", "f", 2), ("c_dsolimp", "f", 5),
     ("c_sopt", "f", 4))
 GEOM_TYPE = {int(mujoco.mjtGeom.mjGEOM_PLANE): 0, int(mujoco.mjtGeom.mjGEOM_SPHERE): 1,
-             int(mujoco.mjtGeom.mjGEOM_CAPSULE): 2, int(mujoco.mjtGeom.mjGEOM_BOX): 3}
+             int(mujoco.mjtGeom.mjGEOM_CAPSULE): 2, int(mujoco.mjtGeom.mjGEOM_BOX): 3, int(mujoco.mjtGeom.mjGEOM_MESH): 4}
 
 
 def validate_maxcon(value):
@@ -123,20 +123,23 @@ def pair_param_sets(m):
     return np.asarray(list(keys), np.float64).reshape(len(keys), PSET_WIDTH), index
 
 
-def const_layout(m):
+def const_layout(m, convex_hulls=None):
     """[(symbol, kind, length)] of pair_constants(m, ...) in packing order."""
     ng = len(collision_geoms(m))
     sizes = {"nb": m.nbody, "nv": m.nv, "nv2": 2 * m.nv}
     npset = len(pair_param_sets(m)[0])
     return ([(s, k, m.npair * w) for s, k, w in PAIR_LAYOUT] + [("c_pset", "f", npset * PSET_WIDTH)]
             + [(s, k, ng * w) for s, k, w in GEOM_LAYOUT]
-            + [(s, k, sizes[w] if isinstance(w, str) else w) for s, k, w in SOLVER_LAYOUT])
+            + [(s, k, sizes[w] if isinstance(w, str) else w) for s, k, w in SOLVER_LAYOUT]
+            + ([] if convex_hulls is None else [(name, kind, count) for name, kind, count, _ in convex_hulls.layout()]))
 
 
-def pair_constants(m, foot_pairs):
+def pair_constants(m, foot_pairs, convex_hulls=None):
     """Contact-pair arrays (geoms ordered by type, as MuJoCo's collision table expects), the collision-geom table and
     the solver constants, as one float32 array in const_layout(m) order."""
     geoms = collision_geoms(m)
+    if convex_hulls is None and any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH for g in geoms):
+        raise ValueError("mesh constants require the caller-owned packed convex hulls")
     gid = {g: i for i, g in enumerate(geoms)}
     sets, words = pair_param_sets(m), []
     foot = set(int(x) for x in foot_pairs)
@@ -162,6 +165,8 @@ def pair_constants(m, foot_pairs):
     out += [m.body_invweight0[:, 0], m.dof_invweight0, m.dof_frictionloss, jr, jlim, m.jnt_solref[1], m.jnt_solimp[1],
             m.dof_solref[0], m.dof_solimp[0],
             [m.opt.impratio, m.stat.meaninertia, m.opt.tolerance, m.npair]]
+    if convex_hulls is not None:
+        out.append(convex_hulls.constants())
     return np.concatenate([np.asarray(x, np.float64).ravel() for x in out]).astype(np.float32)
 
 
@@ -208,12 +213,16 @@ def dof_body_root6(m):
     return m.nv >= 6 and bool((d[:6] == 1).all() and (d[6:] == np.arange(6, m.nv) - 4).all())
 
 
-def step_header(m, max_contacts=None):
+def step_header(m, max_contacts=None, convex_hulls=None):
     p, g, kdof = m.npair, len(collision_geoms(m)), max_support(m)
     capacity = maxcon(m) if max_contacts is None else validate_maxcon(max_contacts)
     hs = hess_columns(kdof)
     hcol = [a | b << 8 | thr << 16 for _, _, tab in hs for row in tab for a, b, thr in row]
-    return f"""
+    if convex_hulls is None and any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH for g in collision_geoms(m)):
+        raise ValueError("mesh source requires the caller-owned packed convex hulls")
+    hull_header = "" if convex_hulls is None else convex_hulls.header()
+    return hull_header + f"""
+#define HAS_CONVEX {int(convex_hulls is not None)}
 #define NPAIR {p}
 #define NGEOMC {g}
 #define MAXCON {capacity}
@@ -1173,6 +1182,16 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
     return;
   }
 #if HAS_BOX
+#if HAS_CONVEX
+  if ((t1 == 1 || t1 == 2) && t2 == 4) {
+    float axis[3]={0.f,0.f,1.f}; if(t1==2)zaxis_rn(q1,axis);
+    float dist,pos[3],fr[9];
+    int status=static_convex_contact(g2,0,p1,axis,sz1[0],t1==2?sz1[1]:0.f,p2,q2,&dist,pos,fr);
+    if(status<0){atomicOr(&s.unsupported,1);return;}
+    if(status==1 && dist<0.f)add_contact(s,pair,0,dist,pos,fr);
+    return;
+  }
+#endif
   if (t1 == 1 && t2 == 3) {
     float R[9],dist,pos[3],normal[3],fr[9]; quat2mat(q2,R);
     sphere_box(p1,sz1[0],p2,R,sz2,&dist,pos,normal);

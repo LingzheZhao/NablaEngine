@@ -66,7 +66,7 @@ def check_model(m):
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
     from nablaengine.model.capability import unsupported_adjoint_box_pairs
     assert not unsupported_adjoint_box_pairs(m), "box VJP requires world-static box paired with sphere/capsule"
-    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2, 3}, "unsupported contact geometry"
+    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2, 3, 4}, "unsupported contact geometry"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
     assert not (m.dof_frictionloss > 0).any(), "the adjoint has no frictionloss rows (mjlab model only)"
@@ -508,6 +508,18 @@ __device__ __forceinline__ int adj_pair_geom(int pair, int slot, const float (*g
                                              float* dist, float* pos, float* fr, float* nu, const float* cot,
                                              float* gb) {
   int g1 = PG1(pair), g2 = PG2(pair);
+#if HAS_CONVEX
+  if ((c_gtype[g1]==1 || c_gtype[g1]==2) && c_gtype[g2]==4) {
+    *nu=__int_as_float(0x7f800000);
+    if(cot)for(int k=0;k<12;k++)gb[k]=0.f;
+    float axis[3]={0.f,0.f,1.f};if(c_gtype[g1]==2)zaxis_rn(gq[g1],axis);
+    float radius=c_gsize[3*g1],hl=c_gtype[g1]==2?c_gsize[3*g1+1]:0.f;
+    int status=static_convex_contact(g2,slot,gx[g1],axis,radius,hl,gx[g2],gq[g2],dist,pos,fr);
+    if(status!=1)return -1;
+    if(cot && static_convex_vjp(g2,slot,gx[g1],axis,radius,hl,gx[g2],gq[g2],cot,gb)!=1)return -1;
+    return 0;
+  }
+#endif
   return adj_contact_geom(c_gtype[g1], c_gtype[g2], slot, gx[g1], gq[g1], c_gsize + 3 * g1, gx[g2], gq[g2],
                           c_gsize + 3 * g2, dist, pos, fr, nu, cot, gb);
 }
