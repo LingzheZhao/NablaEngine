@@ -33,7 +33,7 @@ def main():
     generate=jax_ffi.library_sources
     def debug_sources(*values,**options):
         units,constants,defines=generate(*values,**options)
-        return {name:'#define DK_NEWTON_STOP_DEBUG 1\n#define DK_CONVEX_AABB 0\n'+source for name,source in units.items()},constants,defines
+        return {name:'#include <stdio.h>\n#define DK_NEWTON_STOP_DEBUG 1\n#define DK_CONVEX_AABB 0\n'+source for name,source in units.items()},constants,defines
     jax_ffi.library_sources=debug_sources
     cc=torch.cuda.get_device_capability()
     artifact=engine.build(f'sm_{cc[0]}{cc[1]}',model=model,foot_pairs=contract['foot_pairs'],set_current=False)
