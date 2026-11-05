@@ -84,7 +84,7 @@ FIELDS = {
     "dof_treeid": _f("derived"), "dof_Madr": _f("derived"), "dof_simplenum": _f("derived"),
     "dof_solref": _f("consumed", "H19"), "dof_solimp": _f("consumed", "H20"),
     "dof_frictionloss": _f("consumed", "H21"), "dof_armature": _f("consumed"),
-    "dof_damping": _f("default", "H22", "joint damping"),
+    "dof_damping": _f("consumed", note="linear passive joint damping"),
     "dof_dampingpoly": _f("default", "H22", "joint damping (higher order)"),
     "dof_invweight0": _f("consumed"), "dof_M0": _f("derived"), "dof_length": _f("derived"),
     # ---- kinematic trees

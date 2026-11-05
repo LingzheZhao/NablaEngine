@@ -354,10 +354,12 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H20", bool(uni and not m.jnt_margin.any() and dof_uni and not lim_free), "error",
         "one solref / solimp for every joint limit and every dof, jnt_margin 0, only hinge limits",
         dict(limited_non_hinge=lim_free[:4]))
-    add("H21", not (m.dof_frictionloss > 0).any(), "error", "no frictionloss in the adjoint (the forward has it)",
+    add("H21", bool(np.all(m.dof_frictionloss >= 0) and np.all(np.isfinite(m.dof_frictionloss))), "error", "finite nonnegative dof frictionloss",
         int((m.dof_frictionloss > 0).sum()), ("adjoint",))
 
     # ---- passive forces, integrator, solver, options
+    add("H22d", bool(np.all(m.dof_damping >= 0) and np.all(np.isfinite(m.dof_damping))), "error",
+        "finite nonnegative linear passive damping", m.dof_damping.tolist())
     medium = dict(density=float(m.opt.density), viscosity=float(m.opt.viscosity), wind=[float(x) for x in m.opt.wind])
     add("H22", m.opt.density == 0 and m.opt.viscosity == 0 and not np.any(m.opt.wind), "error",
         "no fluid forces (opt density, viscosity, wind 0)", medium)

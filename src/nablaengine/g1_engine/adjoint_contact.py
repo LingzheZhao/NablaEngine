@@ -69,7 +69,6 @@ def check_model(m):
     assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2, 3, 4}, "unsupported contact geometry"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
-    assert not (m.dof_frictionloss > 0).any(), "the adjoint has no frictionloss rows (mjlab model only)"
 
 
 def header(m):
@@ -89,7 +88,7 @@ def header(m):
 #ifndef DK_ADJ_PARALLEL_EPS
 #define DK_ADJ_PARALLEL_EPS 1.2e-3f  // sin^2(theta) = |a1 x a2|^2 / (|a1|^2 |a2|^2) of DK_ADJ_PARALLEL 1 (strict <):
 #endif                               // ~sin^2(2 degrees) (theta < 1.99 degrees)
-static_assert(NFLOSS == 0, "the contact adjoint has no frictionloss rows");
+
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free

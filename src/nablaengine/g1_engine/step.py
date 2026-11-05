@@ -1867,7 +1867,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec) {
         act = fminf(fmaxf(act, -c_frclim[i]), c_frclim[i]);
         clamp = act <= -c_frclim[i] || act >= c_frclim[i];  // at the limit: MuJoCo Warp's actuator_lam test
       }
-      s.qsm[i] = act - s.qsm[i];
+      s.qsm[i] = act - c_damping[i] * s.qvel[i] - s.qsm[i];
     }
     if (rec) {  // tape: the clamp mask (dof bits), stored rather than recomputed: the adjoint's FMA contraction of the
       unsigned bal = __ballot_sync(0xffffffffu, clamp);  // force could differ and flip a dof at the limit
@@ -2258,7 +2258,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   // implicitfast: (M + h kv) qacc' = M qacc; then qvel, qpos
   for (int e = lane; e < NTRI; e += 32) s.L[e] = s.M[e];
   __syncwarp();
-  for (int i = lane; i < NV; i += 32) { s.L[TRI(i, i)] += h * c_kv[i]; s.tmp[i] = s.Ma[i]; }
+  for (int i = lane; i < NV; i += 32) { s.L[TRI(i, i)] += h * (c_kv[i] + c_damping[i]); s.tmp[i] = s.Ma[i]; }
   __syncwarp();
   CHOL_SOLVE(s.L, s.L, s.tmp, lane, s.cbuf);
   if (rec) {  // tape: L_Q = chol(M + h kv), a* and a_adv (qvel' = qvel + h a_adv), header

@@ -169,7 +169,6 @@ def solimp_powers(m):
 def header(m):
     """#defines of the adjoint (stage, options, debug layout, the model's solimp power); asserts the mjlab-only scope."""
     adjoint_contact.check_model(m)
-    assert not (m.dof_frictionloss > 0).any(), "the adjoint is for the mjlab model: no frictionloss rows"
     assert m.nu == m.nv - 6, "one position actuator per hinge dof"
     lay, nw = debug_layout(m)
     lines = [f"#define ADJ_ROWS_SKIPPED {ADJ_ROWS_SKIPPED}u", f"#define ADJ_REPLAY_MISMATCH {ADJ_REPLAY_MISMATCH}u",
@@ -205,7 +204,7 @@ static_assert(DK_ADJ_CLAMP_KV >= 0 && DK_ADJ_CLAMP_KV <= 2, "DK_ADJ_CLAMP_KV: 0,
 #define ADJ_SOFT_PARAM
 #define ADJ_SOFT_ARG(x)
 #endif
-static_assert(NFLOSS == 0, "the adjoint has no frictionloss rows");
+
 static_assert(DK_ADJ_STAGE >= 1 && DK_ADJ_STAGE <= 3, "DK_ADJ_STAGE: 1, 2 or 3");
 static_assert(NB <= 31, "the contact reduction: lanes 0 and 31 take two of the root rotation dofs");
 #define CS_N 24  // per-contact words (A6, in registers of the contact's lane): W_v, W_a, W_lam (0-8), contact point
@@ -788,14 +787,14 @@ __device__ __noinline__ void adj_solves(Adj& s, const float* rec, int lane) {
   for (int e = lane; e < NTRI; e += 32) s.L[e] = __ldcs(rec + OFF_LQ + e);
   for (int i = lane; i < NV; i += 32) s.y[i] = s.abar[i];
   tri_solve_packed(s.L, s.y, lane);
-  for (int i = lane; i < NV; i += 32) { s.abar[i] -= h * c_kv[i] * s.y[i]; s.ny[i] = -s.y[i]; }
+  for (int i = lane; i < NV; i += 32) { s.abar[i] -= h * (c_kv[i] + c_damping[i]) * s.y[i]; s.ny[i] = -s.y[i]; }
   __syncwarp();
   APROF(APROF_SOLVE_Q);
 #ifdef DK_ADJ_DEBUG
   {  // |M a*| for the residual check's scale
     tri_mul_llt(s.L, s.a, s.tmp, s.did, lane);
     float acc = 0.f;
-    for (int i = lane; i < NV; i += 32) { float x = s.did[i] - h * c_kv[i] * s.a[i]; acc += x * x; }
+    for (int i = lane; i < NV; i += 32) { float x = s.did[i] - h * (c_kv[i] + c_damping[i]) * s.a[i]; acc += x * x; }
     acc = warp_sum(acc);
     if (lane == 0) s.ma_norm = sqrtf(acc);
     __syncwarp();
@@ -844,6 +843,7 @@ __device__ void adj_compose(Adj& s, int lane) {
   }
   __syncwarp();
   for (int i = lane; i < NV; i += 32) {
+    s.Pv[i] += c_damping[i] * s.lam[i];
     if (i < 3) s.qbar[i] -= s.Pq[i];
     else if (i >= 6) s.qbar[i + 1] -= s.Pq[i];
     s.vbar[i] -= s.Pv[i];
@@ -886,7 +886,22 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
   float* const dbg = DBG ? dbg_in : nullptr;
   (void)dbg;  // no debug entries without -DDK_ADJ_DEBUG
   const unsigned below = (1u << lane) - 1u;
-  int nl = 0;
+  int nf = 0;
+  for(int i0=0;i0<NV;i0+=32){
+    int i=i0+lane;bool on=i<NV && c_floss[i]>0.f;
+    unsigned mask=__ballot_sync(0xffffffffu,on);
+    if(on){
+      int row=nf+__popc(mask&below);
+      if((s.zone[row>>5]>>(row&31))&1u){
+        float ri[6];adj_row_impedance(c_dsolref,c_dsolimp,0.f,c_dinvw[i],ri);
+        // In the quadratic friction zone Psi=D*(a+b*v)*lambda.
+        // Saturated dry-friction force is constant and contributes no pose/velocity derivative.
+        s.Pv[i]+=ri[4]*ri[1]*s.lam[i];
+      }
+    }
+    nf+=__popc(mask);
+  }
+  int nl = NFLOSS;
 #pragma unroll 1
   for (int i0 = 0; i0 < NV; i0 += 32) {
     const int i = min(i0 + lane, NV - 1);  // clamped so that the loads need no branch (as the forward)
@@ -1089,7 +1104,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
     const unsigned e = on ? (s.con[c >> 1] >> (16 * (c & 1))) & 0xFFFFu : 0u;
     const int pair = e & TAPE_PAIR_MASK, slot = e >> TAPE_PAIR_BITS, dim = on ? PDIM(pair) : 0;
     const unsigned b3 = __ballot_sync(0xffffffffu, dim == 3);
-    const int r0 = nlim + c + 3 * (ntri + __popc(b3 & below));  // the contact's first row
+    const int r0 = NFLOSS + nlim + c + 3 * (ntri + __popc(b3 & below));  // the contact's first row
     ntri += __popc(b3);
     const bool use = on && (DK_ADJ_STAGE >= 3 || c_gbody[PG1(pair)] == 0);
     unsigned zone = 0u;
