@@ -36,7 +36,16 @@ def main():
             data.ctrl[:]=state['u'];data.qacc_warmstart[:]=decoded['qacc'][i-1] if i else 0
             v_before=data.qvel.copy();q_before=data.qpos.copy()
             mujoco.mj_step(model,data)
+            mass=np.empty((model.nv,model.nv),dtype=np.float64)
+            mujoco.mj_fullM(model,data,mass)
+            force_rhs=data.qfrc_smooth+data.qfrc_constraint
+            solver_residual=mass@data.qacc-force_rhs
             row=dict(state=name,controls=controls,substep=i,
+                     mujoco_mass=mass.tolist(),mujoco_qfrc_smooth=data.qfrc_smooth.tolist(),
+                     mujoco_qfrc_constraint=data.qfrc_constraint.tolist(),
+                     mujoco_solver_residual=solver_residual.tolist(),
+                     engine_solver_residual_with_mujoco_forces=(mass@decoded['qacc'][i]-force_rhs).tolist(),
+                     mujoco_next_qpos=data.qpos.tolist(),mujoco_next_qvel=data.qvel.tolist(),
                      qacc_max_error=float(np.max(np.abs(data.qacc-decoded['qacc'][i]))),
                      engine_qacc=decoded['qacc'][i].tolist(),mujoco_qacc=data.qacc.tolist(),
                      engine_zone=decoded['zone'][i].tolist(),mujoco_row_type=data.efc_type.tolist(),
