@@ -1,8 +1,8 @@
 """CUDA static convex-hull contact selection and differentiable witness replay.
 
-The initial interface exposes slot zero and rejects spatially nonunique closest
-witnesses. Slot one is reserved for the extrema of a future two-point contact
-set. Callers propagate every negative status to the engine unsupported-state
+Slots zero and one expose the minimum and maximum segment parameters of
+the near-minimum-distance witness set. A spatially unique witness uses slot zero.
+The two-point set retains the endpoints of a parallel face contact interval. Callers propagate every negative status to the engine unsupported-state
 flag and stop the training batch at the host boundary.
 
 Selection and replay share explicitly rounded primal arithmetic. Six-variable
@@ -13,8 +13,9 @@ and edge parameters. Hull geometry and pose are fixed.
 DEVICE = r'''
 namespace static_convex {
 constexpr float geometry_tolerance = 2e-5f;
+constexpr float manifold_distance_tolerance = 2e-6f;
 enum Status { NoContact = 0, Valid = 1, CenterlineIntersection = -1,
-              NonuniqueWitness = -2, InvalidGeometry = -3, InvalidSlot = -4 };
+              InvalidGeometry = -3, InvalidSlot = -4 };
 
 // Scalar<0> and Scalar<6> have identical explicitly rounded primal operations.
 // This keeps replay stable across compilation units and contraction settings.
@@ -141,7 +142,9 @@ struct Selection {
   Feature feature;
   Witness<0> witness;
   float squared_distance;
-  bool found;
+  bool found, has_extrema;
+  Feature lower_feature, upper_feature;
+  Witness<0> lower_witness, upper_witness;
   int status;
 };
 __device__ void consider(int hull, const Feature& feature, const Vector<0>& start,
@@ -160,12 +163,18 @@ __device__ void consider(int hull, const Feature& feature, const Vector<0>& star
     return;
   }
   float best_distance = sqrtf(selection.squared_distance);
-  float witness_tolerance = fmaxf(geometry_tolerance, 32.f*1.1920928955078125e-7f*fmaxf(1.f, best_distance));
-  if (fabsf(sqrtf(squared)-best_distance) <= witness_tolerance) {
-    Vector<0> dc = candidate.centerline-selection.witness.centerline;
-    Vector<0> dq = candidate.surface-selection.witness.surface;
-    if (fmaxf(dot(dc, dc).value, dot(dq, dq).value) > witness_tolerance*witness_tolerance)
-      selection.status = NonuniqueWitness;
+  float distance_tolerance = fmaxf(manifold_distance_tolerance,
+                                   8.f*1.1920928955078125e-7f*fmaxf(1.f, best_distance));
+  if (fabsf(sqrtf(squared)-best_distance) <= distance_tolerance) {
+    if (!selection.has_extrema || candidate.parameter.value < selection.lower_witness.parameter.value) {
+      selection.lower_feature = feature;
+      selection.lower_witness = candidate;
+    }
+    if (!selection.has_extrema || candidate.parameter.value > selection.upper_witness.parameter.value) {
+      selection.upper_feature = feature;
+      selection.upper_witness = candidate;
+    }
+    selection.has_extrema = true;
   }
 }
 __device__ void candidates(int hull, const Vector<0>& start, const Vector<0>& delta,
@@ -228,6 +237,7 @@ __device__ int select(int hull, const Vector<0>& start, const Vector<0>& delta, 
   }
   if (lower <= upper) return CenterlineIntersection;
   selection.found = false;
+  selection.has_extrema = false;
   selection.status = Valid;
   candidates(hull, start, delta, 0, selection);
   if (selection.status != Valid || !selection.found) return InvalidGeometry;
@@ -236,12 +246,29 @@ __device__ int select(int hull, const Vector<0>& start, const Vector<0>& delta, 
   return selection.status;
 }
 
+__device__ int select_slot(const Selection& selection, int slot, Feature& feature) {
+  float best_distance = sqrtf(selection.squared_distance);
+  float witness_tolerance = fmaxf(geometry_tolerance,
+                                  32.f*1.1920928955078125e-7f*fmaxf(1.f, best_distance));
+  Vector<0> dc = selection.upper_witness.centerline-selection.lower_witness.centerline;
+  // A point query has one physical closest point on a convex solid. Only
+  // distinct centerline positions create a two-point capsule contact set.
+  bool distinct = dot(dc, dc).value > witness_tolerance*witness_tolerance;
+  if (!distinct) {
+    if (slot == 1) return NoContact;
+    feature = selection.feature;
+  } else {
+    feature = slot == 0 ? selection.lower_feature : selection.upper_feature;
+  }
+  return Valid;
+}
+
 template<int D> __device__ void local_inputs(int hull, const float* center, const float* axis,
                                               float half_length, const float* hull_position,
                                               const float* hull_quaternion, Vector<D>& start,
                                               Vector<D>& delta) {
   Vector<D> cp = load_vector<D>(center), a = load_vector<D>(axis);
-  if (D == 6) {
+  if constexpr (D == 6) {
     for (int i = 0; i < 3; ++i) cp.x[i].derivative[i] = 1.f;
     for (int i = 0; i < 3; ++i) {
       int j = (i+1)%3, k = (i+2)%3;
@@ -291,8 +318,7 @@ __device__ int static_convex_contact(int geom, int slot, const float* center, co
                                       const float* hull_quaternion, float* distance, float* position,
                                       float* frame) {
   using namespace static_convex;
-  if (slot == 1) return NoContact;
-  if (slot != 0) return InvalidSlot;
+  if (slot < 0 || slot > 1) return InvalidSlot;
   int hull = c_ghull[geom];
   if (hull < 0) return InvalidGeometry;
   Vector<0> start, delta;
@@ -300,8 +326,11 @@ __device__ int static_convex_contact(int geom, int slot, const float* center, co
   Selection selected;
   int status = select(hull, start, delta, selected);
   if (status != Valid) return status;
+  Feature feature;
+  status = select_slot(selected, slot, feature);
+  if (status != Valid) return status;
   Scalar<0> output[13];
-  outputs(hull, selected.feature, start, delta, radius, hull_position, hull_quaternion, output);
+  outputs(hull, feature, start, delta, radius, hull_position, hull_quaternion, output);
   *distance = output[0].value;
   for (int i = 0; i < 3; ++i) position[i] = output[1+i].value;
   for (int i = 0; i < 9; ++i) frame[i] = output[4+i].value;
@@ -312,8 +341,7 @@ __device__ int static_convex_vjp(int geom, int slot, const float* center, const 
                                   const float* hull_quaternion, const float* cotangent, float* gradient) {
   using namespace static_convex;
   for (int i = 0; i < 6; ++i) gradient[i] = 0.f;
-  if (slot == 1) return NoContact;
-  if (slot != 0) return InvalidSlot;
+  if (slot < 0 || slot > 1) return InvalidSlot;
   int hull = c_ghull[geom];
   if (hull < 0) return InvalidGeometry;
   Vector<0> start, delta;
@@ -321,11 +349,14 @@ __device__ int static_convex_vjp(int geom, int slot, const float* center, const 
   Selection selected;
   int status = select(hull, start, delta, selected);
   if (status != Valid) return status;
+  Feature feature;
+  status = select_slot(selected, slot, feature);
+  if (status != Valid) return status;
   Vector<6> differentiable_start, differentiable_delta;
   local_inputs(hull, center, axis, half_length, hull_position, hull_quaternion,
                differentiable_start, differentiable_delta);
   Scalar<6> output[13];
-  outputs(hull, selected.feature, differentiable_start, differentiable_delta, radius,
+  outputs(hull, feature, differentiable_start, differentiable_delta, radius,
           hull_position, hull_quaternion, output);
   for (int i = 0; i < 6; ++i)
     for (int k = 0; k < 13; ++k) gradient[i] += cotangent[k]*output[k].derivative[i];

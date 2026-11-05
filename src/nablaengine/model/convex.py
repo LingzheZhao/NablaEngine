@@ -34,9 +34,12 @@ def pack_static_convex_hulls(model, collision_geoms):
 
     The input geom order is the engine collision-geom table order. Every selected
     mesh must be fixed to world body zero and bound a closed convex triangle
-    surface. Indices fit exactly in the float32 host transport representation.
+    surface. Triangulation is rebuilt from every compiled vertex because mesh
+    centering/rotation can change the triangulation of nearly coplanar faces.
+    Indices fit exactly in the float32 host transport representation.
     """
     import mujoco
+    from scipy.spatial import ConvexHull
 
     geom_hulls = np.full(len(collision_geoms), -1, dtype=np.int32)
     vertex_addresses, vertex_counts, face_addresses, face_counts = [], [], [], []
@@ -56,12 +59,15 @@ def pack_static_convex_hulls(model, collision_geoms):
             continue
         vertex_address = int(model.mesh_vertadr[mesh])
         count = int(model.mesh_vertnum[mesh])
-        face_address = int(model.mesh_faceadr[mesh])
-        triangles = int(model.mesh_facenum[mesh])
         points = np.asarray(model.mesh_vert[vertex_address:vertex_address+count], dtype=np.float64)
-        indices = np.array(model.mesh_face[face_address:face_address+triangles], dtype=np.int32)
-        if count < 4 or triangles < 4 or not np.isfinite(points).all():
+        if count < 4 or not np.isfinite(points).all():
             raise ValueError(f'mesh {mesh} requires finite closed solid geometry')
+        # MuJoCo's convex mesh support map uses all compiled vertices. Rebuild
+        # that same convex body after compilation, keeping all input vertices.
+        # Reusing a pre-compilation near-coplanar triangulation can produce
+        # nonconvex thin faces after the compiler's float32 frame transform.
+        indices = np.asarray(ConvexHull(points).simplices, dtype=np.int32)
+        triangles = len(indices)
         if indices.shape != (triangles, 3) or indices.min() < 0 or indices.max() >= count:
             raise ValueError(f'mesh {mesh} has invalid triangle indices')
         edge_counts = {}
