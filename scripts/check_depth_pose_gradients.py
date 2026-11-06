@@ -296,6 +296,59 @@ def check_source(args, model, geometry):
 
 
 
+
+def validate_captured_packing(current, captured):
+    """Validate the saved arrays and exact ordered-face sets per compiled mesh."""
+    for name, array in captured.items():
+        reference = current[name]
+        if array.shape != reference.shape or array.dtype != reference.dtype or not np.isfinite(array).all():
+            raise ValueError(f'Captured {name} shape, dtype or finite-value contract differs')
+    for name in ('geometry', 'poses', 'sizes', 'nodes'):
+        if not np.array_equal(current[name], captured[name]):
+            raise ValueError(f'Captured {name} differs from the loaded model binding')
+    nodes, bounds, triangles = captured['nodes'], captured['bounds'], captured['triangles']
+    if not np.all(bounds[:, :3] <= bounds[:, 3:]):
+        raise ValueError('Captured BVH has inverted bounds')
+    leaves = np.flatnonzero(nodes[:, 1] > 0)
+    first, count = nodes[leaves, 0], nodes[leaves, 1]
+    if np.any(count > 8) or np.any(first < 0) or np.any(first+count > len(triangles)):
+        raise ValueError('Captured BVH leaf triangle ranges are invalid')
+    offsets = np.arange(8)
+    valid = offsets[None] < count[:, None]
+    faces = triangles[np.minimum(first[:, None]+offsets, len(triangles)-1)]
+    lower = np.where(valid[..., None, None], faces, np.inf).min(axis=(1, 2))
+    upper = np.where(valid[..., None, None], faces, -np.inf).max(axis=(1, 2))
+    if np.any(bounds[leaves, :3] > lower) or np.any(bounds[leaves, 3:] < upper):
+        raise ValueError('Captured leaf bounds do not contain their triangles')
+    parents = np.flatnonzero(nodes[:, 1] == 0)
+    left = parents+1
+    right = nodes[left, 2]
+    for children in (left, right):
+        if (np.any(bounds[parents, :3] > bounds[children, :3])
+                or np.any(bounds[parents, 3:] < bounds[children, 3:])):
+            raise ValueError('Captured interior bounds do not contain their children')
+    changed = np.flatnonzero(np.any(current['triangles'] != triangles, axis=(1, 2)))
+    meshes = []
+    for root, end in np.unique(captured['geometry'][:, 2:4], axis=0):
+        mesh_nodes = nodes[root:end]
+        mesh_leaves = mesh_nodes[mesh_nodes[:, 1] > 0]
+        if not len(mesh_leaves):
+            continue
+        start = int(mesh_leaves[:, 0].min())
+        stop = int((mesh_leaves[:, 0]+mesh_leaves[:, 1]).max())
+        changed_faces = changed[(changed >= start) & (changed < stop)]
+        original = sorted(map(tuple, triangles[changed_faces].reshape(-1, 9).tolist()))
+        loaded = sorted(map(tuple, current['triangles'][changed_faces].reshape(-1, 9).tolist()))
+        if original != loaded:
+            raise ValueError(f'Captured ordered-triangle multiset differs in mesh nodes [{root}, {end})')
+        if len(changed_faces):
+            meshes.append(dict(root=int(root), end=int(end), changed_triangle_positions=len(changed_faces)))
+    return dict(ordered_vertex_multisets_equal_per_mesh=True, changed_triangle_positions=len(changed),
+        changed_bound_elements=int((current['bounds'] != bounds).sum()), affected_meshes=meshes,
+        cross_packing_triangle_ids_comparable=False,
+        replay='stored arrays form the sole packet geometry owner; current scene has a separate owner')
+
+
 def check_failure_packet(args, geometry):
     """Replay the recorded failed secondary query with primary face selection."""
     import torch
@@ -303,11 +356,12 @@ def check_failure_packet(args, geometry):
 
     packet = np.load(args.packet, allow_pickle=False)
     native = geometry.cuda_backend
+    captured = {name: packet[name] for name in ('geometry', 'poses', 'sizes', 'bounds', 'nodes', 'triangles')}
     current = {name: getattr(native, name).cpu().numpy() for name in
                ('geometry', 'poses', 'sizes', 'bounds', 'nodes', 'triangles')}
     packing_rows = []
     for name, array in current.items():
-        recorded = packet[name]
+        recorded = captured[name]
         same_shape = array.shape == recorded.shape
         equal = np.array_equal(array, recorded)
         row = dict(array=name, equal=equal, current_shape=list(array.shape),
@@ -330,7 +384,14 @@ def check_failure_packet(args, geometry):
     mismatches = [row['array'] for row in packing_rows if not row['equal']]
     if mismatches:
         np.savez_compressed(args.out/'current_packing.npz', **current)
-        raise ValueError(f'Failure packet packing differs in {mismatches}. See packing_comparison.json and current_packing.npz')
+    packing_equivalence = validate_captured_packing(current, captured)
+    (args.out/'packing_equivalence.json').write_text(json.dumps(packing_equivalence, indent=2)+'\n')
+    # --packet explicitly selects its stored packing. Current-scene validation
+    # above uses its own owner and never interprets these captured triangle IDs.
+    from nablaengine.depth_cuda import CudaDepthGeometry
+    from nablaengine.depth_geometry import DepthGeometry
+    native = CudaDepthGeometry._from_packed_arrays(captured, geometry.body_count, args.device)
+    geometry = DepthGeometry(geometry.geoms, geometry.body_count, native)
     inputs = [torch.tensor(packet[name], device=args.device).requires_grad_() for name in
               ('body_positions', 'body_quaternions', 'origins', 'directions')]
     ranges, ids = geometry.raycast_with_pose_gradients(*inputs)
@@ -340,12 +401,12 @@ def check_failure_packet(args, geometry):
     rows = []
     for world, pixel in packet['invalid_indices']:
         g = int(primary[2][world, pixel]); face = int(primary[3][world, pixel])
-        body = int(packet['geometry'][g, 0]); pose = packet['poses'][g].astype(float)
+        body = int(captured['geometry'][g, 0]); pose = captured['poses'][g].astype(float)
         q = packet['body_quaternions'][world, body].astype(float)
         bp = packet['body_positions'][world, body].astype(float)
         origin = packet['origins'][world, pixel].astype(float)
         direction = packet['directions'][world, pixel].astype(float)
-        triangle = packet['triangles'][face].astype(float)
+        triangle = captured['triangles'][face].astype(float)
         normal = np.cross(triangle[1]-triangle[0], triangle[2]-triangle[0])
         local_origin = inverse_rotate(pose[3:], inverse_rotate(q, origin-bp)-pose[:3])
         local_direction = inverse_rotate(pose[3:], inverse_rotate(q, direction))
@@ -361,7 +422,8 @@ def check_failure_packet(args, geometry):
             max_origin_gradient_error=float(np.max(np.abs(origin_gradient-expected_origin))),
             max_direction_gradient_error=float(np.max(np.abs(direction_gradient-expected_direction))),
             passed=bool(close)))
-    return dict(previously_unrecovered_rays=len(rows),
+    return dict(packing_owner='captured_arrays', packing_equivalence=packing_equivalence,
+        previously_unrecovered_rays=len(rows),
         ranges_bitwise=bool(np.array_equal(ranges.detach().cpu().numpy().view(np.uint32), packet['legacy_ranges'].view(np.uint32))),
         geom_ids_equal=bool(np.array_equal(ids.cpu().numpy(), packet['legacy_geom_ids'])),
         primary_triangle_ids_equal=bool(np.array_equal(primary[3].cpu().numpy(), packet['primary_triangle_ids'])),
@@ -383,7 +445,8 @@ def main():
         parser.error('CUDA checks require --model, --states and --rays')
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out/'protocol.json').write_text(json.dumps(dict(PROTOCOL, code_revision=args.code_revision,
-        model=str(args.model), states=str(args.states), rays=str(args.rays), packet=str(args.packet)), indent=2)+'\n')
+        model=str(args.model), states=str(args.states), rays=str(args.rays), packet=str(args.packet),
+        packet_geometry='explicit captured packing, separate from current scene'), indent=2)+'\n')
     result = dict(math=generated_math('cpu' if args.cpu_math_only else args.device))
     if not args.cpu_math_only:
         import torch

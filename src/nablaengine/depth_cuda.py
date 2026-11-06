@@ -279,19 +279,35 @@ class CudaDepthGeometry:
             geometry.append([geom.body_id, geom.kind, root, end, geom.geom_id])
             poses.append(np.r_[geom.position.cpu().numpy(), geom.quaternion.cpu().numpy()])
             sizes.append(geom.size.cpu().numpy())
+        packed = dict(geometry=np.asarray(geometry, np.int32).reshape(-1, 5),
+            poses=np.asarray(poses, np.float32).reshape(-1, 7),
+            sizes=np.asarray(sizes, np.float32).reshape(-1, 3),
+            bounds=np.asarray(bounds or [np.zeros(6)], np.float32),
+            nodes=np.asarray(nodes or [[0, 0, 0]], np.int32),
+            triangles=np.asarray(triangles or [np.zeros((3, 3))], np.float32))
+        self._initialize(packed, body_count, device)
+
+    @classmethod
+    def _from_packed_arrays(cls, packed, body_count, device):
+        """Initialize the explicit captured packing validated by a diagnostic."""
+        native = cls.__new__(cls)
+        native._initialize(packed, body_count, device)
+        return native
+
+    def _initialize(self, packed, body_count, device):
         def tensor(values, dtype):
-            return torch.tensor(np.asarray(values), dtype=dtype, device=device).contiguous()
-        self.geometry = tensor(geometry, torch.int32)
-        self.poses = tensor(poses, torch.float32)
-        self.sizes = tensor(sizes, torch.float32)
-        self.bounds = tensor(bounds or [np.zeros(6)], torch.float32)
-        self.nodes = tensor(nodes or [[0, 0, 0]], torch.int32)
-        self.triangles = tensor(triangles or [np.zeros((3, 3))], torch.float32)
-        lookup = np.full(max((geom.geom_id for geom in geoms), default=0)+1, -1, np.int32)
-        for index, geom in enumerate(geoms):
-            lookup[geom.geom_id] = index
+            return torch.tensor(values, dtype=dtype, device=device).contiguous()
+        self.geometry = tensor(packed['geometry'], torch.int32)
+        self.poses = tensor(packed['poses'], torch.float32)
+        self.sizes = tensor(packed['sizes'], torch.float32)
+        self.bounds = tensor(packed['bounds'], torch.float32)
+        self.nodes = tensor(packed['nodes'], torch.int32)
+        self.triangles = tensor(packed['triangles'], torch.float32)
+        lookup = np.full(max(packed['geometry'][:, 4], default=0)+1, -1, np.int32)
+        for index, geom_id in enumerate(packed['geometry'][:, 4]):
+            lookup[geom_id] = index
         self.geom_lookup = tensor(lookup, torch.int32)
-        self.pose_gradients_supported = all(geom.kind in (0, 7) for geom in geoms)
+        self.pose_gradients_supported = bool(np.isin(packed['geometry'][:, 1], (0, 7)).all())
         self.body_count = body_count
         self.device = self.geometry.device
         parent = os.environ.get('DK_CACHE_DIR')

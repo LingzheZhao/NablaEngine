@@ -137,8 +137,11 @@ full-graph compilation and CUDA Graph capture. CUDA surface-query libraries use 
 `scripts/check_depth_pose_gradients.py --cpu-math-only` checks the runtime plane formula with generated
 independent geometry. Its CUDA mode additionally consumes a model, matching states and `rays.npz` written by
 `check_depth_geometry.py`, checking source-camera finite differences, forward bits and captured derivatives.
-Add `--packet` to replay a packet from `diagnose_depth_surface_selection.py` and compare the recorded failing rays against primary
-face selection without changing the original ray ranges.
+Add `--packet` to replay a packet from `diagnose_depth_surface_selection.py`. The replay explicitly loads
+its captured packing into a separate CUDA owner, after checking model bindings, conservative BVH bounds and
+exact ordered-triangle multisets per mesh. This retains the packet's triangle IDs when equal-centroid BVH
+partition ties produce different triangle ordering on another host. Range bits, geom IDs and triangle IDs are
+compared within the captured owner. Current-scene camera checks keep their own model packing.
 
 ## Diagnostics
 
