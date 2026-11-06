@@ -195,13 +195,21 @@ def check_source(args):
     model = mujoco.MjModel.from_binary_path(str(args.model))
     data = mujoco.MjData(model)
     states, rays = np.load(args.states, allow_pickle=False), np.load(args.rays, allow_pickle=False)
-    state_ids = states['frames'] if 'frames' in states else np.arange(len(states['qpos']))
+    qpos, qvel = states['qpos'], states['qvel']
+    if qpos.ndim != 2 or qpos.shape[1] != model.nq or qvel.shape != (len(qpos), model.nv):
+        raise ValueError('Reference qpos/qvel dimensions must match the loaded model')
+    if (states['names'].shape != (1,) or states['starts'].tolist() != [0]
+            or states['lengths'].tolist() != [len(qpos)] or not len(qpos)):
+        raise ValueError('Reference shard must contain one complete motion starting at frame zero')
+    if not np.isfinite(qpos).all() or not np.isfinite(qvel).all():
+        raise ValueError('Reference qpos/qvel must be finite')
+    frames = rays['frames']
+    if (frames.ndim != 1 or not len(frames) or frames.dtype.kind not in 'iu'
+            or np.any(frames < 0) or np.any(frames >= len(qpos))):
+        raise ValueError('Ray frames must be integer indices within the reference motion')
     positions, quaternions = [], []
-    for frame in rays['frames']:
-        index = np.flatnonzero(state_ids == frame)
-        if len(index) != 1:
-            raise ValueError(f'Frame {frame} absent or duplicated')
-        data.qpos[:] = states['qpos'][index[0]]
+    for frame in frames:
+        data.qpos[:] = qpos[frame]
         mujoco.mj_kinematics(model, data)
         positions.append(data.xpos.copy())
         quaternions.append(data.xquat.copy())
@@ -232,8 +240,8 @@ def check_source(args):
     margins = torch.minimum(torch.minimum(u, v), 1-u-v).detach()
     rows = []
     groups = np.array([1, 0, 1, 0, 0, 0], np.uint8)
-    for f, frame in enumerate(rays['frames']):
-        data.qpos[:] = states['qpos'][np.flatnonzero(state_ids == frame)[0]]
+    for f, frame in enumerate(frames):
+        data.qpos[:] = qpos[frame]
         mujoco.mj_kinematics(model, data)
         for category, mask in [('terrain', body[f] == 0), ('self', body[f] != 0)]:
             candidate = (ids[f] >= 0) & (triangle_ids[f] >= 0) & mask
@@ -295,7 +303,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cpu-math-only', action='store_true')
     parser.add_argument('--model', type=Path)
-    parser.add_argument('--states', type=Path)
+    parser.add_argument('--states', type=Path, help='current single-motion reference shard')
     parser.add_argument('--rays', type=Path, help='rays.npz produced by check_depth_geometry.py for this model/states')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--code-revision', required=True)
