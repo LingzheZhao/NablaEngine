@@ -41,6 +41,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 import time
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -306,6 +307,16 @@ def main():
         cq, cv = cots[0]
         tmp = tempfile.mkdtemp(prefix="torch_ffi_artifact_", dir=os.environ.get("TMPDIR"))
         try:
+            # Generate the previous metadata contract without its required input
+            # layout. Reject it before inspecting or loading any library files.
+            old_metadata = Path(tmp) / "previous_artifact.json"
+            old_metadata.write_text(json.dumps(dict(artifact_version=4)))
+            reason = torch_ffi._stale(old_metadata, torch_ffi.init()["arch"])
+            record("artifact", "previous_metadata_without_input_layout_refused",
+                   reason == f"artifact version 4, this module reads {torch_ffi.ARTIFACT_VERSION}", reason=reason)
+            record("artifact", "versioned_cache_namespace",
+                   Path(torch_ffi.init()["path"]).name.startswith(
+                       f"libdk_g1_torch_v{torch_ffi.ARTIFACT_VERSION}_"))
             np.savez(os.path.join(tmp, "in.npz"), *host, cq, cv)
             ref = torch_ffi.forward(*tin, tape=True)
             refb = torch_ffi.backward(ref[4], tin[4], tin[5], T(cq), T(cv))

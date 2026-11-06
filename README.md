@@ -11,8 +11,9 @@ step with its gradient from the input state. MuJoCo Warp and MJX simulate the sa
 `docs/results/paper_rtx6000/paper_bench.md`); Isaac Lab runs its own G1 asset with its task defaults (median over
 rounds, `docs/results/physx_rtx6000/physx_bench_results.md`).</sub>
 
-The benchmark figures below describe the original capacity configurations. The current fork's
-96-contact condition has separate [capacity qualification results](docs/contact_capacity.md).
+The benchmark figures below describe the original capacity configurations. The current fork defaults to
+128 contacts and 576 constraint rows; [capacity qualification](docs/contact_capacity.md) separates the current
+sparse-contact candidate-index check from the earlier dense 96-contact results.
 
 NablaEngine is a differentiable GPU physics engine for the Unitree G1 humanoid. It simulates thousands of worlds per
 call with MuJoCo's physics and returns analytic gradients of every step with respect to the state and the actions,
@@ -37,6 +38,11 @@ the engine's simulation gradients.
 NablaEngine is specialized for the Unitree G1 (the mjlab model), the first robot it supports: contacts between
 spheres, capsules and the floor, joint limits, PD position actuators, MuJoCo's Newton solver and implicitfast
 integration, in float32. Other models are rejected with an error that names the unsupported features.
+
+This research branch adds experimental sphere/capsule contacts against static world boxes. Moving boxes,
+plane–box and box–box adjoints remain rejected. The [terrain contact checks](docs/verification.md#terrain-contact-checks)
+separate primitive gradients, short robot steps and the remaining terrain limitations; they do not establish a
+terrain-tracking policy.
 
 Requirements: Linux x86_64, an NVIDIA GPU of compute capability 7.0 or newer (tested: V100, RTX 3090, H100, RTX PRO
 6000), Python 3.12, and a CUDA 12.x toolkit (nvcc) for the one-time build of the CUDA library (about 15 s, cached).
@@ -104,13 +110,15 @@ qpos1, qvel1, warm1 = torch_ffi.step(qpos, qvel, warm, ctrl, friction, com)
 
 Inputs are float32 arrays with the worlds as the leading dimension: `qpos (B, 36)`, `qvel (B, 35)`, the solver's warm
 start `warm (B, 35)`, the position targets `ctrl (B, 29)`, and per-world foot `friction (B,)` and torso
-centre-of-mass offset `com (B, 3)` for domain randomization. Each world holds up to 96 contacts and 416 constraint
+centre-of-mass offset `com (B, 3)` for domain randomization. Each world defaults to 128 contacts and 576 constraint
 rows; a world beyond them (e.g. deep interpenetration after a fall) drops the extra ones and is flagged and counted
 (`docs/api.md`, Diagnostics).
 
-The 96-contact / 416-row extension passes the bounded native, high-contact, overflow and independent
-Jacobian/Hessian checks described in [capacity qualification](docs/contact_capacity.md). The published benchmark
-measurements above used the original capacity; they do not establish this extension's accuracy or throughput.
+The current wide-index check passes forward and directional-gradient comparisons with 15,231 candidate pairs
+and 28 active contacts. Dense 128-contact execution remains unqualified. The earlier 96-contact condition has
+separate native, high-contact, overflow and independent Jacobian/Hessian evidence in
+[capacity qualification](docs/contact_capacity.md). The published benchmark measurements above used the original
+capacity; they do not establish the current configuration's accuracy or throughput.
 
 ## Documentation
 

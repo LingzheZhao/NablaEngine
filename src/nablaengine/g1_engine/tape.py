@@ -22,17 +22,23 @@ FLAG_NONCONV = 1 << 9  # the Newton iterations ran out before the stopping test 
 FLAG_SINGULAR = 1 << 10  # min_nu < SINGULAR_NU: a self contact whose geom axes (or centres) nearly meet
 FLAG_VERIFY_DIFF = 1 << 11  # -DDK_TAPE_VERIFY: L_H differs from a re-assembly at the final zones (expected only with REFACT)
 SINGULAR_NU = 5e-3  # m
-CON_NONE = 0xFFFF  # contact table entry past ncon
+PAIR_BITS = 16
+PAIR_MASK = (1 << PAIR_BITS) - 1
+PAIR_CAPACITY = 1 << PAIR_BITS
+SLOT_FIELD_CAPACITY = 1 << (32 - PAIR_BITS)
+SLOT_CAPACITY = 8  # current collision primitives emit slots 0 through 7
+FORMAT_MARKER = 0x4E540410  # NT, format 4: uint32 contacts, 8/10/6/8-bit header
+CON_NONE = 0xFFFFFFFF  # contact table entry past ncon
 
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
 _FIELDS = (
-    ("hdr", "OFF_HDR", 1),  # ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24
+    ("hdr", "OFF_HDR", 1),  # ncon[8] | nefc[10] << 8 | nlim[6] << 18 | niter[8] << 24
     ("flags", "OFF_FLAGS", 1),  # FLAG_*
     ("min_nu", "OFF_MIN_NU", 1),  # float: smallest centre / axis distance of a sphere or capsule self contact, else +inf
     ("reserved", "OFF_RESERVED", 1),
     ("clamp", "OFF_CLAMP", lambda nq, nv, ntri, nc: -(-nv // 32)),  # dof bits: actuator force at its limit
     ("zone", "OFF_ZONE", lambda nq, nv, ntri, nc: -(-step.NEFC // 32)),  # row bits: quadratic zone (row in the Hessian)
-    ("con", "OFF_CON", lambda nq, nv, ntri, nc: -(-nc // 2)),  # u16 per contact (row order): pair | slot << 9
+    ("con", "OFF_CON", lambda nq, nv, ntri, nc: nc),  # u32 per contact (row order): pair | slot << PAIR_BITS
     ("qpos", "OFF_QPOS", lambda nq, nv, ntri, nc: nq),  # substep input
     ("qvel", "OFF_QVEL", lambda nq, nv, ntri, nc: nv),
     ("qacc", "OFF_QACC", lambda nq, nv, ntri, nc: nv),  # final Newton acceleration a* (the warm start of the next one)
@@ -48,7 +54,7 @@ _FIELDS = (
 def _table(m, max_contacts=None):
     nc = step.maxcon(m) if max_contacts is None else step.validate_maxcon(max_contacts)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    assert nv <= 64 and m.npair <= 512 and nc <= 127 and step.NEFC <= 511, "field widths (clamp u64, pair 9 bits, ncon 7 / nefc 9 bits)"
+    assert nv <= 64 and m.npair <= PAIR_CAPACITY and nc <= 255 and step.NEFC <= 1023, "field widths (clamp u64, pair 16 bits, ncon 8 / nefc 10 bits)"
     out, off = [], 0
     for name, define, n in _FIELDS:
         if name is None:
@@ -61,7 +67,7 @@ def _table(m, max_contacts=None):
 
 
 def layout(m, max_contacts=None):
-    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 224, L_Q at 864, 1504 words)."""
+    """{name: (offset, length)} of a record in 32-bit words."""
     return {name: (off, n) for name, _, off, n in _table(m, max_contacts)[0]}
 
 
@@ -75,6 +81,8 @@ def header(m, max_contacts=None):
     tab, total = _table(m, max_contacts)
     lines = [f"#define REC_WORDS {total}  // tape record (tape.py): words per world and substep"]
     lines += [f"#define {define} {off}  // {name}, {n} words" for name, define, off, n in tab]
+    lines += [f"#define TAPE_PAIR_BITS {PAIR_BITS}", f"#define TAPE_PAIR_MASK {PAIR_MASK}u", f"#define TAPE_SLOT_CAPACITY {SLOT_CAPACITY}",
+              f"#define TAPE_FORMAT_MARKER {FORMAT_MARKER}u"]
     lines += [f"#define TAPE_REFACT {FLAG_REFACT}u", f"#define TAPE_NONCONV {FLAG_NONCONV}u",
               f"#define TAPE_SINGULAR {FLAG_SINGULAR}u", f"#define TAPE_VERIFY_DIFF {FLAG_VERIFY_DIFF}u",
               f"#define TAPE_SINGULAR_NU {SINGULAR_NU}f", f"#define TAPE_CON_NONE {CON_NONE}u"]
@@ -98,10 +106,12 @@ def decode(arr, m, max_contacts=None):
     nw = rec_words(m, max_contacts)
     assert a.shape[-1] == nw, (a.shape, nw)
     u = a.view(np.uint32)
+    if np.any(u[..., layout(m, max_contacts)["reserved"][0]] != FORMAT_MARKER):
+        raise ValueError("incompatible tape contact encoding")
     lay = layout(m, max_contacts)
     sl = lambda name: slice(lay[name][0], lay[name][0] + lay[name][1])  # noqa: E731
     hdr, flags = u[..., lay["hdr"][0]].astype(np.int64), u[..., lay["flags"][0]].astype(np.int64)
-    out = dict(ncon=hdr & 127, nefc=(hdr >> 7) & 511, nlim=(hdr >> 16) & 255, niter=hdr >> 24, flags=flags,
+    out = dict(ncon=hdr & 255, nefc=(hdr >> 8) & 1023, nlim=(hdr >> 18) & 63, niter=hdr >> 24, flags=flags,
                unsupported=flags & FLAG_UNSUPPORTED, refact=(flags & FLAG_REFACT) != 0,
                nonconv=(flags & FLAG_NONCONV) != 0, singular=(flags & FLAG_SINGULAR) != 0,
                verify_diff=(flags & FLAG_VERIFY_DIFF) != 0, min_nu=a[..., lay["min_nu"][0]])
@@ -113,9 +123,21 @@ def decode(arr, m, max_contacts=None):
     out["zone"] = ((zw[..., :, None] >> np.arange(32, dtype=np.uint64)) & np.uint64(1)).astype(bool).reshape(
         zw.shape[:-1] + (-1,))[..., :step.NEFC]
     nc = step.maxcon(m) if max_contacts is None else step.validate_maxcon(max_contacts)
-    e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
+    e = u[..., sl("con")].astype(np.int64)
     past = np.arange(nc) >= out["ncon"][..., None]
-    out["pair"], out["slot"] = np.where(past, -1, e & 511), np.where(past, -1, e >> 9)
+    out["pair"], out["slot"] = np.where(past, -1, e & PAIR_MASK), np.where(past, -1, e >> PAIR_BITS)
     for name in ("qpos", "qvel", "qacc", "qacc_adv", "L_H", "L_Q"):
         out[name] = a[..., sl(name)]
     return out
+
+
+def pack_contact(pair, slot):
+    """Pack one active contact. The all-ones entry remains reserved."""
+    import operator
+    pair, slot = operator.index(pair), operator.index(slot)
+    if not 0 <= pair < PAIR_CAPACITY or not 0 <= slot < SLOT_CAPACITY:
+        raise ValueError('contact pair or slot exceeds its field')
+    entry = int(pair) | int(slot) << PAIR_BITS
+    if entry == CON_NONE:
+        raise ValueError('contact collides with the reserved sentinel')
+    return entry

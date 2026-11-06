@@ -1,0 +1,432 @@
+"""Build a terrain model from a declared robot fixture and completed CoACD output.
+
+CPU construction and source-generation checks only. Physical contact and gradient
+qualification must run separately on explicitly provisioned compute.
+"""
+import argparse
+import importlib.metadata
+import json
+from pathlib import Path
+import os
+import sys
+import traceback
+
+sys.dont_write_bytecode = True
+
+import mujoco
+import numpy as np
+import trimesh
+import yaml
+from scipy.spatial import ConvexHull, cKDTree
+
+from capability_check import spec_from_model
+from nablaengine.g1_engine import kinematics
+from nablaengine.model import capability
+
+TRACKED_BODIES = (
+    "pelvis", "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link",
+    "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link", "torso_link",
+    "left_shoulder_roll_link", "left_elbow_link", "left_wrist_yaw_link",
+    "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link",
+)
+
+
+def verify_robot(fixture, model):
+    """Assert compiled body, joint, dof and actuator dynamics retain fixture values."""
+    if (fixture.nbody, fixture.njnt, fixture.nq, fixture.nv, fixture.nu) != (
+            model.nbody, model.njnt, model.nq, model.nv, model.nu):
+        raise ValueError("Terrain construction changed robot sizes")
+    fields = (
+        "body_parentid", "body_pos", "body_quat", "body_mass", "body_ipos",
+        "body_iquat", "body_inertia", "jnt_type", "jnt_bodyid", "jnt_qposadr",
+        "jnt_dofadr", "jnt_pos", "jnt_axis", "jnt_range", "jnt_limited",
+        "jnt_actfrclimited", "jnt_actfrcrange", "dof_armature", "dof_frictionloss",
+        "dof_damping", "actuator_trnid", "actuator_trntype", "actuator_gaintype",
+        "actuator_biastype", "actuator_gainprm", "actuator_biasprm", "actuator_gear",
+        "actuator_ctrlrange", "actuator_ctrllimited", "actuator_forcerange",
+        "actuator_forcelimited", "qpos0",
+    )
+    errors = {}
+    for name in fields:
+        before, after = np.asarray(getattr(fixture, name)), np.asarray(getattr(model, name))
+        error = float(np.max(np.abs(before.astype(float) - after.astype(float)), initial=0))
+        if error > 1e-12:
+            raise ValueError(f"Terrain construction changed {name}: {error}")
+        errors[name] = error
+    for kind, count in ((mujoco.mjtObj.mjOBJ_BODY, model.nbody),
+                        (mujoco.mjtObj.mjOBJ_JOINT, model.njnt),
+                        (mujoco.mjtObj.mjOBJ_ACTUATOR, model.nu)):
+        if [mujoco.mj_id2name(fixture, kind, i) for i in range(count)] != [
+                mujoco.mj_id2name(model, kind, i) for i in range(count)]:
+            raise ValueError("Terrain construction changed robot names")
+    for index in range(fixture.ngeom):
+        if fixture.geom_bodyid[index] == 0:
+            continue
+        target = model.geom(fixture.geom(index).name).id
+        for field in ("geom_type", "geom_bodyid", "geom_size", "geom_pos", "geom_quat",
+                      "geom_contype", "geom_conaffinity", "geom_condim", "geom_friction",
+                      "geom_solref", "geom_solimp", "geom_margin", "geom_gap", "geom_group"):
+            if not np.allclose(getattr(fixture, field)[index], getattr(model, field)[target], rtol=0, atol=1e-12):
+                raise ValueError(f"Terrain construction changed {fixture.geom(index).name} {field}")
+    for index in range(fixture.npair):
+        if any(fixture.geom_bodyid[g] == 0 for g in (fixture.pair_geom1[index], fixture.pair_geom2[index])):
+            continue
+        target = model.pair(fixture.pair(index).name).id
+        for field in ("pair_dim", "pair_friction", "pair_solref", "pair_solimp", "pair_margin", "pair_gap"):
+            if not np.allclose(getattr(fixture, field)[index], getattr(model, field)[target], rtol=0, atol=1e-12):
+                raise ValueError(f"Terrain construction changed self pair {fixture.pair(index).name} {field}")
+    return errors
+
+
+def add_robot_visuals(spec, fixture, path, artifact_id):
+    """Attach source group-2 triangle surfaces to the existing robot bodies.
+
+    Fixed source children are folded into their named target ancestor. Moving
+    source bodies require that same named target body. No collision pairs or
+    inertials are created by the visual import.
+    """
+    source = (mujoco.MjModel.from_binary_path(str(path)) if path.suffix == '.mjb'
+              else mujoco.MjModel.from_xml_path(str(path)))
+    data = mujoco.MjData(source)
+    mujoco.mj_kinematics(source, data)
+    target_names = {fixture.body(i).name for i in range(1, fixture.nbody)}
+    meshes = {}
+    evidence = []
+    for geom in range(source.ngeom):
+        if int(source.geom_group[geom]) != 2 or source.geom_bodyid[geom] == 0:
+            continue
+        if source.geom_type[geom] != mujoco.mjtGeom.mjGEOM_MESH:
+            raise ValueError('Selected source group-2 visual geometry must use triangle meshes')
+        owner = int(source.geom_bodyid[geom])
+        source_body = source.body(owner).name
+        while source.body(owner).name not in target_names:
+            if source.body_jntnum[owner] or owner == 0:
+                raise ValueError(f'Source visual body {source_body} has no fixed named target binding')
+            owner = int(source.body_parentid[owner])
+        target_body = source.body(owner).name
+        mesh = int(source.geom_dataid[geom])
+        start, count = int(source.mesh_vertadr[mesh]), int(source.mesh_vertnum[mesh])
+        vertices = np.asarray(source.mesh_vert[start:start+count], dtype=float)
+        if mesh not in meshes:
+            mesh_name = f'robot_visual_mesh_{mesh}'
+            face_start, face_count = int(source.mesh_faceadr[mesh]), int(source.mesh_facenum[mesh])
+            faces = source.mesh_face[face_start:face_start+face_count]
+            spec.add_mesh(name=mesh_name, uservert=vertices.ravel().tolist(), userface=faces.ravel().tolist())
+            meshes[mesh] = mesh_name
+        body_rotation = data.xmat[owner].reshape(3, 3)
+        geom_rotation = data.geom_xmat[geom].reshape(3, 3)
+        position = body_rotation.T @ (data.geom_xpos[geom] - data.xpos[owner])
+        rotation = body_rotation.T @ geom_rotation
+        quaternion = np.empty(4)
+        mujoco.mju_mat2Quat(quaternion, rotation.ravel())
+        name = f'robot_visual_geom_{geom}'
+        spec.body(target_body).add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_MESH,
+                                       meshname=meshes[mesh], pos=position, quat=quaternion,
+                                       contype=0, conaffinity=0, group=2, mass=0,
+                                       rgba=source.geom_rgba[geom])
+        evidence.append(dict(name=name, source_geom=geom, source_body=source_body, target_body=target_body,
+                             expected_body_vertices=vertices @ rotation.T + position))
+    if not evidence:
+        raise ValueError('The selected visual model contains no robot group-2 meshes')
+    return dict(artifact_id=artifact_id, source=str(path), geoms=len(evidence), meshes=len(meshes),
+                include_geom_groups=[0, 2], exclude_parent_body=False,
+                geometry='Source compiled triangle surfaces attached to named target body frames; fixed children folded into their named ancestor',
+                body_frame_equivalence='Import preserves local visual surfaces. Source and target physical kinematics require their independent motion/FK checks.'), evidence
+
+
+def verify_robot_visuals(model, data, evidence):
+    """Check the compiled visual surfaces in their declared owning body frame."""
+    result = []
+    for row in evidence:
+        geom = model.geom(row['name']).id
+        body = model.body(row['target_body']).id
+        mesh = model.geom_dataid[geom]
+        start, count = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+        world = model.mesh_vert[start:start+count] @ data.geom_xmat[geom].reshape(3, 3).T + data.geom_xpos[geom]
+        actual = (world - data.xpos[body]) @ data.xmat[body].reshape(3, 3)
+        expected = row['expected_body_vertices']
+        error = float(max(cKDTree(expected).query(actual)[0].max(), cKDTree(actual).query(expected)[0].max()))
+        if error > 2e-5:
+            raise ValueError(f'Compiled robot visual surface changed for {row["name"]}: {error}')
+        result.append(dict(name=row['name'], source_geom=row['source_geom'], source_body=row['source_body'],
+                           target_body=row['target_body'], body_vertex_max_error_m=error,
+                           vertices=int(count), faces=int(model.mesh_facenum[mesh])))
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--fixture-contract", type=Path, help="Contract of the source G1 model producer")
+    terrain_inputs = parser.add_mutually_exclusive_group(required=True)
+    terrain_inputs.add_argument("--coacd", type=Path)
+    terrain_inputs.add_argument("--terrain-set", type=Path, help="YAML with artifact_id and tiles containing terrain_index, coacd, terrain_artifact_id, translation_m")
+    parser.add_argument("--artifact-id", required=True)
+    parser.add_argument("--code-revision", required=True)
+    parser.add_argument("--terrain-artifact-id", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--visual-model", type=Path)
+    parser.add_argument("--visual-artifact-id")
+    args = parser.parse_args()
+    if bool(args.visual_model) != bool(args.visual_artifact_id):
+        parser.error("--visual-model and --visual-artifact-id must be supplied together")
+    if args.visual_model is not None:
+        args.visual_model = args.visual_model.resolve()
+    if args.fixture_contract is not None:
+        args.fixture_contract = args.fixture_contract.resolve()
+    args.fixture = args.fixture.resolve()
+    if args.coacd is not None:
+        args.coacd = args.coacd.resolve()
+    if args.terrain_set is not None:
+        args.terrain_set = args.terrain_set.resolve()
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=False)
+    status = dict(state="started", code_revision=args.code_revision,
+                  arguments={name: str(value) if isinstance(value, Path) else value
+                             for name, value in vars(args).items()})
+
+    def write_status():
+        (args.output / "execution.json").write_text(json.dumps(status, indent=2))
+
+    write_status()
+
+    def record_failure(kind, value, tb):
+        status.update(state="failed", failure_type=kind.__name__, failure=str(value),
+                      traceback="".join(traceback.format_exception(kind, value, tb)))
+        write_status()
+        sys.__excepthook__(kind, value, tb)
+
+    sys.excepthook = record_failure
+    # Resolve selected inputs first, then own incidental native logs in the new
+    # output root. In particular MuJoCo's default warning log uses the cwd.
+    os.chdir(args.output)
+    if args.terrain_set is None:
+        tiles = [dict(coacd=args.coacd, terrain_artifact_id=args.terrain_artifact_id, translation_m=[0., 0., 0.])]
+    else:
+        selected = yaml.safe_load(args.terrain_set.read_text())
+        if selected['artifact_id'] != args.terrain_artifact_id:
+            raise ValueError('Selected terrain-set identity differs from the declared physical terrain identity')
+        tiles = selected['tiles']
+        if not tiles or len({row['terrain_index'] for row in tiles}) != len(tiles):
+            raise ValueError('The terrain set requires distinct selected terrain IDs')
+    terrain_contracts = []
+    for tile in tiles:
+        directory = Path(tile['coacd'])
+        if not directory.is_absolute() and args.terrain_set is not None:
+            directory = args.terrain_set.parent / directory
+        tile['coacd'] = directory.resolve()
+        translation = np.asarray(tile['translation_m'], dtype=float)
+        if translation.shape != (3,) or not np.isfinite(translation).all():
+            raise ValueError('Each terrain tile requires a finite XYZ translation')
+        execution = json.loads((tile['coacd'] / 'execution.json').read_text())
+        result = json.loads((tile['coacd'] / 'result.json').read_text())
+        if execution['state'] != 'completed' or execution.get('synthetic_hulls_only'):
+            raise ValueError('Scene requires completed, real CoACD decompositions')
+        if execution['artifact_id'] != tile['terrain_artifact_id'] or result['artifact_id'] != tile['terrain_artifact_id']:
+            raise ValueError('Selected CoACD artifact identity mismatch')
+        if execution['frame'] != result['frame']:
+            raise ValueError('CoACD frame records disagree')
+        if result['frame']['input_to_world_translation_m'] != [15., 8., 0.]:
+            raise ValueError('Expected declared upstream 30 by 16 metre input frame')
+        if args.terrain_set is not None and tile['terrain_index'] != result['terrain_index']:
+            raise ValueError('Selected tile and CoACD terrain IDs differ')
+        if not result['hulls']:
+            raise ValueError('Each selected terrain requires a nonempty decomposition')
+        tile['result'] = result
+        tile['translation_m'] = translation.tolist()
+        terrain_contracts.append(dict(
+            terrain_index=result['terrain_index'], terrain_file=result['terrain_file'],
+            terrain_artifact_id=tile['terrain_artifact_id'], coacd=str(tile['coacd']),
+            translation_m=translation.tolist(),
+            input_to_world_translation_m=(np.array([15., 8., 0.]) + translation).tolist(),
+            coacd_auto_align_z_m=result['auto_align_z'], hulls=len(result['hulls']), hull_geom_names=[]))
+    if args.terrain_set is not None:
+        resolved = dict(artifact_id=args.terrain_artifact_id, tiles=[
+            dict(terrain_index=row['terrain_index'], coacd=row['coacd'],
+                 terrain_artifact_id=row['terrain_artifact_id'], translation_m=row['translation_m'])
+            for row in terrain_contracts])
+        (args.output / 'terrain_set.yaml').write_text(yaml.safe_dump(resolved, sort_keys=False))
+    fixture = mujoco.MjModel.from_binary_path(str(args.fixture))
+    if fixture.jnt_type[0] != mujoco.mjtJoint.mjJNT_FREE:
+        raise ValueError("Fixture must have a free root")
+    fixture_contract = None
+    if args.fixture_contract is not None:
+        fixture_contract = json.loads(args.fixture_contract.read_text())
+        if fixture_contract['format'] != 'instinct-g1-model-v1':
+            raise ValueError('Expected the declared source G1 model contract')
+        if args.visual_model is not None:
+            raise ValueError('The source G1 model already owns its visual geometry')
+        from prepare_instinct_g1_model import build_source_model
+        spec, source, reconstructed, actuators, collision, selected_pairs, foot_names, material = build_source_model(
+            Path(fixture_contract['upstream']), fixture_contract['resolved_configuration'])
+        verify_robot(fixture, reconstructed)
+        if fixture.body(1).name != fixture_contract['free_root_body']:
+            raise ValueError('Constructed free root differs from the selected model contract')
+    else:
+        spec = spec_from_model(fixture)
+    # Ray selection consumes these original groups independently of contacts.
+    for geom in range(fixture.ngeom):
+        spec.geom(fixture.geom(geom).name).group = int(fixture.geom_group[geom])
+    visual_contract, visual_evidence = None, []
+    if args.visual_model is not None:
+        visual_contract, visual_evidence = add_robot_visuals(
+            spec, fixture, args.visual_model, args.visual_artifact_id)
+    # motion_matched_terrain imports its STL floor and creates no additional plane.
+    # Retain the fixture self pairs. Replace its plane pairs with one explicit
+    # pair per declared robot collision geom per hull, retaining pair parameters.
+    planes = [i for i in range(fixture.ngeom) if fixture.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE]
+    if len(planes) != 1 or fixture.geom_bodyid[planes[0]] != 0:
+        raise ValueError("Expected exactly one fixture world plane")
+    floor = planes[0]
+    floor_pairs = {}
+    for pair in list(spec.pairs):
+        if fixture.geom(floor).name in (pair.geomname1, pair.geomname2):
+            robot = pair.geomname2 if pair.geomname1 == fixture.geom(floor).name else pair.geomname1
+            floor_pairs[robot] = pair
+    physical_geoms = {int(g) for g in np.concatenate((fixture.pair_geom1, fixture.pair_geom2))
+                      if fixture.geom_bodyid[g] != 0}
+    robots = [fixture.geom(i).name for i in sorted(physical_geoms)]
+    if not robots or set(floor_pairs) != set(robots):
+        raise ValueError("Every robot collision geom must have a fixture plane-pair template")
+    foot_robots = {name for name, pair in floor_pairs.items()
+                   if '_foot' in pair.name and pair.name.endswith('_floor')}
+    # Copy values before deleting owned MjSpec objects.
+    parameters = {name: dict(condim=int(p.condim), friction=np.array(p.friction).copy(),
+                            solref=np.array(p.solref).copy(), solimp=np.array(p.solimp).copy(),
+                            margin=float(p.margin), gap=float(p.gap)) for name, p in floor_pairs.items()}
+    for pair in floor_pairs.values():
+        spec.delete(pair)
+    spec.delete(spec.geom(fixture.geom(floor).name))
+    self_pairs = len(list(spec.pairs))
+    hull_names = []
+    expected_vertices = []
+    hull_face_counts = []
+    for tile, terrain in zip(tiles, terrain_contracts):
+        result = tile["result"]
+        for index, record in enumerate(result["hulls"]):
+            hull = trimesh.load(tile["coacd"] / f"hull_{index}.ply", process=False)
+            vertices, faces = np.asarray(hull.vertices), np.asarray(hull.faces)
+            if vertices.shape != (record["vertices"], 3) or faces.shape != (record["faces"], 3):
+                raise ValueError(f"Hull {index} differs from its completed decomposition record")
+            if not np.isfinite(vertices).all() or not hull.is_watertight:
+                raise ValueError(f"Hull {index} is not a finite closed mesh")
+            # MuJoCo collides against the convex hull. Re-triangulate the stored
+            # float32 vertices so near-coplanar CoACD faces cannot encode tiny dents.
+            convex = ConvexHull(vertices)
+            faces = convex.simplices.copy()
+            triangles = vertices[faces]
+            normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+            inward = np.sum(normals * (triangles[:, 0] - vertices.mean(0)), axis=1) < 0
+            faces[inward] = faces[inward][:, [0, 2, 1]]
+            hull_face_counts.append(dict(terrain_index=terrain["terrain_index"], hull_index=index,
+                                         coacd_faces=record["faces"], convex_faces=len(faces)))
+            name = f"terrain_{terrain['terrain_index']}_hull_{index}" if args.terrain_set else f"terrain_hull_{index}"
+            hull_names.append(name)
+            terrain["hull_geom_names"].append(name)
+            expected_vertices.append(vertices + tile["translation_m"])
+            spec.add_mesh(name=name, uservert=vertices.ravel().tolist(), userface=faces.ravel().tolist())
+            spec.worldbody.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_MESH,
+                                    meshname=name, pos=tile["translation_m"], contype=0, conaffinity=0, group=0, mass=0)
+            for robot in robots:
+                # Foot names preserve the environment's established foot-pair selector.
+                suffix = "floor" if robot in foot_robots else "terrain"
+                prefix = f'{robot}__foot' if robot in foot_robots and '_foot' not in robot else robot
+                pair = spec.add_pair(name=f"{prefix}__{name}_{suffix}" if args.terrain_set else f"{prefix}__hull_{index}_{suffix}",
+                                     geomname1=robot, geomname2=name)
+                for field, value in parameters[robot].items():
+                    setattr(pair, field, value)
+    if not hull_names:
+        raise ValueError("Empty terrain decomposition")
+    model = spec.compile()
+    # Preserve the exact constructed geometry if a later numerical source gate
+    # rejects it. The runnable model.mjb and contract are written after checks.
+    mujoco.mj_saveModel(model, str(args.output / 'constructed_model.mjb'))
+    (args.output / 'construction.json').write_text(json.dumps(dict(
+        format='nablaengine-terrain-construction-v1', artifact_id=args.artifact_id,
+        code_revision=args.code_revision, terrain_artifact_id=args.terrain_artifact_id,
+        terrains=terrain_contracts,
+        counts=dict(hulls=len(hull_names), geoms=model.ngeom, pairs=model.npair)), indent=2))
+    robot_error = verify_robot(fixture, model)
+    for terrain in terrain_contracts:
+        terrain["hull_geom_ids"] = [model.geom(name).id for name in terrain["hull_geom_names"]]
+        terrain["terrain_pairs"] = len(robots) * terrain["hulls"]
+    foot_pairs = [i for i in range(model.npair) if "_foot" in model.pair(i).name and model.pair(i).name.endswith("_floor")]
+    if model.npair != self_pairs + len(robots) * len(hull_names):
+        raise ValueError("Compiled terrain pair count mismatch")
+    for name in TRACKED_BODIES:
+        model.body(name)
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    if visual_contract is not None:
+        visual_contract["bindings"] = verify_robot_visuals(model, data, visual_evidence)
+    frame_errors = []
+    for name, expected in zip(hull_names, expected_vertices):
+        geom = model.geom(name).id
+        mesh = model.geom_dataid[geom]
+        start, count = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+        actual = data.geom_xpos[geom] + model.mesh_vert[start:start + count] @ data.geom_xmat[geom].reshape(3, 3).T
+        error = float(max(np.linalg.norm(actual[:, None] - expected[None, :], axis=2).min(0).max(),
+                          np.linalg.norm(actual[:, None] - expected[None, :], axis=2).min(1).max()))
+        if error > 2e-5:
+            raise ValueError(f"Compiled hull world vertices changed: {name}, {error}")
+        frame_errors.append(error)
+    reports = {scope: capability.check(model, np.asarray(foot_pairs), scope=scope)
+               for scope in ("forward", "engine", "kinematics")}
+    findings = {scope: [dict(code=f.code, status=f.status, what=f.what, value=f.value)
+                        for f in report.findings if f.status != "ok"] for scope, report in reports.items()}
+    (args.output / "capability.json").write_text(json.dumps(findings, indent=2))
+    if any(report.errors() for report in reports.values()):
+        raise ValueError(f"Terrain unsupported, {model.npair} explicit pairs. See capability.json")
+    kinematics.check_model(model)
+    from nablaengine.g1_engine import step, adjoint
+    from nablaengine.model.convex import pack_static_convex_hulls
+    packed_hulls = pack_static_convex_hulls(model, step.collision_geoms(model))
+    forward_source = step.step_header(model, convex_hulls=packed_hulls)
+    adjoint_source = adjoint.cuda_source(model, convex_hulls=packed_hulls)
+    # The actual generated source path is checked by the owning engine API.
+    adjoint.engine_constants(model, np.asarray(foot_pairs), convex_hulls=packed_hulls)
+    if args.terrain_set is None:
+        frame = dict(**tiles[0]['result']['frame'], coacd_auto_align_z_m=tiles[0]['result']['auto_align_z'],
+                     hull_files_already_aligned=True)
+    else:
+        frame = dict(coacd_input_to_tile_translation_m=[15., 8., 0.],
+                     terrain_translations_m={str(row['terrain_index']): row['translation_m'] for row in terrain_contracts},
+                     coacd_z_alignment_applies_to='collision hulls only', hull_files_already_aligned=True)
+    contract = dict(
+        artifact_id=args.artifact_id, terrain_artifact_id=args.terrain_artifact_id,
+        fixture=str(args.fixture), fixture_artifact_id=fixture_contract['artifact_id'] if fixture_contract else None,
+        free_root_body=fixture.body(1).name, source_action=fixture_contract['source_action'] if fixture_contract else None,
+        coacd=str(args.coacd) if args.coacd is not None else None,
+        terrain_file=terrain_contracts[0]["terrain_file"] if len(tiles) == 1 else None,
+        terrain_index=terrain_contracts[0]["terrain_index"] if len(tiles) == 1 else None, terrains=terrain_contracts, actuator_joint_names=[model.joint(model.actuator_trnid[i, 0]).name for i in range(model.nu)],
+        tracked_body_names=list(TRACKED_BODIES), foot_pairs=foot_pairs,
+        versions={name: importlib.metadata.version(name) for name in ("mujoco", "numpy", "trimesh", "scipy")},
+        engine_revision=args.code_revision,
+        frame=frame,
+        counts=dict(terrains=len(tiles), collision_geoms=len(step.collision_geoms(model)), robot_geoms=len(robots), hull_geoms=len(hull_names), geoms=model.ngeom, robot_visual_geoms=int(np.count_nonzero((model.geom_bodyid != 0) & (model.geom_group == 2))),
+                    self_pairs=self_pairs, terrain_pairs=len(robots) * len(hull_names), pairs=model.npair),
+        terrain_camera_surface=dict(collision_coacd_visualize_collision_hulls=True,
+                                    skip_source_mesh_import=True, collision_hull_geom_group=0,
+                                    include_geom_groups=[0, 2], exclude_parent_body=False,
+                                    source="pinned PerceptiveShadowingSceneCfg and motion_matched_terrain"),
+        hull_surface="ConvexHull triangulation of stored CoACD vertices, with outward winding. All vertices retained.",
+        hull_face_counts=hull_face_counts,
+        robot_visuals=visual_contract if fixture_contract is None else dict(
+            artifact_id=fixture_contract["artifact_id"], geometry=fixture_contract["geometry"],
+            include_geom_groups=[0, 2], exclude_parent_body=False),
+        robot_collision_geom_groups={fixture.geom(i).name: int(fixture.geom_group[i])
+                                     for i in range(fixture.ngeom) if fixture.geom_bodyid[i] != 0},
+        floor="Fixture plane and its pairs removed. Upstream motion_matched_terrain uses STL floor through CoACD hulls. Robot self pairs retained.",
+        verification=dict(robot_field_max_errors=robot_error, hull_world_vertex_max_errors_m=frame_errors,
+                          capability_scopes=list(reports), generated_forward_header_bytes=len(forward_source),
+                          generated_adjoint_source_bytes=len(adjoint_source), adjoint_constants_created=True, physics_qualified=False),
+    )
+    mujoco.mj_saveModel(model, str(args.output / "model.mjb"))
+    (args.output / "contract.json").write_text(json.dumps(contract, indent=2))
+    status.update(state="completed", counts=contract["counts"])
+    write_status()
+    print(json.dumps(dict(output=str(args.output), counts=contract["counts"])))
+
+
+if __name__ == "__main__":
+    main()

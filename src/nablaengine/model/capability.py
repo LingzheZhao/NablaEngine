@@ -46,11 +46,11 @@ ALLOW_VAR = "DK_ALLOW_UNSUPPORTED"
 COM_BODY = "torso_link"  # the body that takes the per-world COM offset (source.constants, jax_ffi.init)
 SCOPES = {"forward": ("forward",), "engine": ("forward", "adjoint"), "kinematics": ("kinematics",)}
 J, G, T = mujoco.mjtJoint, mujoco.mjtGeom, mujoco.mjtTrn
-GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSULE): 2, int(G.mjGEOM_BOX): 3}
-FORWARD_TYPES = {0, 1, 2, 3}  # step.GEOM_TYPE: plane, sphere, capsule, box
+GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSULE): 2, int(G.mjGEOM_BOX): 3, int(G.mjGEOM_MESH): 4}
+FORWARD_TYPES = {0, 1, 2, 3, 4}  # step.GEOM_TYPE: plane, sphere, capsule, box
 ADJOINT_TYPES = {0, 1, 2}  # adjoint_contact.check_model: no boxes
-DISPATCHED = {(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2), (2, 3), (3, 3)}  # step.py collide_pair's combinations
-CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (2, 3): 2, (3, 3): 8}
+DISPATCHED = {(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2), (1, 3), (2, 3), (3, 3), (1, 4), (2, 4)}  # step.py collide_pair's combinations
+CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (1, 3): 1, (2, 3): 2, (3, 3): 8, (1, 4): 1, (2, 4): 2}
 D, E = mujoco.mjtDisableBit, mujoco.mjtEnableBit
 # disable flags that cannot change the engine's results: sensors (the engine computes none), Euler damping (Euler is
 # rejected), auto reset, midphase / island bookkeeping of MuJoCo's own collision and solver paths, the parent filter
@@ -62,7 +62,7 @@ DISABLE_OK_NO_BOX = (D.mjDSBL_NATIVECCD, D.mjDSBL_MULTICCD)
 # disable flags of physics a supported model does not have, so they change nothing: springs and dampers (every
 # stiffness and damping field must be at its default 0: H22 and the default-kind fields; no tendons or flexes: H25),
 # equality constraints (neq 0: H25); frictionloss and joint limits only where no dof has frictionloss and no joint a limit
-DISABLE_NOOP = (D.mjDSBL_SPRING, D.mjDSBL_DAMPER, D.mjDSBL_EQUALITY)
+DISABLE_NOOP = (D.mjDSBL_SPRING, D.mjDSBL_EQUALITY)
 ENABLE_OK = (E.mjENBL_ENERGY, E.mjENBL_FWDINV, E.mjENBL_INVDISCRETE)  # diagnostics / inverse dynamics only
 STATUSES = ("error", "warn", "info", "ok")
 CTRLSPEC_OK = (0, int(mujoco.mjtCtrlInput.mjINPUT_POS))  # a fixed gain's input: the type default, or a position
@@ -199,6 +199,23 @@ def _name(m, objtype, i):
     return mujoco.mj_id2name(m, objtype, int(i)) or str(int(i))
 
 
+def unsupported_adjoint_box_pairs(m):
+    """Only sphere/capsule against a world-static box has a box VJP."""
+    invalid = []
+    for pair in range(m.npair):
+        geoms = [int(m.pair_geom1[pair]), int(m.pair_geom2[pair])]
+        boxes = [g for g in geoms if int(m.geom_type[g]) in (int(G.mjGEOM_BOX),int(G.mjGEOM_MESH))]
+        if not boxes:
+            continue
+        if len(boxes) != 1 or int(m.geom_bodyid[boxes[0]]) != 0:
+            invalid.append(pair)
+            continue
+        other = geoms[1] if geoms[0] == boxes[0] else geoms[0]
+        if int(m.geom_type[other]) not in (int(G.mjGEOM_SPHERE), int(G.mjGEOM_CAPSULE)):
+            invalid.append(pair)
+    return invalid
+
+
 def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     """The CapabilityReport of model m for a build scope ("forward", "engine", "kinematics"; module docstring).
     foot_pairs: the contact pairs that take the per-world friction (jax_ffi's foot_pairs; None: not checked, and U4
@@ -295,10 +312,10 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     cg = collision_geoms(m)
     types = {GEOM_CODE.get(int(m.geom_type[g]), -1) for g in cg}
     tnames = sorted({mujoco.mjtGeom(int(m.geom_type[g])).name for g in cg})
-    add("H14a", types <= FORWARD_TYPES, "error", "contact pair geoms are planes, spheres, capsules or boxes", tnames)
+    add("H14a", types <= FORWARD_TYPES and not [p for p in unsupported_adjoint_box_pairs(m) if any(m.geom_type[g] == G.mjGEOM_MESH for g in (m.pair_geom1[p],m.pair_geom2[p]))], "error", "supported primitive contacts and world-static convex meshes", tnames)
     planes_off_world = [g for g in cg if m.geom_type[g] == G.mjGEOM_PLANE and m.geom_bodyid[g] != 0]
-    add("H14b", types <= ADJOINT_TYPES and not planes_off_world, "error", "contact pair geoms are planes (on the world "
-        "body), spheres or capsules in the adjoint", dict(types=tnames, planes_off_world=planes_off_world[:4]),
+    add("H14b", types <= (ADJOINT_TYPES | {3,4}) and not planes_off_world and not unsupported_adjoint_box_pairs(m), "error", "contact pair geoms are planes (on the world "
+        "body), spheres/capsules, or world-static boxes paired only with spheres/capsules in the adjoint", dict(types=tnames, planes_off_world=planes_off_world[:4]),
         ("adjoint",))
     combos = sorted({_pair_codes(m, p) for p in range(m.npair)} - DISPATCHED)
     add("H14c", not combos, "error", "every pair's type combination is one the forward collides (not plane-plane, "
@@ -337,10 +354,12 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H20", bool(uni and not m.jnt_margin.any() and dof_uni and not lim_free), "error",
         "one solref / solimp for every joint limit and every dof, jnt_margin 0, only hinge limits",
         dict(limited_non_hinge=lim_free[:4]))
-    add("H21", not (m.dof_frictionloss > 0).any(), "error", "no frictionloss in the adjoint (the forward has it)",
+    add("H21", bool(np.all(m.dof_frictionloss >= 0) and np.all(np.isfinite(m.dof_frictionloss))), "error", "finite nonnegative dof frictionloss",
         int((m.dof_frictionloss > 0).sum()), ("adjoint",))
 
     # ---- passive forces, integrator, solver, options
+    add("H22d", bool(np.all(m.dof_damping >= 0) and np.all(np.isfinite(m.dof_damping))), "error",
+        "finite nonnegative linear passive damping", m.dof_damping.tolist())
     medium = dict(density=float(m.opt.density), viscosity=float(m.opt.viscosity), wind=[float(x) for x in m.opt.wind])
     add("H22", m.opt.density == 0 and m.opt.viscosity == 0 and not np.any(m.opt.wind), "error",
         "no fluid forces (opt density, viscosity, wind 0)", medium)
@@ -349,7 +368,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H24a", m.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON, "error", "Newton solver",
         mujoco.mjtSolver(int(m.opt.solver)).name)
     has_box = any(m.geom_type[g] == G.mjGEOM_BOX for g in cg)
-    noop = DISABLE_NOOP + ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
+    noop = DISABLE_NOOP + ((D.mjDSBL_DAMPER,) if not np.any(m.dof_damping) else ()) + ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
         (D.mjDSBL_LIMIT,) if not np.asarray(m.jnt_limited).any() else ())
     dis = int(m.opt.disableflags) & ~_mask(DISABLE_OK + noop + (() if has_box else DISABLE_OK_NO_BOX))
     en = int(m.opt.enableflags) & ~_mask(ENABLE_OK)
@@ -367,10 +386,13 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     kdof = step.max_support(m) if m.npair and gen else 0
     maxcon = step.maxcon(m)
     npset = len(step.pair_param_sets(m)[0])
-    add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and 1 <= maxcon <= step.MAX_CONTACTS and m.npair < 65536, "error",
-        f"<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, 1 <= MAXCON <= {step.MAX_CONTACTS}",
+    add("H26a", len(cg) <= step.GEOM_CAPACITY and npset <= step.PSET_CAPACITY and kdof <= 32
+        and 1 <= maxcon <= step.MAX_CONTACTS and m.npair <= 65536, "error",
+        f"<= {step.GEOM_CAPACITY} collision geoms, <= {step.PSET_CAPACITY} parameter sets, "
+        f"KDOF <= 32, 1 <= MAXCON <= {step.MAX_CONTACTS}",
         dict(ngeomc=len(cg), param_sets=npset, kdof=kdof, maxcon=maxcon))
-    add("H26b", m.npair <= 512, "error", "at most 512 contact pairs (the tape's 9-bit pair index)", int(m.npair),
+    from nablaengine.g1_engine.tape import PAIR_CAPACITY
+    add("H26b", m.npair <= PAIR_CAPACITY, "error", f"at most {PAIR_CAPACITY} contact pairs (the tape's 16-bit pair index)", int(m.npair),
         ("adjoint",))
     if foot_pairs is not None:
         fps = [int(p) for p in np.asarray(foot_pairs).ravel()]

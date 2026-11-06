@@ -29,7 +29,7 @@ python -m nablaengine.torch_ffi build                      # the first GPU's arc
 python -m nablaengine.torch_ffi build --arch sm_90 --arch sm_120   # or named ones (no GPU needed; nvcc must support them: sm_120 needs CUDA 12.8)
 ```
 
-This needs mujoco 3.17 and nvcc (a CUDA 12.x toolkit) and writes `libdk_g1_torch_<arch>_<key>.so` (the CUDA runtime
+This needs mujoco 3.17 and nvcc (a CUDA 12.x toolkit) and writes `libdk_g1_torch_v5_<arch>_<key>.so` (the CUDA runtime
 linked statically; the units of the JAX library without its XLA FFI unit, so the kernels are the same), the packed
 model constants (`.npy`) and the model facts (`.json`), and makes it the architecture's current artifact. A process
 that only runs the interface needs PyTorch, NumPy and the NVIDIA driver: `init()` loads the artifact with ctypes and
@@ -37,6 +37,10 @@ imports no JAX and no mujoco and calls no nvcc (an artifact built elsewhere: cop
 `DK_TORCH_ARTIFACT` to its `.json`). The artifact records a hash of the package sources it was generated from; after
 an update of the package `init()` rebuilds it where mujoco and nvcc are available and refuses it otherwise. Without
 any artifact, `init()` builds one first.
+
+The current artifact version is 5. Its metadata records physical tape encoding 4 and the qpos/qvel offsets used
+by `read_substep_inputs`. The library, constants and metadata share the versioned cache stem
+`libdk_g1_torch_v5_<arch>_<key>`. `init()` rejects earlier artifact versions.
 
 On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUDA 12.6 wheels
 (`--index-url https://download.pytorch.org/whl/cu126`); the CUDA 12.8 and 12.9 wheels start at sm_75.
@@ -54,6 +58,7 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 | `diagnostics(device=None)`, `read_diagnostics(device=None, reset=True)` | `diagnostics`, `read_diagnostics` | the counters of `jax_ffi.DIAG`, kept per device (below) |
 | `set_diagnostics(enabled)` | | the counters on (default) or off; returns the previous setting |
 | `tape_bytes(nworld, substeps=4, steps=1)` | `tape_bytes` | |
+| `read_substep_inputs(tape, substeps=4)` | | read-only qpos/qvel views shaped `(B, substeps, nq/nv)` at each substep input, using the loaded artifact's layout |
 
 Every tensor is float32, contiguous and on one CUDA device, with the worlds as the leading dimension; another dtype,
 device, layout or shape raises `TypeError` (nothing is cast or copied). Every call runs on PyTorch's current CUDA
@@ -62,7 +67,7 @@ stream of the inputs' device, with that device made current for the call.
 ## Rollouts and memory
 
 A rollout is a Python loop over `step`. Each differentiated step keeps its tape until the backward:
-`tape_bytes(4096) = 98.6 MB` per control step at 4096 worlds (24.1 kB per world), 6.3 GB for 64 steps. `torch.utils.checkpoint` can drop
+`tape_bytes(4096) = 104.9 MB` per control step at 4096 worlds (25.6 kB per world), 6.7 GB for 64 steps. `torch.utils.checkpoint` can drop
 the tapes and rerun the steps in the backward: the forward is deterministic, so a recomputed tape is bitwise the first
 one.
 
@@ -76,6 +81,68 @@ calls are `torch.library` custom ops (`nablaengine::forward`, `nablaengine::back
 opaque nodes without graph breaks. In eager mode the same functions are called directly, without the custom ops'
 dispatch.
 
+## Depth rays bound to the model
+
+`nablaengine.depth_geometry.DepthGeometry` packs the loaded model's visible geometry once. The CUDA backend
+builds a triangle BVH for each compiled mesh and traces first-hit rays against mesh triangles, spheres, capsules,
+boxes and planes. Each call uses the supplied body positions and WXYZ quaternions, including robot self occlusion.
+Mesh vertices retain MuJoCo's compiled geom frame and use `geom_pos` and `geom_quat` once. Geometry groups and
+transparent geoms are selected at construction. The source camera uses groups 0 and 2, with CoACD terrain hulls
+in group 0 and robot visual meshes in group 2.
+
+```python
+from nablaengine.depth_geometry import DepthGeometry
+
+camera_geometry = DepthGeometry.from_model(model, device="cuda", groups=(0, 2))
+ranges, geom_ids = camera_geometry.raycast(
+    body_positions, body_quaternions, ray_origins, unit_ray_directions,
+    max_distance=1e6, min_distance=.05, max_hops=24,
+)
+```
+
+Body tensors have shapes `[B, nbody, 3]` and `[B, nbody, 4]`. World-space ray tensors both have shape `[B, pixels, 3]`.
+CUDA inputs are float32 on the construction device. Ranges are metres along each unit ray. Misses return
+`max_distance` with geom ID -1. Hits before `min_distance` advance the ray by the hit range plus `1e-5` metres and
+continue, up to `max_hops` skipped surfaces. Image-plane depth is the range multiplied by the unit ray's camera
+forward component. The source consumer applies the 27x48 camera intrinsics, torso installation pose, depth
+normalization, crop and resize.
+
+Ray observations use `torch.no_grad()`. A trainable image encoder can consume these observations with its own
+parameter gradients. CUDA construction compiles its library into a fresh `depth-rays-*` directory under
+`DK_CACHE_DIR`, or a system temporary directory when that variable is unset. Construct before tracing or capturing.
+Calls allocate through Torch and launch on the current CUDA stream. `torch.compile` uses an opaque `torch.library`
+operation with a fake implementation. Direct CUDA Graph capture and compiled graph replay are checked by
+`scripts/check_depth_geometry.py --check-graphs`. Select `backend="torch"` explicitly at construction for the
+verification implementation.
+
+### Fixed-hit pose gradients
+
+Call `camera_geometry.raycast_with_pose_gradients(...)` with the same tensor inputs and ray-range keywords
+when observation derivatives are required. This opt-in method requires the native CUDA backend and visible
+mesh/plane geometry. The default `raycast` method keeps its stop-gradient behavior. Geometry construction and
+its GPU triangle storage are shared by both methods.
+
+The primary traversal records the accepted triangle alongside its range and model geom ID, including the
+surface reached after near-hit skipping. Range arithmetic and candidate order match the original no-gradient
+kernel. Torch differentiates that recorded plane against the original world ray. Camera ray origins/directions
+and dynamic body positions/WXYZ quaternions receive gradients. World body zero and packed model geometry stay fixed. Physical
+quaternion and unit-ray perturbations use their normalized tangents.
+
+Misses and ranges beyond `max_distance` have zero derivatives. Clipped optical-depth derivatives follow the
+consumer's clamp. At face/near/far switches the selected plane supplies a one-sided derivative. The derivative
+at a zero or forward-degenerate plane denominator is defined as zero. An accepted hit without a recorded
+surface raises an asynchronous device assertion. The method preserves fixed-shape Torch composition for
+full-graph compilation and CUDA Graph capture. CUDA surface-query libraries use ABI version 3.
+
+`scripts/check_depth_pose_gradients.py --cpu-math-only` checks the runtime plane formula with generated
+independent geometry. Its CUDA mode additionally consumes a model, matching states and `rays.npz` written by
+`check_depth_geometry.py`, checking source-camera finite differences, forward bits and captured derivatives.
+Add `--packet` to replay a packet from `diagnose_depth_surface_selection.py`. The replay explicitly loads
+its captured packing into a separate CUDA owner, after checking model bindings, conservative BVH bounds and
+exact ordered-triangle multisets per mesh. This retains the packet's triangle IDs when equal-centroid BVH
+partition ties produce different triangle ordering on another host. Range bits, geom IDs and triangle IDs are
+compared within the captured owner. Current-scene camera checks keep their own model packing.
+
 ## Diagnostics
 
 Every forward and backward adds its counts (worlds at the solver's iteration limit, tape flags, rows with non-finite
@@ -83,7 +150,7 @@ gradients or cotangents, replay mismatches; `jax_ffi.DIAG`) to an int64 tensor o
 only. `diagnostics()` returns that tensor without reading it; `read_diagnostics()` copies it to the host (a
 synchronization) and by default resets it. The backward's `info` carries the same per-world bits as `jax_ffi.backward`.
 
-Contacts or constraint rows beyond a world's capacity (96 contacts, 416 rows) are dropped and flagged as in the JAX
+Contacts or constraint rows beyond a world's default capacity (128 contacts, 576 rows) are dropped and flagged as in the JAX
 interface (`docs/api.md`, Diagnostics, Capacity): `info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS` of `forward()`, the
 counters `fwd_contact_overflow_worlds` / `fwd_row_overflow_worlds`, and with `set_overflow_warnings(True)` (or
 `DK_OVERFLOW_WARN=1`; off by default) a `RuntimeWarning` from `read_diagnostics()` and once more at exit for counts

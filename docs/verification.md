@@ -119,6 +119,149 @@ own codes by `capability.require` and by `jax_ffi.init(model=...)`, before anyth
 - The benchmark harness (`benchmarks/README.md`) scores the forward and the gradients of every engine against the
   same truth files: `docs/results/paper_accuracy_heldout_v100.md`.
 
+## Terrain contact checks
+
+These checks use generated inputs and write their reports and compiled libraries to new directories outside the
+checkout. They do not use the benchmark corpora as pass inputs. The static-box implementation admits explicit
+sphere/capsule pairs only when the box belongs to the world body. Moving boxes, plane–box and box–box adjoints,
+and heightfields remain outside that static-box capability. Static convex mesh contacts have their own checks below. The box primitive differentiates the selected continuous
+witness parameters as well as distance, position and frame; feature boundaries are not smooth derivatives.
+
+`scripts/check_box_contact_gradients.py` declares forward and gradient tolerances before execution. On an RTX 3090,
+Python 3.12.15, NumPy 2.5.1, MuJoCo 3.17.0 and CUDA 12.9.86, all 16 smooth conditions passed, including rotated boxes,
+inside spheres and two capsule contact slots. All 13 output basis cotangents were compared in six robot-pose
+directions with two-step float64 finite differences. The maximum absolute gradient difference was 2.10e-5.
+Four non-smooth boundaries were retained without a gradient pass decision. The reference shares the capsule
+forward formulas, so this result alone does not establish independent collision-model equivalence. The production
+sphere wrapper and namespace-isolated implementation were rechecked at
+[this revision](https://github.com/LingzheZhao/NablaEngine/tree/2cd042cc78af975f6c2b36f3e981304e4c413a6d).
+
+`scripts/check_box_step_gradients.py` uses the G1 fixture with an in-memory static box whose top is at zero, two
+generated initial contact states, one/four controls, four substeps per control and 50 Newton iterations. It checks
+the compiled box's derived geometry fields and realized pose, explicit contact support, tape/no-tape equality,
+diagnostics and MuJoCo float64 forward results. At
+[the checked revision](https://github.com/LingzheZhao/NablaEngine/tree/bfde8aae4f35874d99ff196e07cdc16eea8afb89),
+all four conditions passed those forward/contact checks, with no overflow, nonfinite or replay-mismatch counters.
+The full predeclared qualification passed **one of four windows**: 143/144 directional-gradient comparisons and
+138/144 finite-difference stability checks passed. All six stability failures concerned the same initial-position
+direction; these failures remain part of the result.
+
+`scripts/diagnose_box_step_gradient_epsilon.py` separately compares that direction at five smaller perturbations
+with MuJoCo float64 finite differences. Across its 12 box readings the analytic derivative differed from the finest
+MuJoCo difference by at most 3.98e-4; the corresponding plane maximum was 3.71e-4. The float32 engine differences
+became noisy at small perturbations. This supports a numerical explanation for the failed finite-difference checks,
+but the diagnostic does not replace the qualification rule or turn its failed windows into passes.
+
+Failed conditions retained with the successful checks include a leftover blanket no-box assertion in full code
+generation, CUDA overload name shadowing, and an incorrectly retained MuJoCo `geom_sameframe` flag in the generated
+test model. The flag put MuJoCo's box ten centimetres above its intended position; the corrected test obtains that
+field from a separately compiled box and verifies the realized pose before execution. No failed output was reused
+as a passing reading. These short flat-box conditions do not qualify general terrain, long gradient windows or training.
+
+`scripts/coacd_audit.py` applies the inspected InstinctMJ upstream functions to terrain 0. With CoACD 1.0.7,
+trimesh 4.11.2, NumPy 2.4.2, SciPy 1.17.1 and Shapely 2.1.2 it produced 18 hulls, 1,194 vertices and 2,316 faces.
+These are the decomposed collision inputs, not proof of physical parity or exact replacement by boxes. The audit
+retains the upstream crop, adaptive settings and top alignment. Its failed AST/global-variable preparation and
+dependency-download attempts remain separate from the successful offline-dependency execution.
+
+`nablaengine.convex_contact` provides the separately checked Torch reference primitive. It admits
+only a unique closest witness with the sphere center or capsule centerline outside a closed convex hull. It allows
+radius overlap, but refuses centerline entry, intersection, touching and nonunique witnesses. Continuous witness
+parameters retain gradients. A common static local origin avoids subtracting rounded world-space projections
+when computing distance and normal; only the final contact position is translated back.
+
+At [the fixed primitive revision](https://github.com/LingzheZhao/NablaEngine/tree/ffe712f710d6297a54ed0943883e611f47063b06),
+`scripts/check_convex_contact_gradients.py` passed all **80 declared conditions**: a generated box and one actual
+terrain-0 hull (46 vertices, 88 faces), CPU/CUDA, float32/float64, six smooth queries and four explicit rejections
+per combination. The 48 smooth queries passed independent MuJoCo distance checks, finite-difference stability and
+all eight-output/six-pose Jacobian checks; the 32 rejection conditions failed in the declared way. Compiled mesh
+world vertices were checked independently of MuJoCo's mesh-centering transform. The largest distance difference
+was 1.34e-7 m, largest Jacobian/FD difference 0.00411 (float32), and largest CUDA/CPU Jacobian difference 1.95e-10.
+The physical oracle checks distance, not an independent physical-engine gradient or contact manifold.
+
+Earlier complete readings were 60/80, because an area-versus-length degeneracy check rejected thin float32 hull
+faces, and 78/80, because float32 world-coordinate cancellation made one normal finite difference unstable on
+both devices. The corrected implementation passed the unchanged protocol; those failed readings were retained.
+The engine now packs static convex meshes selected by explicit sphere/capsule pairs. Its CUDA primitive
+handles signed penetration and emits up to two capsule surface-edge contacts projected onto an incident hull
+face. Continuous clipping parameters and the original surface-edge offset retain pose gradients. Invalid
+geometry and invalid slots propagate through the forward status and stop unsupported backward replay.
+
+Tape records use a uint32 contact entry: a 16-bit candidate-pair index and a 16-bit slot field. The reserved
+word identifies physical tape format 4. Current Torch artifacts declare version 5, the matching tape encoding,
+and the substep input-state offsets. Current primitives use slots 0 through 7. The unused-contact sentinel is `0xffffffff`. Pair constants store two uint16 geom indices
+in `c_pgeom` and parameter-set, dimension and flags in `c_pword`. The encoding supports 65,536 candidate pairs
+and collision geoms, with 256 parameter sets. The header holds ncon/nefc/nlim/niter in 8/10/6/8 bits.
+The default active-contact capacity is 128 and constraint-row capacity 576, covering 128 condim-3 contacts,
+35 dof frictionloss rows and 29 hinge limits. These representation limits are separate from measured physical
+capability.
+
+`PYTHONPATH=src:scripts python scripts/check_contact_encoding.py` checks generated constants with 577 total
+geoms, 542 collision geoms and 15,231 candidate pairs, plus tape boundaries through pair 65,535 and slot 7,
+without stepping physics. On provisioned CUDA compute, `scripts/check_pair_capacity.py --code-revision REV
+--out /new/external/root` compares the large generated sparse-contact model with its 47-pair physical control
+and MuJoCo forward and directional-gradient readings. It records compiled state sizes, tape bytes, timing and
+overflows. The [current capacity reading](contact_capacity.md#current-sparse-contact-candidate-index-check) passed
+all three generated model conditions at one and four controls on RTX 3090, including high active pair IDs and
+eight-/eleven-bit corruption controls. Each substep had 28 active contacts and 112 rows; the 15,231-pair model
+read 3.292 ms median for 256 worlds, four substeps, forward plus backward. This qualifies sparse-contact index
+execution, not dense 128-contact execution or full terrain-task behavior.
+
+The terrain-4 scene contains 40 CoACD hulls and 1,789 explicit pairs. The fixture's robot geometry, self pairs and
+pelvis-root dynamics are retained, with terrain pairs replacing the plane. The physical check used reference
+frames 0, 190, 235 and 320, each for one and four controls, on an RTX 3090 with PyTorch 2.13.0+cu129,
+NumPy 2.5.1 and MuJoCo 3.17.0. At the [fixed incident-face implementation](https://github.com/LingzheZhao/NablaEngine/tree/495252b),
+all eight conditions met the declared forward comparison with MuJoCo. Frame 190 differed by at most
+3.41e-5 in generalized position and 8.14e-4 in generalized velocity after one control, and 1.83e-4 and 0.0045 after
+four controls. Twenty-two of the twenty-four directional gradient conditions passed. The two frame-235 tangent
+conditions retained unstable finite differences, giving six of eight complete forward-and-gradient passes.
+These checks cover the declared short trajectories. Terrain-policy training and executed tracking have separate
+readings.
+
+Earlier full-scene attempts exposed a convex dispatch nested inside the box compile guard and missing secondary
+contacts on near-parallel capsules. A per-substep comparison localized the latter to pairs 462 and 477 after the
+first five milliseconds of frame 190. MuJoCo's first compatible incident-face rule restored both contacts and
+resolved the large forward discrepancy. The original failed runs remain separate from the corrected readings.
+
+The static-mesh AABB candidate was compared with its compile-time switch disabled on the same four recorded
+states, repeated across 64 environments. After three warm-up calls, twenty forward-and-backward calls averaged
+93.82 ms without AABB and 83.96 ms with it, a 10.5% reduction in this workload. All 256 substeps retained the
+same pair/slot multisets, contact counts, constraint-row counts and status flags. The declared bitwise comparison
+failed. Contact rows were emitted in a different order through `atomicAdd`, with maximum output differences
+of 1.25e-6 in generalized position and 1.43e-4 in generalized velocity, and maximum state-gradient difference
+0.00233. The candidate remains experimental. The terrain-policy readings use the fixed incident-face engine
+revision linked above, with this optimization disabled.
+
+## Source-camera depth rays
+
+`scripts/check_depth_geometry.py` compares the native depth backend with MuJoCo `mj_ray` on the loaded visible
+model and recorded body states. It records pixel ranges, geom IDs, terrain hits, robot self occlusion and misses.
+The camera uses the source torso installation and full body rotation, 87x58-degree fields of view, 27x48 raw
+pixels, groups 0 and 2, and a 0.05-metre near-hit skip rule. Both implementations continue through near surfaces
+for up to 24 skips. Clipped image-plane depths are also compared. The declared range and clipped-depth absolute
+margins are both 0.0002 metres. Outputs, generated CUDA source and timing records stay in the requested fresh
+external directory.
+
+At [the native BVH revision](https://github.com/LingzheZhao/NablaEngine/tree/ee5510f), the six-terrain model contained
+513 visible CoACD hulls and 35 robot visual geoms. Four recorded source-motion states at frames 0, 190, 235 and 320
+covered terrain hits, self occlusion and misses. All 5,184 raw pixel queries matched MuJoCo's hit/miss decisions and
+geom IDs. Maximum metric-range error was 0.0000126621 metres, and maximum clipped image-plane depth error was
+0.0000122706 metres. The explicit Torch reference on 32 rays per frame had maximum range error 0.000002265 metres.
+The task requested an NVIDIA GeForce RTX 3090 and used PyTorch 2.13.0+cu129 and MuJoCo 3.17.0.
+
+Construction and CUDA compilation took 7.113 seconds. After three warmup calls, five 128-frame batches of 27x48
+images had median elapsed time 6.967 milliseconds, or 18,372 frames per second on that GPU workload. The first
+four-frame render took 18.640 milliseconds. These timings measure ray rendering with the fixed loaded geometry.
+
+An earlier model selected only 35 robot visual geoms because terrain hulls inherited an excluded geom group.
+Its comparisons therefore covered self occlusion and misses. The corrected scene explicitly places the source
+camera's visible CoACD hulls in group 0, following the source task's collision-hull visualization setting.
+
+Add `--check-graphs` to compare eager CUDA Graph capture, full-graph `torch.compile`, and compiled graph replay
+with eager rendering at two changed input states. Build the geometry before capture. The script separately records
+construction, first render and steady-state rendering, with `--benchmark-batch`, `--warmup` and `--repeats` fixing
+the timing conditions.
+
 ## Labels
 
 ### Forward-tape checks T1-T8 (`engine_step_check.py --tape`)

@@ -9,7 +9,7 @@ one control step (substeps engine substeps of h = 5 ms) for B worlds; all float3
 (B, nu), (B,), (B, 3) (mjlab G1: nq 36, nv 35, nu 29); warm is the Newton warm start (warm' = the last substep's
 acceleration, for the next call); friction is each world's foot-floor friction, com its torso COM offset. B is read
 from the arrays at run time: one library serves every batch size, and JAX traces once per shape. jax.custom_vjp: the
-forward under differentiation (dk_step_fwd) also writes the tape, (B, substeps * REC_WORDS) float32 (6016 B per world
+forward under differentiation (dk_step_fwd) also writes the tape, (B, substeps * REC_WORDS) float32 (6400 B per world
 and substep), kept with friction and com as the residuals; the backward (dk_step_bwd, the analytic adjoint k_adjoint,
 deterministic) returns d/dqpos (36-dimensional qpos form, as MuJoCo Warp), d/dqvel and d/dctrl (summed over the
 substeps), zeros for warm, friction and com; the cotangent of warm' is ignored. Without differentiation step runs
@@ -259,10 +259,47 @@ extern "C" void @PFX@_sizes(long long* o) {  // checked by the Python side again
 @FWD_SHIM@
 """
 
+FWD_ATTRIBUTES = r"""
+#if DK_SPLIT
+  e = cudaFuncSetAttribute(k_pre, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(SimP));
+  if (e != cudaSuccess) return (int)e;
+  e = cudaFuncSetAttribute(k_post, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(SimN));
+#else
+  e = cudaFuncSetAttribute(k_substep, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(Sim));
+#endif
+  if (e != cudaSuccess) return (int)e;
+"""
+
+
 FWD_SHIM = r"""
 // the forward (host.KERNEL, DK_SPLIT): the split kernels with work memory of @PFX@_work_bytes(nw) bytes (the handler's
 // scratch memory), or k_substep (none)
 extern "C" long long @PFX@_work_bytes(int nw) { return DK_SPLIT ? (long long)dk_work_bytes(nw) : 0; }
+// Per forward kernel: requested dynamic bytes, static bytes, opted-in dynamic limit; then the device opt-in limit.
+extern "C" int @PFX@_forward_shared_memory(long long* o) {
+  auto read = [](auto kernel, size_t dynamic, long long* dst) {
+    cudaFuncAttributes attr;
+    cudaError_t e = cudaFuncGetAttributes(&attr, kernel);
+    if (e != cudaSuccess) return e;
+    dst[0] = (long long)dynamic; dst[1] = (long long)attr.sharedSizeBytes;
+    dst[2] = (long long)attr.maxDynamicSharedSizeBytes;
+    return cudaSuccess;
+  };
+  cudaError_t e = read(k_substep, sizeof(Sim), o);
+  if (e != cudaSuccess) return (int)e;
+  e = read(k_pre, sizeof(SimP), o + 3);
+  if (e != cudaSuccess) return (int)e;
+  e = read(k_post, sizeof(SimN), o + 6);
+  if (e != cudaSuccess) return (int)e;
+  int dev, limit;
+  e = cudaGetDevice(&dev);
+  if (e != cudaSuccess) return (int)e;
+  e = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  if (e != cudaSuccess) return (int)e;
+  o[9] = limit;
+  return 0;
+}
+
 extern "C" int @PFX@_forward(cudaStream_t st, int nw, const float* qpos, const float* qvel, const float* warm,
                            const float* ctrl, const float* fric, const float* com, int iterations, int nsub, float* oq,
                            float* ov, float* ow, int* info, float* ocon, float* tape, void* work) {
@@ -273,6 +310,34 @@ extern "C" int @PFX@_forward(cudaStream_t st, int nw, const float* qpos, const f
   (void)work;
   k_substep<<<nw, 32, sizeof(Sim), st>>>(nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub, oq, ov, ow, info, ocon,
                                          tape);
+  return (int)cudaGetLastError();
+#endif
+}
+extern "C" int @PFX@_forward_measurements(cudaStream_t st, int nw, const float* qpos, const float* qvel,
+                           const float* warm, const float* ctrl, const float* fric, const float* com,
+                           int iterations, int nsub, float* oq, float* ov, float* ow, int* info, float* ocon,
+                           float* tape, void* work, float* wrench, int* count, float* actuator, int* sample_info) {
+#if DK_SPLIT
+  return (int)dk_forward_split(st, nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub, oq, ov, ow, info,
+                               ocon, tape, work, sizeof(SimP), sizeof(SimN), wrench, count, actuator, sample_info);
+#else
+  (void)work;
+  k_substep<<<nw, 32, sizeof(Sim), st>>>(nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub,
+                                      oq, ov, ow, info, ocon, tape, wrench, count, actuator, sample_info);
+  return (int)cudaGetLastError();
+#endif
+}
+extern "C" int @PFX@_forward_all_contact_measurements(cudaStream_t st, int nw, const float* qpos, const float* qvel,
+                           const float* warm, const float* ctrl, const float* fric, const float* com,
+                           int iterations, int nsub, float* oq, float* ov, float* ow, int* info, float* ocon,
+                           float* tape, void* work, float* wrench, int* count, float* actuator, int* sample_info, float* all_wrench, int* all_count) {
+#if DK_SPLIT
+  return (int)dk_forward_split(st, nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub, oq, ov, ow, info,
+                               ocon, tape, work, sizeof(SimP), sizeof(SimN), wrench, count, actuator, sample_info, all_wrench, all_count);
+#else
+  (void)work;
+  k_substep<<<nw, 32, sizeof(Sim), st>>>(nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub,
+                                      oq, ov, ow, info, ocon, tape, wrench, count, actuator, sample_info, all_wrench, all_count);
   return (int)cudaGetLastError();
 #endif
 }
@@ -822,11 +887,14 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
     built with other architecture flags: cuda.arch_flags('forward')), every adjoint variant's unit without them. target:
     the build target (default cuda.arch()), whose forward-unit -D options (cuda.unit_defines: the register caps on
     sm_90) the unit with the forward kernels gets."""
-    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs)
+    from nablaengine.model.convex import pack_static_convex_hulls
+    selected_geoms=g1_step.collision_geoms(m)
+    convex_hulls=pack_static_convex_hulls(m,selected_geoms) if any(m.geom_type[g]==mujoco.mjtGeom.mjGEOM_MESH for g in selected_geoms) else None
+    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs, convex_hulls)
     load = host.loader(lays, sizes)
     load = re.sub(r"cudaMemcpyToSymbol\(([^;]*)\);", r"cudaMemcpyToSymbolAsync(\1, 0, cudaMemcpyHostToDevice, st);", load)
     assert "cudaMemcpyToSymbol(" not in load
-    engine = adjoint.cuda_source(m)
+    engine = adjoint.cuda_source(m, convex_hulls=convex_hulls)
     assert engine.count("#include <cuda_runtime.h>\n") == 1 and engine.count("#include") == 1, \
         "the engine source may only include cuda_runtime.h (it is wrapped in a namespace)"
     engine = engine.replace("#include <cuda_runtime.h>\n", "")
@@ -834,8 +902,7 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
 
     def unit(v, fwd, pfx):
         src = (VARIANT_UNIT.replace("@FWD_SHIM@", FWD_SHIM if fwd else "")
-               .replace("@FWD_ATTR@", "  cudaFuncSetAttribute(k_substep, cudaFuncAttributeMaxDynamicSharedMemorySize, "
-                                      "(int)sizeof(Sim));" if fwd else "")
+               .replace("@FWD_ATTR@", FWD_ATTRIBUTES if fwd else "")
                .replace("@PFX@", pfx).replace("@MAX_DEVICES@", str(MAX_DEVICES))
                .replace("@UPLOAD_ERR_SMEM@", str(UPLOAD_ERR_SMEM)).replace("@LOAD_CONSTS@", load)
                .replace("@ENGINE@", engine + (host.KERNEL + g1_kin.KIN_DEVICE if fwd else "")))  # last: never scanned
@@ -1097,7 +1164,7 @@ def init(model_dir=None, model=None, foot_pairs=None):
 
 
 def rec_words():
-    """Words (float32) per tape record (one world, one substep): 1504 for the mjlab model."""
+    """Words (float32) per tape record (one world, one substep): 1600 for the mjlab model at 128 contacts."""
     return init()["rec_words"]
 
 

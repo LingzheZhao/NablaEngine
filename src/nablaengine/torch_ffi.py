@@ -10,17 +10,17 @@ Arguments and outputs as jax_ffi.step / jax_ffi.kinematics (see that module's do
 device, contiguous, leading dimension B (the worlds): qpos (B, nq), qvel (B, nv), warm (B, nv), ctrl (B, nu), friction
 (B,), com (B, 3) (mjlab G1: nq 36, nv 35, nu 29). Other dtypes, devices or shapes raise TypeError; nothing is cast or
 copied implicitly. step is differentiable (torch.autograd): when any input requires grad, the forward also writes the
-tape (B, substeps * REC_WORDS float32, 6016 B per world and substep) and keeps it for the backward (the analytic
+tape (B, substeps * REC_WORDS float32, 6400 B per world and substep) and keeps it for the backward (the analytic
 adjoint, deterministic), which returns d/dqpos (36-dimensional qpos form), d/dqvel and d/dctrl, no gradient for warm,
 friction and com. The outputs and gradients are bitwise those of jax_ffi on the same GPU (scripts/torch_ffi_check.py).
 
-A rollout is a Python loop: every differentiated step keeps its tape until the backward (tape_bytes(); 6.3 GB for
+A rollout is a Python loop: every differentiated step keeps its tape until the backward (tape_bytes(); 6.7 GB for
 4096 worlds x 64 steps). torch.utils.checkpoint may rerun a step: the forward is deterministic, so a recomputed tape
 is bitwise the first one.
 
 The library: the engine's CUDA source for the model (jax_ffi.build_plan's units without the XLA FFI unit, plus
 dk_torch.cu's diagnostic counters), compiled by build() for one architecture into an artifact in the cache directory
-(libdk_g1_torch_<arch>_<key>.so with the CUDA runtime linked statically, the packed constants .npy, the model facts
+(libdk_g1_torch_v<artifact_version>_<arch>_<key>.so with the CUDA runtime linked statically, the packed constants .npy, the model facts
 .json): `python -m nablaengine.torch_ffi build [--arch sm_XY ...]` where mujoco 3.17 and nvcc are installed. init()
 loads the artifact for the GPU's architecture (or $DK_TORCH_ARTIFACT) with ctypes: a process that only loads it needs
 torch, NumPy and the NVIDIA driver, and imports no JAX, no mujoco and no nvcc. The artifact records a hash of the
@@ -61,8 +61,11 @@ OVERFLOW_CONTACTS, OVERFLOW_ROWS = 4, 16  # forward info[:, 3] bits: contacts / 
 _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # set_overflow_warnings
 NONFINITE_QPOS, NONFINITE_QVEL, NONFINITE_CTRL, NONFINITE_COT, NONFINITE_SHIFT = 1, 2, 4, 8, 16
 VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint builds (clamp_kv, normal)
+MEASUREMENT_FIELDS = ("terrain_wrench", "terrain_contact_count", "actuator_torque", "substep_info",
+                      "all_contact_wrench", "all_contact_count")
 FWD_UNIT = "dk_fwd"
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 5
+TAPE_ENCODING = dict(contact_bits=32, pair_bits=16, slot_capacity=8, header_bits=[8, 10, 6, 8], format_marker=0x4E540410)
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
 SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
 
@@ -194,7 +197,7 @@ def sources_sha256():
 
 def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
     """Generate and compile the library for the model and architecture arch (sm_XY) and write its artifact into the
-    cache directory: the library libdk_g1_torch_<arch>_<key>.so (the CUDA runtime linked statically), the packed model
+    cache directory: the library libdk_g1_torch_v<artifact_version>_<arch>_<key>.so (the CUDA runtime linked statically), the packed model
     constants (.npy) and the model facts (.json); returns the .json's path. Needs mujoco 3.17 and nvcc (CUDA 12.x), no
     torch and no JAX; cached (the same sources reuse the library). set_current: make it the architecture's artifact
     that init() loads by default (torch_<arch>_current.json); False for another model's, loaded by its path."""
@@ -214,7 +217,7 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
         if adj:
             unit_arch["dk_torch.cu"] = adj
     consts = np.ascontiguousarray(plan["consts"], np.float32)
-    path, built, key = jax_ffi._build(units, defines, arch, None, consts, unit_arch or None, prefix="libdk_g1_torch")
+    path, built, key = jax_ffi._build(units, defines, arch, None, consts, unit_arch or None, prefix=f"libdk_g1_torch_v{ARTIFACT_VERSION}")
     try:  # the kinematics outputs' assumptions (kinematics.check_model); the kinematics entries raise without them
         g1_kin.check_model(m)
         kin_error = None
@@ -222,11 +225,13 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
         kin_error = f"the model does not meet the kinematics outputs' assumptions ({e!r})"
     stem = path.with_suffix("")
     np.save(stem.with_suffix(".npy"), consts)
-    meta = dict(artifact_version=ARTIFACT_VERSION, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
+    meta = dict(artifact_version=ARTIFACT_VERSION, tape_encoding=TAPE_ENCODING, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
                 arch=arch, version=nablaengine.__version__, sources_sha256=sources_sha256(),
                 consts_sha256=hashlib.sha256(consts.tobytes()).hexdigest(), rec_words=g1_tape.rec_words(m),
                 nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
-                off_flags=int(g1_tape.layout(m)["flags"][0]), forward_unit=plan["forward_unit"],
+                off_flags=int(g1_tape.layout(m)["flags"][0]),
+                substep_input_offsets={name: int(g1_tape.layout(m)[name][0]) for name in ("qpos", "qvel")},
+                forward_unit=plan["forward_unit"],
                 variants=[list(v) for v in VARIANTS], kinematics_error=kin_error, timestep=float(m.opt.timestep),
                 foot_pairs=[int(p) for p in fp], arch_flags=plan["arch_flags"],
                 forward_defines=plan["forward_defines"], built=built,
@@ -256,6 +261,8 @@ def _stale(js, arch):
     meta = json.loads(js.read_text())
     if meta.get("artifact_version") != ARTIFACT_VERSION:
         return f"artifact version {meta.get('artifact_version')}, this module reads {ARTIFACT_VERSION}"
+    if meta.get("tape_encoding") != TAPE_ENCODING:
+        return f"incompatible tape encoding {meta.get('tape_encoding')!r}, expected {TAPE_ENCODING!r}"
     if meta["arch"] != arch:
         return f"built for {meta['arch']}, the GPU is {arch}"
     if not (js.parent / meta["library"]).exists() or not (js.parent / meta["consts"]).exists():
@@ -338,6 +345,9 @@ def _bind(lib, info):
     fns = dict(forward=getattr(lib, f"{fwd}_forward"), work_bytes=getattr(lib, f"{fwd}_work_bytes"),
                kin=getattr(lib, f"{fwd}_kinematics"), kin_vjp=getattr(lib, f"{fwd}_kinematics_vjp"))
     fns["forward"].argtypes = [vp, i32] + [vp] * 6 + [i32, i32] + [vp] * 7
+    fns["forward_measurements"] = getattr(lib, f"{fwd}_forward_all_contact_measurements", None)
+    if fns["forward_measurements"] is not None:
+        fns["forward_measurements"].argtypes = fns["forward"].argtypes + [vp] * 6
     fns["work_bytes"].argtypes, fns["work_bytes"].restype = [i32], ctypes.c_longlong
     fns["kin"].argtypes = [vp, i32] + [vp] * 8
     fns["kin_vjp"].argtypes = [vp, i32] + [vp] * 12
@@ -461,7 +471,7 @@ def tape_bytes(nworld, substeps=SUBSTEPS, steps=1):
 # ---- custom ops (torch.library): the library calls, opaque to torch.compile ------------------------------------------
 
 @_on_input_device
-def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics):
+def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics, measurements=False):
     import torch
     dev = _ready(qpos)
     nq, nv, nu, nb, rec = _sizes()
@@ -476,20 +486,32 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, t
     info = torch.empty((B, 4), dtype=torch.int32, device=qpos.device)
     tp = torch.empty((B, substeps * rec), **kw) if tape else torch.empty((0, substeps * rec), **kw)
     kin = _kin_empty(B, qpos.device) if kinematics else []
+    measured = []
+    if measurements:
+        measured = [torch.empty((B, substeps, nb, 6), **kw),
+                    torch.empty((B, substeps, nb), dtype=torch.int32, device=qpos.device),
+                    torch.empty((B, substeps, nv-6), **kw),
+                    torch.empty((B, substeps, 4), dtype=torch.int32, device=qpos.device),
+                    torch.empty((B, substeps, nb, 6), **kw),
+                    torch.empty((B, substeps, nb), dtype=torch.int32, device=qpos.device)]
     if B == 0:
-        return [q1, v1, w1, info, tp] + kin
+        return [q1, v1, w1, info, tp] + kin + measured
     fns = _STATE["fns"]
     con = torch.empty((B, _STATE["info"]["maxcon"] * 8), **kw)  # the last substep's contacts (unused, as jax_ffi)
     work = torch.empty((max(int(fns["work_bytes"](B)), 1),), dtype=torch.uint8, device=qpos.device)
     st = torch.cuda.current_stream(dev).cuda_stream
-    _rc(fns["forward"](st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),
-                       _ptr(v1), _ptr(w1), _ptr(info), _ptr(con), _ptr(tp) if tape else None, _ptr(work)),
+    launch = fns["forward_measurements"] if measurements else fns["forward"]
+    if launch is None:
+        raise _err("loaded artifact has no native measurement entry; build this source revision", RuntimeError)
+    extra = list(map(_ptr, measured))
+    _rc(launch(st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),
+               _ptr(v1), _ptr(w1), _ptr(info), _ptr(con), _ptr(tp) if tape else None, _ptr(work), *extra),
         "the forward launch")
     if kinematics:
         _rc(fns["kin"](st, B, _ptr(q1), _ptr(v1), _ptr(com), *map(_ptr, kin)), "the kinematics launch")
     if _DIAG_ON[0]:
         _diag_forward(dev, st, info, tp if tape else None, iterations, substeps)
-    return [q1, v1, w1, info, tp] + kin
+    return [q1, v1, w1, info, tp] + kin + measured
 
 
 def _kin_empty(B, device):
@@ -579,7 +601,8 @@ def _kinematics_backward_impl(qpos, qvel, com, g_qpos_n, g_xpos, g_xquat, g_cvel
 
 
 _OPS = {}
-_IMPL = dict(forward=lambda *a: _forward_impl(*a), backward=lambda *a: _backward_impl(*a),
+_IMPL = dict(forward=lambda *a: _forward_impl(*a),
+             forward_measurements=lambda *a: _forward_impl(*a, True), backward=lambda *a: _backward_impl(*a),
              kinematics=lambda *a: _kinematics_impl(*a), kinematics_backward=lambda *a: _kinematics_backward_impl(*a))
 
 
@@ -614,6 +637,25 @@ def _custom_ops():
         if kinematics:
             out += [qpos.new_empty(s) for s in ((B, nq), (B, nb, 3), (B, nb, 4), (B, nb, 6), (B, nb, 3))]
         return out
+
+    @torch.library.custom_op("nablaengine::forward_measurements", mutates_args=())
+    def measured_op(qpos: Tensor, qvel: Tensor, warm: Tensor, ctrl: Tensor, friction: Tensor, com: Tensor,
+                    iterations: int, substeps: int, tape: bool, kinematics: bool) -> List[Tensor]:
+        return _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics, True)
+
+    @measured_op.register_fake
+    def _(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, tape, kinematics):
+        nq, nv, _, nb, rec = _fake_sizes()
+        B = qpos.shape[0]
+        out = [qpos.new_empty((B, nq)), qpos.new_empty((B, nv)), qpos.new_empty((B, nv)),
+               qpos.new_empty((B, 4), dtype=torch.int32), qpos.new_empty((B if tape else 0, substeps*rec))]
+        if kinematics:
+            out += [qpos.new_empty(s) for s in ((B, nq), (B, nb, 3), (B, nb, 4), (B, nb, 6), (B, nb, 3))]
+        return out + [qpos.new_empty((B, substeps, nb, 6)),
+                      qpos.new_empty((B, substeps, nb), dtype=torch.int32),
+                      qpos.new_empty((B, substeps, nv-6)), qpos.new_empty((B, substeps, 4), dtype=torch.int32),
+                      qpos.new_empty((B, substeps, nb, 6)),
+                      qpos.new_empty((B, substeps, nb), dtype=torch.int32)]
 
     @torch.library.custom_op("nablaengine::backward", mutates_args=())
     def backward_op(tape: Tensor, friction: Tensor, com: Tensor, g_qpos: Tensor, g_qvel: Tensor,
@@ -650,7 +692,8 @@ def _custom_ops():
         B = qpos.shape[0]
         return [qpos.new_empty((B, nq)), qpos.new_empty((B, nv))]
 
-    _OPS.update(forward=forward_op, backward=backward_op, kinematics=kinematics_op,
+    _OPS.update(forward=forward_op, forward_measurements=measured_op,
+                backward=backward_op, kinematics=kinematics_op,
                 kinematics_backward=kinematics_backward_op)
     return _OPS
 
@@ -750,18 +793,21 @@ def _make_step_fn():
     class _Step(torch.autograd.Function):
         @staticmethod
         def forward(ctx, qpos, qvel, warm, ctrl, friction, com, iterations, substeps, clamp_kv, normal, clamp_soft,
-                    grad_decay, kin):
-            r = _ops()["forward"](qpos, qvel, warm, ctrl, friction, com, iterations, substeps, True, kin)
+                    grad_decay, kin, measured):
+            operation = "forward_measurements" if measured else "forward"
+            r = _ops()[operation](qpos, qvel, warm, ctrl, friction, com, iterations, substeps, True, kin)
             q1, v1, w1, info, tp = r[:5]
             ctx.save_for_backward(tp, friction, com, ctrl, q1, v1)
             ctx.opts = (substeps, clamp_kv, normal, clamp_soft, grad_decay, kin)
-            ctx.mark_non_differentiable(w1)
+            measured_outputs = r[5+(5 if kin else 0):] if measured else []
+            ctx.mark_non_differentiable(w1, *measured_outputs)
             return (q1, v1, w1) + tuple(r[5:])
 
         @staticmethod
         def backward(ctx, g_q1, g_v1, g_w1, *g_kin):
             tp, friction, com, ctrl, q1, v1 = ctx.saved_tensors
             substeps, clamp_kv, normal, clamp_soft, grad_decay, kin = ctx.opts
+            g_kin = g_kin[:5] if kin else ()
             g_q1 = torch.zeros_like(q1) if g_q1 is None else g_q1.contiguous()
             g_v1 = torch.zeros_like(v1) if g_v1 is None else g_v1.contiguous()
             kin_state, kin_cot = [], []
@@ -774,7 +820,7 @@ def _make_step_fn():
                                                0.0 if clamp_soft is None else clamp_soft)
             if grad_decay != 1.0:  # the state cotangent through this step's physics times it, ctrl's not
                 gq, gv = gq * grad_decay, gv * grad_decay  # grad_decay a float32 value: one float32 product
-            return gq, gv, None, gu, None, None, None, None, None, None, None, None, None
+            return gq, gv, None, gu, None, None, None, None, None, None, None, None, None, None
 
     return _Step
 
@@ -815,11 +861,17 @@ def _fn(name, make):
 
 
 def step(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, substeps=SUBSTEPS, clamp_kv=CLAMP_KV,
-         normal=NORMAL, clamp_soft=None, grad_decay=GRAD_DECAY, kinematics=False):
+         normal=NORMAL, clamp_soft=None, grad_decay=GRAD_DECAY, kinematics=False, measurements=False):
     """One control step: (qpos', qvel', warm'); kinematics=True: (qpos', qvel', warm', qpos_n, xpos, xquat, cvel,
     subtree_com), the output state's kinematics. Options as jax_ffi.step (clamp_kv, normal, clamp_soft and
     grad_decay act on the backward only). Differentiable in qpos, qvel and ctrl when any input requires grad (then the
-    forward also writes the tape); warm' is not differentiable."""
+    forward also writes the tape); warm' is not differentiable.
+
+    measurements=True appends one dictionary after the normal state outputs.
+    Its fixed fields are MEASUREMENT_FIELDS, with the same sampling, units and
+    semantics as forward_measurements. Measurements are marked nondifferentiable.
+    State outputs retain the native VJP from this same forward execution.
+    """
     import torch
     if int(clamp_kv) not in (0, 1, 2) or int(normal) not in (0, 1, 2, 3):
         raise _err("clamp_kv in {0, 1, 2}, normal in 0..3", ValueError)
@@ -829,10 +881,17 @@ def step(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, subste
         raise _err(f"grad_decay must be finite, got {grad_decay}", ValueError)
     args = (qpos, qvel, warm, ctrl, friction, com)
     if torch.is_grad_enabled() and any(isinstance(x, torch.Tensor) and x.requires_grad for x in args):
-        return _fn("step", _make_step_fn).apply(*args, int(iterations), int(substeps), int(clamp_kv), int(normal),
-                                                soft, gd, bool(kinematics))
-    r = _ops()["forward"](*args, int(iterations), int(substeps), False, bool(kinematics))
-    return tuple(r[:3]) + tuple(r[5:])
+        output = _fn("step", _make_step_fn).apply(*args, int(iterations), int(substeps), int(clamp_kv), int(normal),
+                                                soft, gd, bool(kinematics), bool(measurements))
+    else:
+        operation = "forward_measurements" if measurements else "forward"
+        result = _ops()[operation](*args, int(iterations), int(substeps), False, bool(kinematics))
+        output = tuple(result[:3]) + tuple(result[5:])
+    if measurements:
+        state_count = 8 if kinematics else 3
+        measured = dict(zip(MEASUREMENT_FIELDS, output[state_count:]))
+        return tuple(output[:state_count]) + (measured,)
+    return output
 
 
 def kinematics(qpos, qvel, com):
@@ -849,6 +908,57 @@ def forward(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, sub
     r = _ops()["forward"](qpos, qvel, warm, ctrl, friction, com, int(iterations), int(substeps), bool(tape),
                           bool(kinematics))
     return tuple(r[:4]) + ((r[4],) if tape else ()) + tuple(r[5:])
+
+
+def forward_measurements(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, substeps=SUBSTEPS,
+                         tape=False):
+    """Execute a forward call with native solver measurements at every substep.
+
+    Returns a dictionary with qpos, qvel, warm and info, plus tape when requested.
+    terrain_wrench has shape (B, substeps, nbody, 6), ordered world force (N),
+    moment about world origin (N m). Each contact applies +force to canonical
+    geom 2 and -force to geom 1. Only pairs with one world-body geom contribute.
+    Body zero holds the opposite terrain reaction. terrain_contact_count counts
+    retained geometric contacts, including those whose final solved force is zero.
+    all_contact_wrench and all_contact_count have the same shapes and reference
+    conventions, and include both sides of robot self contacts. Forces are summed
+    as vectors per body before computing a magnitude. This permits cancellation
+    between contacts. Source hard contact thresholds consume the magnitude.
+    actuator_torque (B, substeps, nv-6) is the executed clamped actuator generalized
+    torque in actuated dof order, in N m. It excludes passive damping/friction.
+    substep_info (B, substeps, 4) holds iterations, contacts, rows and unsupported
+    bits. Counts/forces from unsupported or overflowed records remain partial.
+
+    Samples refer to each substep input t_k and its solved acceleration, before
+    implicitfast advances to t_k+dt. At dt=.005 and substeps=4 this is 200 Hz.
+    These observational outputs have no autograd rule. Use step for state VJPs.
+    """
+    result = _ops()["forward_measurements"](qpos, qvel, warm, ctrl, friction, com,
+                                             int(iterations), int(substeps), bool(tape), False)
+    output = dict(zip(("qpos", "qvel", "warm", "info", "tape") + MEASUREMENT_FIELDS, result))
+    if not tape:
+        output.pop("tape")
+    return output
+
+
+def read_substep_inputs(tape, substeps=SUBSTEPS):
+    """Views of recorded input states at each physics substep t_k.
+
+    tape is the current loaded model's contiguous float32 CUDA forward tape,
+    shaped (B, substeps * rec_words). Returns qpos (B, substeps, nq) and qvel
+    (B, substeps, nv) as views into that same storage. Treat these views and the
+    original tape as read-only. This operation performs tensor indexing only.
+    The loaded artifact owns the current tape schema and its recorded offsets.
+    """
+    if not isinstance(substeps, int) or not 1 <= substeps <= 32:
+        raise _err("substeps must be an integer in 1..32", ValueError)
+    dev = _ready(tape)
+    nq, nv, _, _, record_words = _sizes()
+    _check("tape", tape, (tape.shape[0], substeps * record_words), dev)
+    offsets = _STATE["info"]["substep_input_offsets"]
+    records = tape.reshape(tape.shape[0], substeps, record_words)
+    return {"qpos": records[..., offsets["qpos"]:offsets["qpos"]+nq],
+            "qvel": records[..., offsets["qvel"]:offsets["qvel"]+nv]}
 
 
 def backward(tape, friction, com, g_qpos, g_qvel, *, substeps=SUBSTEPS, clamp_kv=CLAMP_KV, normal=NORMAL, ctrl=None,

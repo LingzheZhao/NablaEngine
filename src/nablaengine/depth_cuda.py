@@ -1,0 +1,480 @@
+"""Native CUDA first-hit rays with a local triangle BVH per visible mesh.
+
+The model's compiled triangles build a preorder, stack-free BVH once. Every ray
+uses current body poses, and retains primitive surfaces and robot self occlusion.
+The Python owner keeps packed GPU arrays and the compiled library alive together.
+"""
+import ctypes
+import itertools
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from .cuda import nvcc
+
+
+_OPERATOR_IDS = itertools.count()
+
+
+SOURCE = r'''
+#include <cuda_runtime.h>
+#include <math.h>
+__device__ float dot(float3 a,float3 b){return a.x*b.x+a.y*b.y+a.z*b.z;}
+__device__ float3 add(float3 a,float3 b){return make_float3(a.x+b.x,a.y+b.y,a.z+b.z);}
+__device__ float3 sub(float3 a,float3 b){return make_float3(a.x-b.x,a.y-b.y,a.z-b.z);}
+__device__ float3 mul(float3 a,float s){return make_float3(a.x*s,a.y*s,a.z*s);}
+__device__ float3 cross(float3 a,float3 b){return make_float3(a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x);}
+__device__ float3 load3(const float*p){return make_float3(p[0],p[1],p[2]);}
+__device__ float3 inverse_rotate(const float*q,float3 v){
+  float3 axis=make_float3(-q[1],-q[2],-q[3]);
+  float3 t=mul(cross(axis,v),2.f);return add(add(v,mul(t,q[0])),cross(axis,t));
+}
+__device__ bool bounds_hit(const float*b,float3 origin,float3 direction,float maximum){
+  float low=0.f,high=maximum;
+  float o[3]={origin.x,origin.y,origin.z},d[3]={direction.x,direction.y,direction.z};
+  for(int k=0;k<3;++k){
+    if(d[k]==0.f){if(o[k]<b[k]||o[k]>b[k+3])return false;}
+    else{float a=(b[k]-o[k])/d[k],c=(b[k+3]-o[k])/d[k];low=fmaxf(low,fminf(a,c));high=fminf(high,fmaxf(a,c));}
+  }
+  return low<=high;
+}
+__device__ float triangle_hit(const float*t,float3 origin,float3 direction){
+  float3 a=load3(t),e1=sub(load3(t+3),a),e2=sub(load3(t+6),a);
+  float3 p=cross(direction,e2);float det=dot(e1,p);
+  if(fabsf(det)<=1.1920928955078125e-7f*sqrtf(dot(e1,e1)*dot(e2,e2)))return INFINITY;
+  float inv=1.f/det;float3 offset=sub(origin,a);float u=dot(offset,p)*inv;
+  if(u<0.f||u>1.f)return INFINITY;
+  float3 q=cross(offset,e1);float v=dot(direction,q)*inv;
+  if(v<0.f||u+v>1.f)return INFINITY;
+  float distance=dot(e2,q)*inv;return distance>=0.f?distance:INFINITY;
+}
+__device__ float sphere_hit(float3 origin,float3 direction,float radius){
+  float projection=dot(origin,direction),disc=projection*projection-dot(origin,origin)+radius*radius;
+  if(disc<0.f)return INFINITY;float root=sqrtf(disc);
+  float near=-projection-root,far=-projection+root;
+  return near>=0.f?near:(far>=0.f?far:INFINITY);
+}
+__device__ float capsule_hit(float3 o,float3 d,float radius,float half_length){
+  float speed=d.x*d.x+d.y*d.y,projection=o.x*d.x+o.y*d.y;
+  float disc=projection*projection-speed*(o.x*o.x+o.y*o.y-radius*radius),best=INFINITY;
+  if(speed>0.f&&disc>=0.f){
+    float root=sqrtf(disc);
+    for(int sign=-1;sign<=1;sign+=2){float hit=(-projection+sign*root)/speed;float z=o.z+hit*d.z;
+      if(hit>=0.f&&fabsf(z)<=half_length)best=fminf(best,hit);}
+  }
+  for(int cap=-1;cap<=1;cap+=2){
+    float3 shifted=o;shifted.z-=cap*half_length;
+    float p=dot(shifted,d),delta=p*p-dot(shifted,shifted)+radius*radius;
+    if(delta<0.f)continue;float root=sqrtf(delta);
+    for(int sign=-1;sign<=1;sign+=2){float hit=-p+sign*root;
+      if(hit>=0.f&&cap*(o.z+hit*d.z)>=half_length)best=fminf(best,hit);}
+  }
+  return best;
+}
+__device__ float first_hit(int geom_count,int body_count,const int*geometry,const float*poses,
+                             const float*sizes,const float*bounds,const int*nodes,const float*triangles,
+                             const float*body_positions,const float*body_quaternions,
+                             float3 origin,float3 direction,int&geom_id){
+  float best=INFINITY;geom_id=-1;
+  for(int g=0;g<geom_count;++g){
+    const int*info=geometry+5*g;int body=info[0],kind=info[1];
+    float3 o=inverse_rotate(body_quaternions+4*body,sub(origin,load3(body_positions+3*body)));
+    float3 d=inverse_rotate(body_quaternions+4*body,direction);
+    o=inverse_rotate(poses+7*g+3,sub(o,load3(poses+7*g)));
+    d=inverse_rotate(poses+7*g+3,d);
+    const float*size=sizes+3*g;float distance=INFINITY;
+    if(kind==7){
+      int node=info[2],end=info[3];
+      while(node<end){
+        const int*entry=nodes+3*node;
+        if(!bounds_hit(bounds+6*node,o,d,fminf(best,distance))){node=entry[2];continue;}
+        if(entry[1]>0){for(int i=0;i<entry[1];++i)distance=fminf(distance,triangle_hit(triangles+9*(entry[0]+i),o,d));node=entry[2];}
+        else ++node;
+      }
+    }else if(kind==2)distance=sphere_hit(o,d,size[0]);
+    else if(kind==3)distance=capsule_hit(o,d,size[0],size[1]);
+    else if(kind==6){
+      float b[6]={-size[0],-size[1],-size[2],size[0],size[1],size[2]};
+      float low=-INFINITY,high=INFINITY,ov[3]={o.x,o.y,o.z},dv[3]={d.x,d.y,d.z};bool valid=true;
+      for(int k=0;k<3;++k){if(dv[k]==0.f){if(ov[k]<b[k]||ov[k]>b[k+3])valid=false;}
+        else{float a=(b[k]-ov[k])/dv[k],c=(b[k+3]-ov[k])/dv[k];low=fmaxf(low,fminf(a,c));high=fminf(high,fmaxf(a,c));}}
+      if(valid&&low<=high)distance=low>=0.f?low:(high>=0.f?high:INFINITY);
+    }else if(kind==0&&d.z!=0.f){float t=-o.z/d.z;if(t>=0.f)distance=t;}
+    if(distance<best){best=distance;geom_id=info[4];}
+  }
+  return best;
+}
+__global__ void rays(int batch,int ray_count,int geom_count,int body_count,
+                       const int*geometry,const float*poses,const float*sizes,
+                       const float*bounds,const int*nodes,const float*triangles,
+                       const float*body_positions,const float*body_quaternions,
+                       const float*origins,const float*directions,float maximum,float minimum,
+                       int max_hops,float epsilon,float*distances,long long*ids){
+  int ray=blockIdx.x*blockDim.x+threadIdx.x;if(ray>=batch*ray_count)return;
+  int world=ray/ray_count;float3 origin=load3(origins+3*ray),direction=load3(directions+3*ray);
+  const float*bp=body_positions+3*body_count*world;const float*bq=body_quaternions+4*body_count*world;
+  float traveled=0.f,result=maximum;int id=-1;
+  for(int hop=0;hop<=max_hops;++hop){
+    int hit_id;float hit=first_hit(geom_count,body_count,geometry,poses,sizes,bounds,nodes,triangles,bp,bq,origin,direction,hit_id);
+    if(!isfinite(hit)||hit+traveled>maximum)break;
+    if(hit+traveled>=minimum){result=hit+traveled;id=hit_id;break;}
+    if(hop==max_hops)break;float advance=hit+epsilon;origin=add(origin,mul(direction,advance));traveled+=advance;
+  }
+  distances[ray]=result;ids[ray]=id;
+}
+extern "C" int depth_rays(int batch,int ray_count,int geom_count,int body_count,
+                            const int*geometry,const float*poses,const float*sizes,
+                            const float*bounds,const int*nodes,const float*triangles,
+                            const float*body_positions,const float*body_quaternions,
+                            const float*origins,const float*directions,float maximum,float minimum,
+                            int max_hops,float epsilon,float*distances,long long*ids,void*stream){
+  rays<<<(batch*ray_count+127)/128,128,0,(cudaStream_t)stream>>>(batch,ray_count,geom_count,body_count,
+    geometry,poses,sizes,bounds,nodes,triangles,body_positions,body_quaternions,origins,directions,
+    maximum,minimum,max_hops,epsilon,distances,ids);return int(cudaGetLastError());
+}
+'''
+
+
+# Secondary recovery is retained for diagnosing its numerical difference from
+# the primary accepted-hop triangle. Pose gradients use primary face recording.
+POSE_SOURCE = r'''
+#define DEPTH_POSE_ABI_VERSION 2
+extern "C" int depth_pose_abi_version(){return DEPTH_POSE_ABI_VERSION;}
+__global__ void pose_hits(int batch,int ray_count,int body_count,const int*geometry,
+                           const int*geom_lookup,const float*poses,const float*bounds,
+                           const int*nodes,const float*triangles,const float*body_positions,
+                           const float*body_quaternions,const float*origins,const float*directions,
+                           const float*ranges,const long long*geom_ids,long long*packed_ids,
+                           long long*triangle_ids){
+  int ray=blockIdx.x*blockDim.x+threadIdx.x;if(ray>=batch*ray_count)return;
+  packed_ids[ray]=-1;triangle_ids[ray]=-1;
+  if(geom_ids[ray]<0)return;
+  int g=geom_lookup[geom_ids[ray]],world=ray/ray_count;
+  if(g<0)return;
+  const int*info=geometry+5*g;int body=info[0];
+  packed_ids[ray]=g;
+  if(info[1]==0)return;
+  if(info[1]!=7){packed_ids[ray]=-2;return;}
+  const float*bp=body_positions+3*body_count*world;
+  const float*bq=body_quaternions+4*body_count*world;
+  float3 o=inverse_rotate(bq+4*body,sub(load3(origins+3*ray),load3(bp+3*body)));
+  float3 d=inverse_rotate(bq+4*body,load3(directions+3*ray));
+  o=inverse_rotate(poses+7*g+3,sub(o,load3(poses+7*g)));
+  d=inverse_rotate(poses+7*g+3,d);
+  float target=ranges[ray],error=INFINITY;
+  float tolerance=32.f*1.1920928955078125e-7f*fmaxf(1.f,fabsf(target))+2e-5f;
+  float maximum=target+tolerance;
+  int node=info[2],end=info[3];
+  while(node<end){
+    const int*entry=nodes+3*node;
+    if(!bounds_hit(bounds+6*node,o,d,maximum)){node=entry[2];continue;}
+    if(entry[1]>0){
+      for(int i=0;i<entry[1];++i){
+        int triangle=entry[0]+i;
+        float distance=triangle_hit(triangles+9*triangle,o,d);
+        float difference=fabsf(distance-target);
+        if(difference<error){error=difference;triangle_ids[ray]=triangle;}
+      }
+      node=entry[2];
+    }else ++node;
+  }
+  if(error>tolerance)triangle_ids[ray]=-1;
+}
+extern "C" int depth_pose_hits_v2(int batch,int ray_count,int body_count,const int*geometry,
+                                    const int*geom_lookup,const float*poses,const float*bounds,
+                                    const int*nodes,const float*triangles,const float*body_positions,
+                                    const float*body_quaternions,const float*origins,const float*directions,
+                                    const float*ranges,const long long*geom_ids,long long*packed_ids,
+                                    long long*triangle_ids,void*stream){
+  pose_hits<<<(batch*ray_count+127)/128,128,0,(cudaStream_t)stream>>>(batch,ray_count,body_count,
+    geometry,geom_lookup,poses,bounds,nodes,triangles,body_positions,body_quaternions,
+    origins,directions,ranges,geom_ids,packed_ids,triangle_ids);return int(cudaGetLastError());
+}
+'''
+
+
+
+def _primary_surface_source():
+    """Instrument the same traversal with the face selected at the accepted hop.
+
+    Range arithmetic and fminf reduction remain in their original order. The
+    additional integer witness follows each strictly improving candidate.
+    """
+    source = SOURCE[SOURCE.index('__device__ float first_hit'):]
+    source = source.replace('first_hit(', 'first_hit_surface(')
+    source = source.replace('void rays(', 'void rays_surface(').replace('rays<<<', 'rays_surface<<<')
+    source = source.replace('int depth_rays(', 'int depth_rays_surface_v3(')
+    source = source.replace('int&geom_id)', 'int&geom_id,int&packed_id,int&triangle_id)')
+    source = source.replace('float best=INFINITY;geom_id=-1;',
+                            'float best=INFINITY;geom_id=-1;packed_id=-1;triangle_id=-1;')
+    source = source.replace('const float*size=sizes+3*g;float distance=INFINITY;',
+                            'const float*size=sizes+3*g;float distance=INFINITY;int face=-1;')
+    source = source.replace('distance=fminf(distance,triangle_hit(triangles+9*(entry[0]+i),o,d));',
+        '{float candidate=triangle_hit(triangles+9*(entry[0]+i),o,d);'
+        'if(candidate<distance)face=entry[0]+i;distance=fminf(distance,candidate);}')
+    source = source.replace('best=distance;geom_id=info[4];',
+                            'best=distance;geom_id=info[4];packed_id=g;triangle_id=face;')
+    source = source.replace('float*distances,long long*ids',
+        'float*distances,long long*ids,long long*packed_ids,long long*triangle_ids,float*surface_trace')
+    source = source.replace('int id=-1;', 'int id=-1,packed=-1,triangle=-1,accepted_hop=-1;')
+    source = source.replace('int hit_id;float hit=first_hit_surface(',
+                            'int hit_id,hit_packed,hit_triangle;float hit=first_hit_surface(')
+    source = source.replace('origin,direction,hit_id);', 'origin,direction,hit_id,hit_packed,hit_triangle);')
+    source = source.replace('result=hit+traveled;id=hit_id;break;',
+        'result=hit+traveled;id=hit_id;packed=hit_packed;triangle=hit_triangle;accepted_hop=hop;break;')
+    source = source.replace('distances[ray]=result;ids[ray]=id;',
+        'distances[ray]=result;ids[ray]=id;packed_ids[ray]=packed;triangle_ids[ray]=triangle;'
+        'if(surface_trace){surface_trace[5*ray]=origin.x;surface_trace[5*ray+1]=origin.y;'
+        'surface_trace[5*ray+2]=origin.z;surface_trace[5*ray+3]=traveled;'
+        'surface_trace[5*ray+4]=float(accepted_hop);}')
+    source = source.replace('epsilon,distances,ids);',
+                            'epsilon,distances,ids,packed_ids,triangle_ids,surface_trace);')
+    return 'extern "C" int depth_surface_abi_version(){return 3;}\n'+source
+
+
+PRIMARY_SOURCE = _primary_surface_source()
+
+
+def _mesh_bvh(triangles, bounds, nodes, ordered):
+    """Preorder tree with subtree escape links, leaves contain at most 8 faces."""
+    first_node = len(nodes)
+    centroids = triangles.mean(axis=1)
+    def visit(indices):
+        index = len(nodes)
+        subset = triangles[indices]
+        lower, upper = subset.min(axis=(0, 1)), subset.max(axis=(0, 1))
+        # Outward rounding keeps a triangle on its node boundary visible.
+        bounds.append(np.r_[np.nextafter(lower, -np.inf), np.nextafter(upper, np.inf)])
+        nodes.append([0, 0, 0])
+        if len(indices) <= 8:
+            nodes[index][:2] = [len(ordered), len(indices)]
+            ordered.extend(subset)
+        else:
+            axis = np.argmax(np.ptp(centroids[indices], axis=0))
+            midpoint = len(indices)//2
+            order = indices[np.argpartition(centroids[indices, axis], midpoint)]
+            visit(order[:midpoint])
+            visit(order[midpoint:])
+        nodes[index][2] = len(nodes)
+    visit(np.arange(len(triangles)))
+    return first_node, len(nodes)
+
+
+class CudaDepthGeometry:
+    def __init__(self, geoms, body_count, device):
+        geometry, poses, sizes, bounds, nodes, triangles = [], [], [], [], [], []
+        meshes = {}
+        for geom in geoms:
+            root, end = 0, 0
+            if geom.triangles is not None:
+                # Geoms sharing one mesh tensor reuse its local BVH.
+                key = geom.triangles.data_ptr()
+                if key not in meshes:
+                    meshes[key] = _mesh_bvh(geom.triangles.cpu().numpy(), bounds, nodes, triangles)
+                root, end = meshes[key]
+            geometry.append([geom.body_id, geom.kind, root, end, geom.geom_id])
+            poses.append(np.r_[geom.position.cpu().numpy(), geom.quaternion.cpu().numpy()])
+            sizes.append(geom.size.cpu().numpy())
+        packed = dict(geometry=np.asarray(geometry, np.int32).reshape(-1, 5),
+            poses=np.asarray(poses, np.float32).reshape(-1, 7),
+            sizes=np.asarray(sizes, np.float32).reshape(-1, 3),
+            bounds=np.asarray(bounds or [np.zeros(6)], np.float32),
+            nodes=np.asarray(nodes or [[0, 0, 0]], np.int32),
+            triangles=np.asarray(triangles or [np.zeros((3, 3))], np.float32))
+        self._initialize(packed, body_count, device)
+
+    @classmethod
+    def _from_packed_arrays(cls, packed, body_count, device):
+        """Initialize the explicit captured packing validated by a diagnostic."""
+        native = cls.__new__(cls)
+        native._initialize(packed, body_count, device)
+        return native
+
+    def _initialize(self, packed, body_count, device):
+        def tensor(values, dtype):
+            return torch.tensor(values, dtype=dtype, device=device).contiguous()
+        self.geometry = tensor(packed['geometry'], torch.int32)
+        self.poses = tensor(packed['poses'], torch.float32)
+        self.sizes = tensor(packed['sizes'], torch.float32)
+        self.bounds = tensor(packed['bounds'], torch.float32)
+        self.nodes = tensor(packed['nodes'], torch.int32)
+        self.triangles = tensor(packed['triangles'], torch.float32)
+        lookup = np.full(max(packed['geometry'][:, 4], default=0)+1, -1, np.int32)
+        for index, geom_id in enumerate(packed['geometry'][:, 4]):
+            lookup[geom_id] = index
+        self.geom_lookup = tensor(lookup, torch.int32)
+        self.pose_gradients_supported = bool(np.isin(packed['geometry'][:, 1], (0, 7)).all())
+        self.body_count = body_count
+        self.device = self.geometry.device
+        parent = os.environ.get('DK_CACHE_DIR')
+        if parent:
+            Path(parent).mkdir(parents=True, exist_ok=True)
+        self.build_directory = Path(tempfile.mkdtemp(prefix='depth-rays-', dir=parent))
+        source = self.build_directory/'depth.cu'
+        source.write_text(SOURCE+POSE_SOURCE+PRIMARY_SOURCE)
+        capability = torch.cuda.get_device_capability(device)
+        command = [nvcc(), '-std=c++17', '-O3', '-shared', '-Xcompiler=-fPIC',
+                   f'-arch=sm_{capability[0]}{capability[1]}', str(source),
+                   '-o', str(self.build_directory/'depth_v3.so')]
+        result = subprocess.run(command, capture_output=True, text=True)
+        (self.build_directory/'build.log').write_text(result.stdout+result.stderr)
+        if result.returncode:
+            raise RuntimeError(f'Depth CUDA build failed, see {self.build_directory / "build.log"}')
+        self.library = ctypes.CDLL(str(self.build_directory/'depth_v3.so'))
+        self.launch = self.library.depth_rays
+        self.launch.restype = ctypes.c_int
+        self.launch.argtypes = ([ctypes.c_int]*4+[ctypes.c_void_p]*10+
+                                [ctypes.c_float]*2+[ctypes.c_int, ctypes.c_float]+[ctypes.c_void_p]*3)
+        version = self.library.depth_pose_abi_version
+        version.restype = ctypes.c_int
+        if version() != 2:
+            raise RuntimeError('Depth surface-query ABI version 2 required')
+        self.pose_launch = self.library.depth_pose_hits_v2
+        self.pose_launch.restype = ctypes.c_int
+        self.pose_launch.argtypes = [ctypes.c_int]*3+[ctypes.c_void_p]*15
+        primary_version = self.library.depth_surface_abi_version
+        primary_version.restype = ctypes.c_int
+        if primary_version() != 3:
+            raise RuntimeError('Depth primary-surface ABI version 3 required')
+        self.primary_launch = self.library.depth_rays_surface_v3
+        self.primary_launch.restype = ctypes.c_int
+        self.primary_launch.argtypes = ([ctypes.c_int]*4+[ctypes.c_void_p]*10+
+            [ctypes.c_float]*2+[ctypes.c_int, ctypes.c_float]+[ctypes.c_void_p]*6)
+        # Register outside a compile trace. The closure owns this fixed model's
+        # library and packed arrays, with no mutable global model registry.
+        name = f'nablaengine::depth_rays_{next(_OPERATOR_IDS)}'
+        @torch.library.custom_op(name, mutates_args=())
+        def operation(bp: torch.Tensor, bq: torch.Tensor, origins: torch.Tensor,
+                      directions: torch.Tensor, maximum: float, minimum: float,
+                      hops: int, epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+            return self._raycast_impl(bp, bq, origins, directions, max_distance=maximum,
+                min_distance=minimum, max_hops=hops, surface_epsilon=epsilon)
+
+        @operation.register_fake
+        def fake(bp, bq, origins, directions, maximum, minimum, hops, epsilon):
+            return origins.new_empty(origins.shape[:-1]), origins.new_empty(origins.shape[:-1], dtype=torch.long)
+
+        self.operation = operation
+        @torch.library.custom_op(f'nablaengine::depth_rays_surface_{next(_OPERATOR_IDS)}', mutates_args=())
+        def primary_operation(bp: torch.Tensor, bq: torch.Tensor, origins: torch.Tensor,
+                              directions: torch.Tensor, maximum: float, minimum: float,
+                              hops: int, epsilon: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            return self._primary_raycast_impl(bp, bq, origins, directions, max_distance=maximum,
+                min_distance=minimum, max_hops=hops, surface_epsilon=epsilon)
+
+        @primary_operation.register_fake
+        def primary_fake(bp, bq, origins, directions, maximum, minimum, hops, epsilon):
+            shape = origins.shape[:-1]
+            return (origins.new_empty(shape), origins.new_empty(shape, dtype=torch.long),
+                    origins.new_empty(shape, dtype=torch.long), origins.new_empty(shape, dtype=torch.long))
+
+        self.primary_operation = primary_operation
+        @torch.library.custom_op(f'nablaengine::depth_pose_hits_{next(_OPERATOR_IDS)}', mutates_args=())
+        def pose_operation(bp: torch.Tensor, bq: torch.Tensor, origins: torch.Tensor,
+                           directions: torch.Tensor, ranges: torch.Tensor,
+                           geom_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return self._pose_hits_impl(bp, bq, origins, directions, ranges, geom_ids)
+
+        @pose_operation.register_fake
+        def pose_fake(bp, bq, origins, directions, ranges, geom_ids):
+            return torch.empty_like(geom_ids), torch.empty_like(geom_ids)
+
+        self.pose_operation = pose_operation
+
+    @torch.no_grad()
+    def raycast_with_hits(self, body_positions, body_quaternions, origins, directions,
+                          *, max_distance=1e6, min_distance=.05, max_hops=24, surface_epsilon=1e-5):
+        """Record the triangle selected by the primary accepted-hop traversal."""
+        if torch.compiler.is_compiling():
+            return self.primary_operation(body_positions, body_quaternions, origins, directions,
+                                          max_distance, min_distance, max_hops, surface_epsilon)
+        return self._primary_raycast_impl(body_positions, body_quaternions, origins, directions,
+            max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+            surface_epsilon=surface_epsilon)
+
+    @torch.no_grad()
+    def trace_primary_hits(self, body_positions, body_quaternions, origins, directions,
+                           *, max_distance=1e6, min_distance=.05, max_hops=24, surface_epsilon=1e-5):
+        """Eager diagnostic of primary face IDs and accepted-hop coordinates."""
+        return self._primary_raycast_impl(body_positions, body_quaternions, origins, directions,
+            max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+            surface_epsilon=surface_epsilon, collect_trace=True)
+
+    def _primary_raycast_impl(self, body_positions, body_quaternions, origins, directions,
+                              *, max_distance, min_distance, max_hops, surface_epsilon, collect_trace=False):
+        inputs = [body_positions, body_quaternions, origins, directions]
+        if any(value.dtype != torch.float32 or value.device != self.device for value in inputs):
+            raise ValueError('CUDA depth rays and body poses require float32 on the packed device')
+        bp, bq, origin, direction = [value.contiguous() for value in inputs]
+        ranges = torch.empty(origins.shape[:-1], device=self.device, dtype=torch.float32)
+        ids = torch.empty_like(ranges, dtype=torch.long)
+        packed_ids, triangle_ids = torch.empty_like(ids), torch.empty_like(ids)
+        trace = torch.empty((*ranges.shape, 5), device=self.device, dtype=torch.float32) if collect_trace else None
+        arrays = [self.geometry, self.poses, self.sizes, self.bounds, self.nodes, self.triangles,
+                  bp, bq, origin, direction]
+        outputs = [ranges, ids, packed_ids, triangle_ids]
+        with torch.cuda.device(self.device):
+            stream = torch.cuda.current_stream(self.device)
+            error = self.primary_launch(origins.shape[0], origins.shape[1], len(self.geometry), self.body_count,
+                *[ctypes.c_void_p(value.data_ptr()) for value in arrays], max_distance, min_distance,
+                max_hops, surface_epsilon, *[ctypes.c_void_p(value.data_ptr()) for value in outputs],
+                ctypes.c_void_p(trace.data_ptr()) if trace is not None else None, ctypes.c_void_p(stream.cuda_stream))
+        if error:
+            raise RuntimeError(f'CUDA primary depth surface query failed with error {error}')
+        return (*outputs, trace) if collect_trace else tuple(outputs)
+
+    @torch.no_grad()
+    def pose_hits(self, body_positions, body_quaternions, origins, directions, ranges, geom_ids):
+        if torch.compiler.is_compiling():
+            return self.pose_operation(body_positions, body_quaternions, origins, directions, ranges, geom_ids)
+        return self._pose_hits_impl(body_positions, body_quaternions, origins, directions, ranges, geom_ids)
+
+    def _pose_hits_impl(self, body_positions, body_quaternions, origins, directions, ranges, geom_ids):
+        bp, bq, origin, direction, ranges, geom_ids = [value.contiguous() for value in
+            (body_positions, body_quaternions, origins, directions, ranges, geom_ids)]
+        packed_ids, triangle_ids = torch.empty_like(geom_ids), torch.empty_like(geom_ids)
+        arrays = [self.geometry, self.geom_lookup, self.poses, self.bounds, self.nodes, self.triangles,
+                  bp, bq, origin, direction, ranges, geom_ids, packed_ids, triangle_ids]
+        with torch.cuda.device(self.device):
+            stream = torch.cuda.current_stream(self.device)
+            error = self.pose_launch(origins.shape[0], origins.shape[1], self.body_count,
+                *[ctypes.c_void_p(value.data_ptr()) for value in arrays], ctypes.c_void_p(stream.cuda_stream))
+        if error:
+            raise RuntimeError(f'CUDA depth surface query failed with error {error}')
+        return packed_ids, triangle_ids
+
+    @torch.no_grad()
+    def raycast(self, body_positions, body_quaternions, origins, directions,
+                *, max_distance, min_distance, max_hops, surface_epsilon):
+        if torch.compiler.is_compiling():
+            return self.operation(body_positions, body_quaternions, origins, directions,
+                                  max_distance, min_distance, max_hops, surface_epsilon)
+        return self._raycast_impl(body_positions, body_quaternions, origins, directions,
+            max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+            surface_epsilon=surface_epsilon)
+
+    @torch.no_grad()
+    def _raycast_impl(self, body_positions, body_quaternions, origins, directions,
+                *, max_distance, min_distance, max_hops, surface_epsilon):
+        inputs = [body_positions, body_quaternions, origins, directions]
+        if any(value.dtype != torch.float32 or value.device != self.geometry.device for value in inputs):
+            raise ValueError('CUDA depth rays and body poses require float32 tensors on the packed device')
+        bp, bq, origin, direction = [value.contiguous() for value in inputs]
+        distances = torch.empty(origins.shape[:-1], dtype=torch.float32, device=self.device)
+        ids = torch.empty_like(distances, dtype=torch.long)
+        arrays = [self.geometry, self.poses, self.sizes, self.bounds, self.nodes, self.triangles,
+                  bp, bq, origin, direction]
+        with torch.cuda.device(self.device):
+            stream = torch.cuda.current_stream(self.device)
+            error = self.launch(origins.shape[0], origins.shape[1], len(self.geometry), self.body_count,
+                                *[ctypes.c_void_p(value.data_ptr()) for value in arrays],
+                                max_distance, min_distance, max_hops, surface_epsilon,
+                                ctypes.c_void_p(distances.data_ptr()), ctypes.c_void_p(ids.data_ptr()),
+                                ctypes.c_void_p(stream.cuda_stream))
+        if error:
+            raise RuntimeError(f'CUDA depth ray launch failed with error {error}')
+        return distances, ids

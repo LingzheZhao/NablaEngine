@@ -13,7 +13,7 @@ contact or row; no warp intrinsics, no shared state. They need source.DEVICE (qr
 step.STEP_DEVICE (kbimp, imp_raw, efc_D, contact_invw, sphere_sphere, make_frame and the primitives' geometry that
 collide_pair uses: plane_point, plane_capsule_frame, capsule_end, segment_point, capcap_*) before them in the compilation
 unit, and header(m) (which asserts the
-model: no boxes, no frictionloss rows). Unit-test labels: U4-U9 (docs/verification.md).
+model, plus sphere/capsule against static world boxes; no frictionloss rows). Unit-test labels: U4-U9 (docs/verification.md).
 
 Conventions:
 - P = grad Psi with MuJoCo Warp's res_* sign (the adjoint kernel subtracts it: qbar = qbar_dir - P). Every "bar"
@@ -59,14 +59,16 @@ from nablaengine.g1_engine import step
 
 
 def check_model(m):
-    """The contact adjoint is for the mjlab model only: collision geoms are planes, spheres and capsules
-    (no boxes), and no dof has a frictionloss row."""
+    """Validate primitive contacts and world-static boxes paired with spheres/capsules.
+
+    Dynamic boxes, other box pairings and frictionloss rows remain unsupported.
+    """
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
-    assert int(mujoco.mjtGeom.mjGEOM_BOX) not in types, "the adjoint has no box collisions (mjlab model only)"
-    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2}, "collision geoms other than plane / sphere / capsule"
+    from nablaengine.model.capability import unsupported_adjoint_box_pairs
+    assert not unsupported_adjoint_box_pairs(m), "box VJP requires world-static box paired with sphere/capsule"
+    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2, 3, 4}, "unsupported contact geometry"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
-    assert not (m.dof_frictionloss > 0).any(), "the adjoint has no frictionloss rows (mjlab model only)"
 
 
 def header(m):
@@ -86,7 +88,7 @@ def header(m):
 #ifndef DK_ADJ_PARALLEL_EPS
 #define DK_ADJ_PARALLEL_EPS 1.2e-3f  // sin^2(theta) = |a1 x a2|^2 / (|a1|^2 |a2|^2) of DK_ADJ_PARALLEL 1 (strict <):
 #endif                               // ~sin^2(2 degrees) (theta < 1.99 degrees)
-static_assert(!HAS_BOX && NFLOSS == 0, "the contact adjoint is for the mjlab model: no boxes, no frictionloss rows");
+
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free
@@ -319,6 +321,22 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
   *nu = __int_as_float(0x7f800000);
   if (cot)
     for (int k = 0; k < 12; k++) gb[k] = 0.f;
+#if HAS_BOX
+  if (t1 == 1 && t2 == 3) {
+    float rotation[9], normal[3]; quat2mat(q2,rotation);
+    sphere_box(p1,sz1[0],p2,rotation,sz2,dist,pos,normal); make_frame(normal,fr);
+    if(cot) static_box_sphere_vjp(p1,sz1[0],p2,rotation,sz2,cot,gb);
+    return br;
+  }
+  if (t1 == 2 && t2 == 3) { // capsule against a static world box; host gate enforces topology
+    float axis[3], rotation[9];
+    zaxis_rn(q1, axis);
+    quat2mat(q2, rotation);
+    if (!capsule_box_contact(slot,p1,axis,sz1[0],sz1[1],p2,rotation,sz2,dist,pos,fr)) return -1;
+    if (cot && !static_box_capsule_vjp(slot,p1,axis,sz1[0],sz1[1],p2,rotation,sz2,cot,gb)) return -1;
+    return br;
+  }
+#endif
   if (t1 == 0) {  // plane (the floor, static): normal = its z axis; the frame does not depend on the other geom...
     float n[3];
     zaxis_rn(q1, n);
@@ -487,8 +505,31 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
 // gx[NGEOMC][3], gq[NGEOMC][4] (struct Sim's gx / gq layout, or the adjoint's copy)
 __device__ __forceinline__ int adj_pair_geom(int pair, int slot, const float (*gx)[3], const float (*gq)[4],
                                              float* dist, float* pos, float* fr, float* nu, const float* cot,
-                                             float* gb) {
+                                             float* gb
+#if HAS_CONVEX
+                                             , static_convex::PreparedContact* convex_selection=nullptr
+#endif
+                                             ) {
   int g1 = PG1(pair), g2 = PG2(pair);
+#if HAS_CONVEX
+  if ((c_gtype[g1]==1 || c_gtype[g1]==2) && c_gtype[g2]==4) {
+    *nu=__int_as_float(0x7f800000);
+    if(cot)for(int k=0;k<12;k++)gb[k]=0.f;
+    float axis[3]={0.f,0.f,1.f};if(c_gtype[g1]==2)zaxis_rn(gq[g1],axis);
+    float radius=c_gsize[3*g1],hl=c_gtype[g1]==2?c_gsize[3*g1+1]:0.f;
+    static_convex::PreparedContact local_selection;
+    static_convex::PreparedContact& selected=convex_selection?*convex_selection:local_selection;
+    // adj_contact_one supplies one cache: its primal call prepares it and its
+    // later VJP consumes that same unchanged physical input's selected features.
+    if(!cot || !convex_selection){
+      int status=static_convex_prepare(g2,gx[g1],axis,radius,hl,gx[g2],gq[g2],selected);
+      if(status!=1)return -1;
+    }
+    if(static_convex_contact_selected(selected,slot,radius,gx[g2],gq[g2],dist,pos,fr)!=1)return -1;
+    if(cot && static_convex_vjp_selected(selected,slot,gx[g1],axis,radius,hl,gx[g2],gq[g2],cot,gb)!=1)return -1;
+    return 0;
+  }
+#endif
   return adj_contact_geom(c_gtype[g1], c_gtype[g2], slot, gx[g1], gq[g1], c_gsize + 3 * g1, gx[g2], gq[g2],
                           c_gsize + 3 * g2, dist, pos, fr, nu, cot, gb);
 }
@@ -507,4 +548,88 @@ __device__ __forceinline__ void geom_to_body_vjp(const float* xg, const float* X
 
 def source(m):
     """header(m) + DEVICE: the contact adjoint's device code for model m, to place after step.STEP_DEVICE."""
-    return header(m) + DEVICE
+    return header(m) + (static_box_dual_source() if any(int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_BOX) for g in step.collision_geoms(m)) else '') + DEVICE
+
+
+def static_box_dual_source():
+    """Experimental six-variable forward AD of the shared primitive, including witnesses.
+
+    Branches follow primal values. Feature boundaries remain nondifferentiable;
+    callers must qualify this primitive before using it for learning.
+    """
+    from nablaengine.g1_engine import step
+    primitives = step.STEP_DEVICE
+    begin = primitives.index('__device__ void sphere_box(')
+    end = primitives.index('template <class S>\n__device__ void capsule_box(', begin)
+    code = primitives[begin:end]
+    code = code.replace('sphere_box', 'dual_sphere_box').replace('capsule_box_witness', 'dual_capsule_box_witness').replace('capsule_box_contact', 'dual_capsule_box_contact')
+    code = code.replace('float', 'BoxDual')
+    prelude = r'''
+struct BoxDual {
+  float v, d[6];
+  __device__ BoxDual(float x=0.f):v(x) { for(int i=0;i<6;i++)d[i]=0.f; }
+  __device__ BoxDual& operator+=(BoxDual b);
+  __device__ BoxDual& operator-=(BoxDual b);
+  __device__ BoxDual& operator*=(BoxDual b);
+};
+#define BOX_DUAL_OP(OP,DER) __device__ BoxDual operator OP(BoxDual a,BoxDual b){BoxDual c(a.v OP b.v);for(int i=0;i<6;i++)c.d[i]=DER;return c;}
+BOX_DUAL_OP(+,a.d[i]+b.d[i])
+BOX_DUAL_OP(-,a.d[i]-b.d[i])
+BOX_DUAL_OP(*,a.d[i]*b.v+a.v*b.d[i])
+BOX_DUAL_OP(/,(a.d[i]*b.v-a.v*b.d[i])/(b.v*b.v))
+#undef BOX_DUAL_OP
+__device__ BoxDual operator-(BoxDual a){return BoxDual(0.f)-a;}
+#define BOX_DUAL_CMP(OP) __device__ bool operator OP(BoxDual a,BoxDual b){return a.v OP b.v;}
+BOX_DUAL_CMP(<) BOX_DUAL_CMP(>) BOX_DUAL_CMP(<=) BOX_DUAL_CMP(>=)
+#undef BOX_DUAL_CMP
+__device__ BoxDual& BoxDual::operator+=(BoxDual b){*this=*this+b;return *this;}
+__device__ BoxDual& BoxDual::operator-=(BoxDual b){*this=*this-b;return *this;}
+__device__ BoxDual& BoxDual::operator*=(BoxDual b){*this=*this*b;return *this;}
+__device__ BoxDual fabsf(BoxDual a){return a.v<0.f?-a:a;}
+__device__ BoxDual fminf(BoxDual a,BoxDual b){return a.v<=b.v?a:b;}
+__device__ BoxDual fmaxf(BoxDual a,BoxDual b){return a.v>=b.v?a:b;}
+__device__ BoxDual sqrtf(BoxDual a){BoxDual c(::sqrtf(a.v));for(int i=0;i<6;i++)c.d[i]=a.d[i]/(2.f*c.v);return c;}
+__device__ BoxDual safe_div(BoxDual a,BoxDual b){return a/(b.v!=0.f?b:BoxDual(1e-15f));}
+__device__ BoxDual dot3(const BoxDual*a,const BoxDual*b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+__device__ void mtv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i++)b[i]=R[i]*a[0]+R[3+i]*a[1]+R[6+i]*a[2];}
+__device__ void mv3(const BoxDual*R,const BoxDual*a,BoxDual*b){for(int i=0;i<3;i++)b[i]=R[3*i]*a[0]+R[3*i+1]*a[1]+R[3*i+2]*a[2];}
+'''
+    # Reuse the forward frame construction as well, so tangent-basis derivatives
+    # follow its actual branch rather than a surrogate normal-only objective.
+    import re
+    match = re.search(r'__device__[^\n]*void make_frame\([^\n]*', primitives)
+    if match is None:
+        raise ValueError('shared make_frame definition unavailable')
+    start = match.start()
+    brace = primitives.index('{', start)
+    depth, stop = 1, brace + 1
+    while depth:
+        depth += (primitives[stop] == '{') - (primitives[stop] == '}')
+        stop += 1
+    frame = primitives[start:stop].replace('float', 'BoxDual')
+    frame = frame.replace('dot3_rn(n, b)', 'dot3(n, b)').replace('RFMS(n[k], d, b[k])', '(b[k]-n[k]*d)').replace('normalize3_rn(b);', 'BoxDual norm=sqrtf(dot3(b,b)); for(int k=0;k<3;k++) b[k]=b[k]/norm;').replace('cross_rn(n, b, c);', 'c[0]=n[1]*b[2]-n[2]*b[1]; c[1]=n[2]*b[0]-n[0]*b[2]; c[2]=n[0]*b[1]-n[1]*b[0];')
+    wrapper = r'''
+__device__ void static_box_sphere_vjp(const float*cp,float radius,const float*bp,const float*R,const float*bs,const float*cot,float*gb){
+ BoxDual p[3],b[3],rot[9],size[3],dist,pos[3],n[3],fr[9];
+ for(int k=0;k<3;k++){p[k]=cp[k];p[k].d[k]=1.f;b[k]=bp[k];size[k]=bs[k];}
+ for(int k=0;k<9;k++)rot[k]=R[k];
+ dual_sphere_box(p,BoxDual(radius),b,rot,size,&dist,pos,n);make_frame(n,fr);
+ for(int j=0;j<6;j++){gb[j]=cot[0]*dist.d[j];for(int k=0;k<3;k++)gb[j]+=cot[1+k]*pos[k].d[j];for(int k=0;k<9;k++)gb[j]+=cot[4+k]*fr[k].d[j];}
+}
+__device__ bool static_box_capsule_vjp(int slot,const float*cp,const float*axis,float radius,float half_length,
+ const float*bp,const float*R,const float*bs,const float*cot,float*gb){
+ BoxDual p[3],a[3],b[3],rot[9],size[3],dist,pos[3],fr[9];
+ for(int k=0;k<3;k++){p[k]=cp[k];p[k].d[k]=1.f;a[k]=axis[k];b[k]=bp[k];size[k]=bs[k];}
+ for(int j=0;j<3;j++){int u=(j+1)%3,v=(j+2)%3;a[u].d[3+j]=-axis[v];a[v].d[3+j]=axis[u];}
+ for(int k=0;k<9;k++)rot[k]=R[k];
+ if(!dual_capsule_box_contact(slot,p,a,BoxDual(radius),BoxDual(half_length),b,rot,size,&dist,pos,fr))return false;
+ for(int j=0;j<6;j++){gb[j]=cot[0]*dist.d[j];for(int k=0;k<3;k++)gb[j]+=cot[1+k]*pos[k].d[j];for(int k=0;k<9;k++)gb[j]+=cot[4+k]*fr[k].d[j];}
+ return true;
+}
+'''
+    generated = prelude + frame + code + wrapper
+    # Keep overloads out of the engine namespace: CUDA's global float overloads
+    # must remain visible to every existing solver function.
+    generated = 'namespace box_ad {\n' + generated + '\n}\n'
+    generated += 'using box_ad::static_box_capsule_vjp;\nusing box_ad::static_box_sphere_vjp;\n'
+    return generated

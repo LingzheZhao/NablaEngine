@@ -85,7 +85,7 @@ functions) and the contact VJPs (adjoint_contact.source); the caller adds its __
 import mujoco
 import numpy as np
 
-from nablaengine.g1_engine import adjoint_contact, source, step, tape
+from nablaengine.g1_engine import convex_contact, adjoint_contact, source, step, tape
 
 ADJ_ROWS_SKIPPED = 1 << 12  # info: a record has contacts or constraint rows that this build does not differentiate
 ADJ_REPLAY_MISMATCH = 1 << 13  # info: a replayed contact is not penetrating, or the replayed limit rows differ in number
@@ -168,9 +168,7 @@ def solimp_powers(m):
 
 def header(m):
     """#defines of the adjoint (stage, options, debug layout, the model's solimp power); asserts the mjlab-only scope."""
-    assert not any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX for g in step.collision_geoms(m)), \
-        "the adjoint is for the mjlab model: no box geoms"
-    assert not (m.dof_frictionloss > 0).any(), "the adjoint is for the mjlab model: no frictionloss rows"
+    adjoint_contact.check_model(m)
     assert m.nu == m.nv - 6, "one position actuator per hinge dof"
     lay, nw = debug_layout(m)
     lines = [f"#define ADJ_ROWS_SKIPPED {ADJ_ROWS_SKIPPED}u", f"#define ADJ_REPLAY_MISMATCH {ADJ_REPLAY_MISMATCH}u",
@@ -206,7 +204,7 @@ static_assert(DK_ADJ_CLAMP_KV >= 0 && DK_ADJ_CLAMP_KV <= 2, "DK_ADJ_CLAMP_KV: 0,
 #define ADJ_SOFT_PARAM
 #define ADJ_SOFT_ARG(x)
 #endif
-static_assert(HAS_BOX == 0 && NFLOSS == 0, "the adjoint is for the mjlab model (no boxes, no frictionloss rows)");
+
 static_assert(DK_ADJ_STAGE >= 1 && DK_ADJ_STAGE <= 3, "DK_ADJ_STAGE: 1, 2 or 3");
 static_assert(NB <= 31, "the contact reduction: lanes 0 and 31 take two of the root rotation dofs");
 #define CS_N 24  // per-contact words (A6, in registers of the contact's lane): W_v, W_a, W_lam (0-8), contact point
@@ -255,8 +253,8 @@ struct Adj {
   float com[3], fric;
   unsigned clamp[(NV + 31) / 32];  // the record's actuator clamp mask (dof bits)
   unsigned zone[(NEFC + 31) / 32];  // the record's quadratic-zone bits of the constraint rows (forward row order)
-  unsigned con[(MAXCON + 1) / 2];  // the record's contact table: pair | slot << 9 per 16 bits
-  int hdr;  // the record's header: ncon[7] | nefc[9] << 7 | nlim[8] << 16 | niter[8] << 24
+  unsigned con[MAXCON];  // one uint32 pair | slot << 16 per contact
+  int hdr;  // the record's header: ncon[8] | nefc[10] << 8 | nlim[6] << 18 | niter[8] << 24
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
   // bodies, lane b = body b (body 0: the world, at rest). Forward quantities (A3) read up to A7:
   float Q[NB][4], X[NB][3], z[NB][3];  // pose (X_b: origin = hinge anchor), hinge axis z_b = R_b axis_b (b >= 2)
@@ -789,14 +787,14 @@ __device__ __noinline__ void adj_solves(Adj& s, const float* rec, int lane) {
   for (int e = lane; e < NTRI; e += 32) s.L[e] = __ldcs(rec + OFF_LQ + e);
   for (int i = lane; i < NV; i += 32) s.y[i] = s.abar[i];
   tri_solve_packed(s.L, s.y, lane);
-  for (int i = lane; i < NV; i += 32) { s.abar[i] -= h * c_kv[i] * s.y[i]; s.ny[i] = -s.y[i]; }
+  for (int i = lane; i < NV; i += 32) { s.abar[i] -= h * (c_kv[i] + c_damping[i]) * s.y[i]; s.ny[i] = -s.y[i]; }
   __syncwarp();
   APROF(APROF_SOLVE_Q);
 #ifdef DK_ADJ_DEBUG
   {  // |M a*| for the residual check's scale
     tri_mul_llt(s.L, s.a, s.tmp, s.did, lane);
     float acc = 0.f;
-    for (int i = lane; i < NV; i += 32) { float x = s.did[i] - h * c_kv[i] * s.a[i]; acc += x * x; }
+    for (int i = lane; i < NV; i += 32) { float x = s.did[i] - h * (c_kv[i] + c_damping[i]) * s.a[i]; acc += x * x; }
     acc = warp_sum(acc);
     if (lane == 0) s.ma_norm = sqrtf(acc);
     __syncwarp();
@@ -845,6 +843,7 @@ __device__ void adj_compose(Adj& s, int lane) {
   }
   __syncwarp();
   for (int i = lane; i < NV; i += 32) {
+    s.Pv[i] += c_damping[i] * s.lam[i];
     if (i < 3) s.qbar[i] -= s.Pq[i];
     else if (i >= 6) s.qbar[i + 1] -= s.Pq[i];
     s.vbar[i] -= s.Pv[i];
@@ -887,7 +886,22 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
   float* const dbg = DBG ? dbg_in : nullptr;
   (void)dbg;  // no debug entries without -DDK_ADJ_DEBUG
   const unsigned below = (1u << lane) - 1u;
-  int nl = 0;
+  int nf = 0;
+  for(int i0=0;i0<NV;i0+=32){
+    int i=i0+lane;bool on=i<NV && c_floss[i]>0.f;
+    unsigned mask=__ballot_sync(0xffffffffu,on);
+    if(on){
+      int row=nf+__popc(mask&below);
+      if((s.zone[row>>5]>>(row&31))&1u){
+        float ri[6];adj_row_impedance(c_dsolref,c_dsolimp,0.f,c_dinvw[i],ri);
+        // In the quadratic friction zone Psi=D*(a+b*v)*lambda.
+        // Saturated dry-friction force is constant and contributes no pose/velocity derivative.
+        s.Pv[i]+=ri[4]*ri[1]*s.lam[i];
+      }
+    }
+    nf+=__popc(mask);
+  }
+  int nl = NFLOSS;
 #pragma unroll 1
   for (int i0 = 0; i0 < NV; i0 += 32) {
     const int i = min(i0 + lane, NV - 1);  // clamped so that the loads need no branch (as the forward)
@@ -923,9 +937,9 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
 #endif
     nl += __popc(bal);
   }
-  if (lane == 0 && nl != (int)(((unsigned)s.hdr >> 16) & 255u)) s.flags |= (int)ADJ_REPLAY_MISMATCH;
+  if (lane == 0 && nl - NFLOSS != (int)(((unsigned)s.hdr >> 18) & 63u)) s.flags |= (int)ADJ_REPLAY_MISMATCH;
   __syncwarp();
-  APROF_COUNT(APROF_COUNT_LIMIT_ROWS, nl);
+  APROF_COUNT(APROF_COUNT_LIMIT_ROWS, nl - NFLOSS);
   APROF(APROF_LIMITS);
 }
 
@@ -943,7 +957,15 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
                                                  float* dbg) {
   const int g1 = PG1(pair), g2 = PG2(pair), b1 = c_gbody[g1], b2 = c_gbody[g2], dim = PDIM(pair);
   float d, p[3], fr[9], nu;
-  const int br = adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr);
+#if HAS_CONVEX
+  static_convex::PreparedContact convex_selection;
+#endif
+  const int br = adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr
+#if HAS_CONVEX
+                               , &convex_selection
+#endif
+                               );
+  if (br < 0) { asm volatile("trap;"); return 0.f; }
   const float mu = PFOOT(pair) ? s.fric : PMU(pair);
   float ri[6];
   adj_row_impedance(PSOLREF(pair), PSOLIMP(pair), d, contact_invw(pair, mu), ri);
@@ -981,7 +1003,13 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   for (int t = 0; t < 12; t++) fg[t] = 0.f;
   if (zone) {  // the primitive's VJP (it replays again) and the geoms' pose cotangents on their bodies
     float d2, p2[3], fr2[9], nu2, gb[12];
-    adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb);
+    if (adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb
+#if HAS_CONVEX
+                      , &convex_selection
+#endif
+                      ) < 0) {
+      asm volatile("trap;"); return 0.f;
+    }
     if (b1) geom_to_body_vjp(s.gx[g1], s.X[b1], gb, gb + 3, fg, fg + 3);
     geom_to_body_vjp(s.gx[g2], s.X[b2], gb + 6, gb + 9, fg + 6, fg + 9);
   }
@@ -1051,7 +1079,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
   // ncon through votes (uniform_int, step.py), and UNIFORM for the per-contact branches: the batch loops and the
   // shuffles in them are then uniform for the compiler (no divergence checks; see step.py UNIFORM). Without the votes
   // the shuffles cost 5% of k_adjoint (RTX 3090, at 6 worlds per SM)
-  const int ncon = uniform_int(s.hdr & 127, 7), nlim = ((unsigned)s.hdr >> 16) & 255;
+  const int ncon = uniform_int(s.hdr & 255, 8), nlim = ((unsigned)s.hdr >> 18) & 63;
   for (int g = lane; g < NGEOMC; g += 32) {  // geom_poses (step.py)
     const int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
@@ -1084,10 +1112,10 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
   for (int c0 = 0; c0 < ncon; c0 += 32) {
     const int c = c0 + lane, nb = min(32, ncon - c0);
     const bool on = c < ncon;
-    const unsigned e = on ? (s.con[c >> 1] >> (16 * (c & 1))) & 0xFFFFu : 0u;
-    const int pair = e & 511u, slot = e >> 9, dim = on ? PDIM(pair) : 0;
+    const unsigned e = on ? s.con[c] : 0u;
+    const int pair = e & TAPE_PAIR_MASK, slot = e >> TAPE_PAIR_BITS, dim = on ? PDIM(pair) : 0;
     const unsigned b3 = __ballot_sync(0xffffffffu, dim == 3);
-    const int r0 = nlim + c + 3 * (ntri + __popc(b3 & below));  // the contact's first row
+    const int r0 = NFLOSS + nlim + c + 3 * (ntri + __popc(b3 & below));  // the contact's first row
     ntri += __popc(b3);
     const bool use = on && (DK_ADJ_STAGE >= 3 || c_gbody[PG1(pair)] == 0);
     unsigned zone = 0u;
@@ -1226,7 +1254,7 @@ __device__ void adj_residual(Adj& s, const float* ctrl, float* dbg, int lane) {
 // adj_contacts (written by other lanes before the caller's __syncwarp): the limit row's sigma f, and s_i col_i . F_c
 // of every contact c whose support holds the dof (F_c: its force sum_e -D x_e u_e at its point)
 __device__ void adj_jtf(Adj& s, const float* dbg, int lane) {
-  const int ncon = s.hdr & 127;
+  const int ncon = s.hdr & 255;
   for (int i = lane; i < NV; i += 32) {
     const int bi = c_dofbody[i];
     float acc = 0.f;
@@ -1235,7 +1263,7 @@ __device__ void adj_jtf(Adj& s, const float* dbg, int lane) {
       acc = (q - c_jrange[2 * i] < c_jrange[2 * i + 1] - q ? 1.f : -1.f) * dbg[DBG_LIM_FORCE + i];
     }
     for (int c = 0; c < ncon; c++) {
-      const int pair = (s.con[c >> 1] >> (16 * (c & 1))) & 511u;
+      const int pair = s.con[c] & TAPE_PAIR_MASK;
       const unsigned m1 = c_ancmask[c_gbody[PG1(pair)]], m2 = c_ancmask[c_gbody[PG2(pair)]];
       if (!(((m1 ^ m2) >> bi) & 1u)) continue;
       const float sg = (m2 >> bi) & 1u ? 1.f : -1.f, *F = dbg + DBG_CON_FORCE + 3 * c, *p = dbg + DBG_CON_POS + 3 * c;
@@ -1269,6 +1297,11 @@ __device__ void adj_init(Adj& s, int lane) {
 // s.ubar accumulates. rec: its tape record. dbg, ctrl: -DDK_ADJ_DEBUG (this world's debug record of the substep, the
 // world's ctrl); null otherwise
 __device__ void adj_substep(Adj& s, const float* rec, int lane, float* dbg, const float* ctrl) {
+  // Reject records from another contact-table format before reading their fields.
+  if (__float_as_uint(__ldcs(rec + OFF_RESERVED)) != TAPE_FORMAT_MARKER) {
+    asm volatile("trap;");
+    return;
+  }
   // A0
   for (int i = lane; i < NQ; i += 32) s.q[i] = __ldcs(rec + OFF_QPOS + i);
   for (int i = lane; i < NV; i += 32) {
@@ -1277,12 +1310,12 @@ __device__ void adj_substep(Adj& s, const float* rec, int lane, float* dbg, cons
   }
   if (lane < (NV + 31) / 32) s.clamp[lane] = __float_as_uint(__ldcs(rec + OFF_CLAMP + lane));
   if (lane < (NEFC + 31) / 32) s.zone[lane] = __float_as_uint(__ldcs(rec + OFF_ZONE + lane));
-  for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.con[i] = __float_as_uint(__ldcs(rec + OFF_CON + i));
+  for (int i = lane; i < MAXCON; i += 32) s.con[i] = __float_as_uint(__ldcs(rec + OFF_CON + i));
   if (lane == 0) {
     unsigned hd = __float_as_uint(__ldcs(rec + OFF_HDR));
     s.hdr = (int)hd;
     s.flags |= (int)__float_as_uint(__ldcs(rec + OFF_FLAGS));
-    if (DK_ADJ_STAGE < 2 && (hd & 0xFFFFu)) s.flags |= ADJ_ROWS_SKIPPED;  // contacts (ncon) or rows (nefc)
+    if (DK_ADJ_STAGE < 2 && (hd & 0x3FFFFu)) s.flags |= ADJ_ROWS_SKIPPED;  // contacts (ncon) or rows (nefc)
   }
   __syncwarp();
   APROF(APROF_RECORD);
@@ -1471,24 +1504,26 @@ static inline size_t adj_launch_smem(int worlds_per_sm = -1, cudaError_t* err = 
 """
 
 
-def cuda_source(m, max_contacts=None):
+def cuda_source(m, max_contacts=None, convex_hulls=None):
     """The device code of the forward and the adjoint as one compilation unit, with k_adjoint's launch helpers
     (adj_launch_smem; no __global__ forward kernel, no host main)."""
     maxd = source.constants(m)[1]
-    return (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m, max_contacts)
-            + tape.header(m, max_contacts) + header(m) + source.DEVICE + step.STEP_DEVICE + step.STEP_KERNEL
+    return (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m, max_contacts, convex_hulls)
+            + tape.header(m, max_contacts) + header(m) + source.DEVICE
+            + ("" if convex_hulls is None else convex_contact.device_source())
+            + step.STEP_DEVICE + step.STEP_KERNEL
             + adjoint_contact.source(m) + ADJ_DEVICE + ADJ_KERNEL)
 
 
-def engine_constants(m, foot_pairs):
+def engine_constants(m, foot_pairs, convex_hulls=None):
     """(constants as one float32 array, [(symbol, kind, count, width)] in packing order, sizes) for the host loader
     (scripts/engine_step_check.py loader()), as engine_step_check packs them."""
     c1, _ = source.constants(m)
-    c2 = step.pair_constants(m, foot_pairs)
+    c2 = step.pair_constants(m, foot_pairs, convex_hulls)
     dofbody, mask = step.extra_constants(m)
     halves = np.stack([mask & 0xFFFF, mask >> 16], 1).ravel()
     consts = np.concatenate([c1, c2, dofbody.astype(np.float32), halves.astype(np.float32)])
     sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv}
-    lays = (list(source.CONST_LAYOUT) + [(s, k, n, 1) for s, k, n in step.const_layout(m)]
+    lays = (list(source.CONST_LAYOUT) + [(s, k, n, 1) for s, k, n in step.const_layout(m, convex_hulls)]
             + [("c_dofbody", "i", "nv", 1), ("c_ancmask", "u", "nb", 1)])
     return consts, lays, sizes
