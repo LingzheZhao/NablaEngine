@@ -26,14 +26,16 @@ def _selected_plane_range(body_positions, body_quaternions, origins, directions,
     external to this calculation. The denominator test matches the forward
     triangle intersection, including its area scaling.
     """
-    conjugate = body_quaternions.new_tensor([1., -1., -1., -1.])
-    local_origin = _rotate(body_quaternions*conjugate, origins-body_positions)
-    local_direction = _rotate(body_quaternions*conjugate, directions)
-    local_origin = _rotate(geom_poses[..., 3:]*conjugate, local_origin-geom_poses[..., :3])
-    local_direction = _rotate(geom_poses[..., 3:]*conjugate, local_direction)
+    body_inverse = torch.cat([body_quaternions[..., :1], -body_quaternions[..., 1:]], -1)
+    geom_inverse = torch.cat([geom_poses[..., 3:4], -geom_poses[..., 4:]], -1)
+    local_origin = _rotate(body_inverse, origins-body_positions)
+    local_direction = _rotate(body_inverse, directions)
+    local_origin = _rotate(geom_inverse, local_origin-geom_poses[..., :3])
+    local_direction = _rotate(geom_inverse, local_direction)
     edge1, edge2 = triangles[..., 1, :]-triangles[..., 0, :], triangles[..., 2, :]-triangles[..., 0, :]
     normal = torch.linalg.cross(edge1, edge2)
-    normal = torch.where(is_plane[..., None], normal.new_tensor([0., 0., 1.]), normal)
+    plane_normal = torch.cat([torch.zeros_like(normal[..., :2]), torch.ones_like(normal[..., :1])], -1)
+    normal = torch.where(is_plane[..., None], plane_normal, normal)
     anchor = torch.where(is_plane[..., None], 0., triangles[..., 0, :])
     denominator = (normal*local_direction).sum(-1)
     threshold = torch.finfo(origins.dtype).eps*edge1.norm(dim=-1)*edge2.norm(dim=-1)
