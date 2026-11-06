@@ -1,9 +1,10 @@
 """First-hit depth rays against a fixed model's visible geometry.
 
 Mesh triangles retain their compiled representation and geom frame. Dynamic
-robot geoms use the supplied body poses, including self occlusion. Images are
-stop-gradient observations. Camera rays, image-plane conversion and image
-processing belong to the camera consumer.
+robot geoms use the supplied body poses, including self occlusion. The default
+raycast produces stop-gradient observations. An explicit fixed-surface method
+adds piecewise pose derivatives. Camera rays and image processing belong to the
+camera consumer.
 """
 from dataclasses import dataclass
 
@@ -15,6 +16,32 @@ def _rotate(quaternion, vector):
     qvector = quaternion[..., 1:]
     twice_cross = 2*torch.linalg.cross(qvector, vector)
     return vector+quaternion[..., :1]*twice_cross+torch.linalg.cross(qvector, twice_cross)
+
+
+def _selected_plane_range(body_positions, body_quaternions, origins, directions,
+                          geom_poses, triangles, is_plane):
+    """Continuous range on one selected geom-local plane, with unit WXYZ poses.
+
+    All tensors have matching leading ray dimensions. Triangle selection is
+    external to this calculation. The denominator test matches the forward
+    triangle intersection, including its area scaling.
+    """
+    conjugate = body_quaternions.new_tensor([1., -1., -1., -1.])
+    local_origin = _rotate(body_quaternions*conjugate, origins-body_positions)
+    local_direction = _rotate(body_quaternions*conjugate, directions)
+    local_origin = _rotate(geom_poses[..., 3:]*conjugate, local_origin-geom_poses[..., :3])
+    local_direction = _rotate(geom_poses[..., 3:]*conjugate, local_direction)
+    edge1, edge2 = triangles[..., 1, :]-triangles[..., 0, :], triangles[..., 2, :]-triangles[..., 0, :]
+    normal = torch.linalg.cross(edge1, edge2)
+    normal = torch.where(is_plane[..., None], normal.new_tensor([0., 0., 1.]), normal)
+    anchor = torch.where(is_plane[..., None], 0., triangles[..., 0, :])
+    denominator = (normal*local_direction).sum(-1)
+    threshold = torch.finfo(origins.dtype).eps*edge1.norm(dim=-1)*edge2.norm(dim=-1)
+    threshold = torch.where(is_plane, 0., threshold)
+    valid = denominator.abs() > threshold
+    safe_denominator = torch.where(valid, denominator, 1.)
+    distance = (normal*(anchor-local_origin)).sum(-1)/safe_denominator
+    return distance, valid
 
 
 def _sphere(origins, directions, radius):
@@ -174,6 +201,52 @@ class DepthGeometry:
             ranges.append(torch.where(valid, total, max_distance))
             geom_ids.append(torch.where(valid, geom_id, -1))
         return torch.cat(ranges, dim=1), torch.cat(geom_ids, dim=1)
+
+    def raycast_with_pose_gradients(self, body_positions, body_quaternions, ray_origins, ray_directions,
+                                   *, max_distance=1e6, min_distance=.05, max_hops=24,
+                                   surface_epsilon=1e-5):
+        """Return original CUDA ranges with fixed-hit mesh/plane pose gradients.
+
+        Shapes and unit-ray/WXYZ conventions match ``raycast``. The selected
+        geom and triangle are discrete. Each accepted plane is differentiated
+        against the original ray, including hits after near-surface skipping.
+        Camera origins/directions and dynamic body poses receive gradients.
+        Body zero and model geometry stay fixed. Misses and ranges beyond
+        max_distance have zero gradient. A downstream image clamp determines
+        the derivative of clipped optical depth.
+
+        Face switches, edges, near/far thresholds and exactly grazing rays are
+        nonsmooth. At a zero/forward-degenerate denominator the derivative is
+        defined as zero. At other selection boundaries this returns the chosen
+        plane's one-sided derivative. Use normalized quaternion tangents and
+        unit-direction tangents when perturbing physical poses and rays.
+        """
+        native = self.cuda_backend
+        if native is None or not self.geoms or not native.pose_gradients_supported:
+            raise ValueError('Depth pose gradients require native CUDA mesh/plane geometry')
+        ranges, geom_ids = self.raycast(body_positions, body_quaternions, ray_origins, ray_directions,
+            max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+            surface_epsilon=surface_epsilon)
+        packed_ids, triangle_ids = native.pose_hits(body_positions, body_quaternions,
+            ray_origins, ray_directions, ranges, geom_ids)
+        geom = packed_ids.clamp_min(0)
+        info, poses = native.geometry[geom], native.poses[geom]
+        plane = info[..., 1] == 0
+        hit = geom_ids >= 0
+        recognized = (packed_ids >= 0) & (plane | (triangle_ids >= 0))
+        torch._assert_async((~hit | recognized).all(), 'Accepted depth hit has no recoverable surface')
+        body = info[..., 0].long()
+        batch = torch.arange(body_positions.shape[0], device=body.device)[:, None]
+        position, quaternion = body_positions[batch, body], body_quaternions[batch, body]
+        position = torch.where((body == 0)[..., None], position.detach(), position)
+        quaternion = torch.where((body == 0)[..., None], quaternion.detach(), quaternion)
+        triangles = native.triangles[triangle_ids.clamp_min(0)]
+        analytic, differentiable = _selected_plane_range(position, quaternion, ray_origins,
+            ray_directions, poses, triangles, plane)
+        # The subtraction is parenthesized so the forward producer's bits are
+        # retained. Accepted near hits use the original ray, not a hop origin.
+        differential = torch.where(hit & differentiable, analytic-analytic.detach(), 0.)
+        return ranges+differential, geom_ids
 
     def _first_hit(self, body_positions, body_quaternions, origins, directions, *, triangle_chunk=128):
         nearest = torch.full(origins.shape[:-1], torch.inf, device=origins.device, dtype=origins.dtype)

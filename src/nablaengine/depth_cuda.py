@@ -139,6 +139,65 @@ extern "C" int depth_rays(int batch,int ray_count,int geom_count,int body_count,
 '''
 
 
+# The original range kernel above remains the sole forward-value producer. This
+# query recovers the accepted surface on that already selected geom, including
+# an exit surface reached after skipping nearer intersections.
+POSE_SOURCE = r'''
+#define DEPTH_POSE_ABI_VERSION 2
+extern "C" int depth_pose_abi_version(){return DEPTH_POSE_ABI_VERSION;}
+__global__ void pose_hits(int batch,int ray_count,int body_count,const int*geometry,
+                           const int*geom_lookup,const float*poses,const float*bounds,
+                           const int*nodes,const float*triangles,const float*body_positions,
+                           const float*body_quaternions,const float*origins,const float*directions,
+                           const float*ranges,const long long*geom_ids,long long*packed_ids,
+                           long long*triangle_ids){
+  int ray=blockIdx.x*blockDim.x+threadIdx.x;if(ray>=batch*ray_count)return;
+  packed_ids[ray]=-1;triangle_ids[ray]=-1;
+  if(geom_ids[ray]<0)return;
+  int g=geom_lookup[geom_ids[ray]],world=ray/ray_count;
+  if(g<0)return;
+  const int*info=geometry+5*g;int body=info[0];
+  packed_ids[ray]=g;
+  if(info[1]==0)return;
+  if(info[1]!=7){packed_ids[ray]=-2;return;}
+  const float*bp=body_positions+3*body_count*world;
+  const float*bq=body_quaternions+4*body_count*world;
+  float3 o=inverse_rotate(bq+4*body,sub(load3(origins+3*ray),load3(bp+3*body)));
+  float3 d=inverse_rotate(bq+4*body,load3(directions+3*ray));
+  o=inverse_rotate(poses+7*g+3,sub(o,load3(poses+7*g)));
+  d=inverse_rotate(poses+7*g+3,d);
+  float target=ranges[ray],error=INFINITY;
+  float tolerance=32.f*1.1920928955078125e-7f*fmaxf(1.f,fabsf(target))+2e-5f;
+  float maximum=target+tolerance;
+  int node=info[2],end=info[3];
+  while(node<end){
+    const int*entry=nodes+3*node;
+    if(!bounds_hit(bounds+6*node,o,d,maximum)){node=entry[2];continue;}
+    if(entry[1]>0){
+      for(int i=0;i<entry[1];++i){
+        int triangle=entry[0]+i;
+        float distance=triangle_hit(triangles+9*triangle,o,d);
+        float difference=fabsf(distance-target);
+        if(difference<error){error=difference;triangle_ids[ray]=triangle;}
+      }
+      node=entry[2];
+    }else ++node;
+  }
+  if(error>tolerance)triangle_ids[ray]=-1;
+}
+extern "C" int depth_pose_hits_v2(int batch,int ray_count,int body_count,const int*geometry,
+                                    const int*geom_lookup,const float*poses,const float*bounds,
+                                    const int*nodes,const float*triangles,const float*body_positions,
+                                    const float*body_quaternions,const float*origins,const float*directions,
+                                    const float*ranges,const long long*geom_ids,long long*packed_ids,
+                                    long long*triangle_ids,void*stream){
+  pose_hits<<<(batch*ray_count+127)/128,128,0,(cudaStream_t)stream>>>(batch,ray_count,body_count,
+    geometry,geom_lookup,poses,bounds,nodes,triangles,body_positions,body_quaternions,
+    origins,directions,ranges,geom_ids,packed_ids,triangle_ids);return int(cudaGetLastError());
+}
+'''
+
+
 def _mesh_bvh(triangles, bounds, nodes, ordered):
     """Preorder tree with subtree escape links, leaves contain at most 8 faces."""
     first_node = len(nodes)
@@ -187,6 +246,11 @@ class CudaDepthGeometry:
         self.bounds = tensor(bounds or [np.zeros(6)], torch.float32)
         self.nodes = tensor(nodes or [[0, 0, 0]], torch.int32)
         self.triangles = tensor(triangles or [np.zeros((3, 3))], torch.float32)
+        lookup = np.full(max((geom.geom_id for geom in geoms), default=0)+1, -1, np.int32)
+        for index, geom in enumerate(geoms):
+            lookup[geom.geom_id] = index
+        self.geom_lookup = tensor(lookup, torch.int32)
+        self.pose_gradients_supported = all(geom.kind in (0, 7) for geom in geoms)
         self.body_count = body_count
         self.device = self.geometry.device
         parent = os.environ.get('DK_CACHE_DIR')
@@ -194,20 +258,27 @@ class CudaDepthGeometry:
             Path(parent).mkdir(parents=True, exist_ok=True)
         self.build_directory = Path(tempfile.mkdtemp(prefix='depth-rays-', dir=parent))
         source = self.build_directory/'depth.cu'
-        source.write_text(SOURCE)
+        source.write_text(SOURCE+POSE_SOURCE)
         capability = torch.cuda.get_device_capability(device)
         command = [nvcc(), '-std=c++17', '-O3', '-shared', '-Xcompiler=-fPIC',
                    f'-arch=sm_{capability[0]}{capability[1]}', str(source),
-                   '-o', str(self.build_directory/'depth.so')]
+                   '-o', str(self.build_directory/'depth_v2.so')]
         result = subprocess.run(command, capture_output=True, text=True)
         (self.build_directory/'build.log').write_text(result.stdout+result.stderr)
         if result.returncode:
             raise RuntimeError(f'Depth CUDA build failed, see {self.build_directory / "build.log"}')
-        self.library = ctypes.CDLL(str(self.build_directory/'depth.so'))
+        self.library = ctypes.CDLL(str(self.build_directory/'depth_v2.so'))
         self.launch = self.library.depth_rays
         self.launch.restype = ctypes.c_int
         self.launch.argtypes = ([ctypes.c_int]*4+[ctypes.c_void_p]*10+
                                 [ctypes.c_float]*2+[ctypes.c_int, ctypes.c_float]+[ctypes.c_void_p]*3)
+        version = self.library.depth_pose_abi_version
+        version.restype = ctypes.c_int
+        if version() != 2:
+            raise RuntimeError('Depth surface-query ABI version 2 required')
+        self.pose_launch = self.library.depth_pose_hits_v2
+        self.pose_launch.restype = ctypes.c_int
+        self.pose_launch.argtypes = [ctypes.c_int]*3+[ctypes.c_void_p]*15
         # Register outside a compile trace. The closure owns this fixed model's
         # library and packed arrays, with no mutable global model registry.
         name = f'nablaengine::depth_rays_{next(_OPERATOR_IDS)}'
@@ -223,6 +294,37 @@ class CudaDepthGeometry:
             return origins.new_empty(origins.shape[:-1]), origins.new_empty(origins.shape[:-1], dtype=torch.long)
 
         self.operation = operation
+        @torch.library.custom_op(f'nablaengine::depth_pose_hits_{next(_OPERATOR_IDS)}', mutates_args=())
+        def pose_operation(bp: torch.Tensor, bq: torch.Tensor, origins: torch.Tensor,
+                           directions: torch.Tensor, ranges: torch.Tensor,
+                           geom_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return self._pose_hits_impl(bp, bq, origins, directions, ranges, geom_ids)
+
+        @pose_operation.register_fake
+        def pose_fake(bp, bq, origins, directions, ranges, geom_ids):
+            return torch.empty_like(geom_ids), torch.empty_like(geom_ids)
+
+        self.pose_operation = pose_operation
+
+    @torch.no_grad()
+    def pose_hits(self, body_positions, body_quaternions, origins, directions, ranges, geom_ids):
+        if torch.compiler.is_compiling():
+            return self.pose_operation(body_positions, body_quaternions, origins, directions, ranges, geom_ids)
+        return self._pose_hits_impl(body_positions, body_quaternions, origins, directions, ranges, geom_ids)
+
+    def _pose_hits_impl(self, body_positions, body_quaternions, origins, directions, ranges, geom_ids):
+        bp, bq, origin, direction, ranges, geom_ids = [value.contiguous() for value in
+            (body_positions, body_quaternions, origins, directions, ranges, geom_ids)]
+        packed_ids, triangle_ids = torch.empty_like(geom_ids), torch.empty_like(geom_ids)
+        arrays = [self.geometry, self.geom_lookup, self.poses, self.bounds, self.nodes, self.triangles,
+                  bp, bq, origin, direction, ranges, geom_ids, packed_ids, triangle_ids]
+        with torch.cuda.device(self.device):
+            stream = torch.cuda.current_stream(self.device)
+            error = self.pose_launch(origins.shape[0], origins.shape[1], self.body_count,
+                *[ctypes.c_void_p(value.data_ptr()) for value in arrays], ctypes.c_void_p(stream.cuda_stream))
+        if error:
+            raise RuntimeError(f'CUDA depth surface query failed with error {error}')
+        return packed_ids, triangle_ids
 
     @torch.no_grad()
     def raycast(self, body_positions, body_quaternions, origins, directions,

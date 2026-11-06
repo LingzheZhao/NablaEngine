@@ -115,6 +115,29 @@ operation with a fake implementation. Direct CUDA Graph capture and compiled gra
 `scripts/check_depth_geometry.py --check-graphs`. Select `backend="torch"` explicitly at construction for the
 verification implementation.
 
+### Fixed-hit pose gradients
+
+Call `camera_geometry.raycast_with_pose_gradients(...)` with the same tensor inputs and ray-range keywords
+when observation derivatives are required. This opt-in method requires the native CUDA backend and visible
+mesh/plane geometry. The default `raycast` method keeps its stop-gradient behavior. Geometry construction and
+its GPU triangle storage are shared by both methods.
+
+The forward ranges and model geom IDs come from the existing range kernel. A no-gradient query recovers the
+accepted triangle in that selected geom. Torch then differentiates its plane intersection against the original
+world ray, including surfaces reached after near-hit skipping. Camera ray origins/directions and dynamic body
+positions/WXYZ quaternions receive gradients. World body zero and packed model geometry stay fixed. Physical
+quaternion and unit-ray perturbations use their normalized tangents.
+
+Misses and ranges beyond `max_distance` have zero derivatives. Clipped optical-depth derivatives follow the
+consumer's clamp. At face/near/far switches the selected plane supplies a one-sided derivative. The derivative
+at a zero or forward-degenerate plane denominator is defined as zero. An accepted hit whose surface cannot be
+recovered raises an asynchronous device assertion. The method preserves fixed-shape Torch composition for
+full-graph compilation and CUDA Graph capture. CUDA surface-query libraries use ABI version 2.
+
+`scripts/check_depth_pose_gradients.py --cpu-math-only` checks the runtime plane formula with generated
+independent geometry. Its CUDA mode additionally consumes a model, matching states and `rays.npz` written by
+`check_depth_geometry.py`, checking source-camera finite differences, forward bits and captured derivatives.
+
 ## Diagnostics
 
 Every forward and backward adds its counts (worlds at the solver's iteration limit, tape flags, rows with non-finite
