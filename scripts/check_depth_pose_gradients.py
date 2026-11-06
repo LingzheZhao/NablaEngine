@@ -187,12 +187,9 @@ def check_generated_cuda(device):
     return [near, miss, bits, far]+pose_rows, compare_graphs(geometry, (positions, quaternions, origins, directions))
 
 
-def check_source(args):
+def check_source(args, model, geometry):
     import mujoco
     import torch
-    from nablaengine.depth_geometry import DepthGeometry
-
-    model = mujoco.MjModel.from_binary_path(str(args.model))
     data = mujoco.MjData(model)
     states, rays = np.load(args.states, allow_pickle=False), np.load(args.rays, allow_pickle=False)
     qpos, qvel = states['qpos'], states['qvel']
@@ -216,10 +213,9 @@ def check_source(args):
     tensor = lambda value: torch.tensor(np.asarray(value), device=args.device, dtype=torch.float32)
     inputs = [tensor(value).requires_grad_() for value in
               (positions, quaternions, rays['origins'], rays['directions'])]
-    geometry = DepthGeometry.from_model(model, device=args.device)
     plain, plain_ids = geometry.raycast(*inputs)
     actual, ids = geometry.raycast_with_pose_gradients(*inputs)
-    packed, triangle_ids = geometry.cuda_backend.pose_hits(*inputs, plain, plain_ids)
+    _, _, packed, triangle_ids = geometry.cuda_backend.raycast_with_hits(*inputs)
     # Compute barycentric margin on the selected triangle to choose samples
     # before finite differences. Edge/surface switches remain separately visible.
     owner = geometry.cuda_backend
@@ -299,12 +295,61 @@ def check_source(args):
         smooth_self_samples=sum(r.get('condition') == 'same_face' and r['category'] == 'self' for r in rows))
 
 
+
+def check_failure_packet(args, geometry):
+    """Replay the recorded failed secondary query with primary face selection."""
+    import torch
+    from diagnose_depth_surface_selection import inverse_rotate
+
+    packet = np.load(args.packet, allow_pickle=False)
+    native = geometry.cuda_backend
+    for name in ('geometry', 'poses', 'sizes', 'bounds', 'nodes', 'triangles'):
+        if not np.array_equal(getattr(native, name).cpu().numpy(), packet[name]):
+            raise ValueError(f'Failure packet {name} differs from the loaded model packing')
+    inputs = [torch.tensor(packet[name], device=args.device).requires_grad_() for name in
+              ('body_positions', 'body_quaternions', 'origins', 'directions')]
+    ranges, ids = geometry.raycast_with_pose_gradients(*inputs)
+    primary = native.raycast_with_hits(*inputs)
+    hit = ids >= 0
+    gradients = torch.autograd.grad(torch.where(hit, ranges, 0.).sum(), inputs)
+    rows = []
+    for world, pixel in packet['invalid_indices']:
+        g = int(primary[2][world, pixel]); face = int(primary[3][world, pixel])
+        body = int(packet['geometry'][g, 0]); pose = packet['poses'][g].astype(float)
+        q = packet['body_quaternions'][world, body].astype(float)
+        bp = packet['body_positions'][world, body].astype(float)
+        origin = packet['origins'][world, pixel].astype(float)
+        direction = packet['directions'][world, pixel].astype(float)
+        triangle = packet['triangles'][face].astype(float)
+        normal = np.cross(triangle[1]-triangle[0], triangle[2]-triangle[0])
+        local_origin = inverse_rotate(pose[3:], inverse_rotate(q, origin-bp)-pose[:3])
+        local_direction = inverse_rotate(pose[3:], inverse_rotate(q, direction))
+        denominator = normal@local_direction
+        distance = (normal@(triangle[0]-local_origin))/denominator
+        world_normal = matrix(q)@matrix(pose[3:])@normal
+        expected_origin, expected_direction = -world_normal/denominator, -distance*world_normal/denominator
+        origin_gradient = gradients[2][world, pixel].cpu().numpy()
+        direction_gradient = gradients[3][world, pixel].cpu().numpy()
+        close = all(np.allclose(a, b, atol=PROTOCOL['gpu_atol'], rtol=PROTOCOL['gpu_rtol'])
+                    for a, b in ((origin_gradient, expected_origin), (direction_gradient, expected_direction)))
+        rows.append(dict(world=int(world), pixel=int(pixel), primary_triangle_id=face,
+            max_origin_gradient_error=float(np.max(np.abs(origin_gradient-expected_origin))),
+            max_direction_gradient_error=float(np.max(np.abs(direction_gradient-expected_direction))),
+            passed=bool(close)))
+    return dict(previously_unrecovered_rays=len(rows),
+        ranges_bitwise=bool(np.array_equal(ranges.detach().cpu().numpy().view(np.uint32), packet['legacy_ranges'].view(np.uint32))),
+        geom_ids_equal=bool(np.array_equal(ids.cpu().numpy(), packet['legacy_geom_ids'])),
+        primary_triangle_ids_equal=bool(np.array_equal(primary[3].cpu().numpy(), packet['primary_triangle_ids'])),
+        finite_gradients=all(bool(torch.isfinite(g).all()) for g in gradients), comparisons=rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cpu-math-only', action='store_true')
     parser.add_argument('--model', type=Path)
     parser.add_argument('--states', type=Path, help='current single-motion reference shard')
     parser.add_argument('--rays', type=Path, help='rays.npz produced by check_depth_geometry.py for this model/states')
+    parser.add_argument('--packet', type=Path, help='packet.npz from diagnose_depth_surface_selection.py')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--code-revision', required=True)
     parser.add_argument('--out', type=Path, required=True)
@@ -313,12 +358,18 @@ def main():
         parser.error('CUDA checks require --model, --states and --rays')
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out/'protocol.json').write_text(json.dumps(dict(PROTOCOL, code_revision=args.code_revision,
-        model=str(args.model), states=str(args.states), rays=str(args.rays)), indent=2)+'\n')
+        model=str(args.model), states=str(args.states), rays=str(args.rays), packet=str(args.packet)), indent=2)+'\n')
     result = dict(math=generated_math('cpu' if args.cpu_math_only else args.device))
     if not args.cpu_math_only:
         import torch
         result['generated_cuda'], result['graphs'] = check_generated_cuda(args.device)
-        result['source'] = check_source(args)
+        import mujoco
+        from nablaengine.depth_geometry import DepthGeometry
+        model = mujoco.MjModel.from_binary_path(str(args.model))
+        geometry = DepthGeometry.from_model(model, device=args.device)
+        result['source'] = check_source(args, model, geometry)
+        if args.packet is not None:
+            result['failure_packet'] = check_failure_packet(args, geometry)
         result['gpu'] = torch.cuda.get_device_name(args.device)
     passed = all(row['passed'] for row in result['math'])
     if not args.cpu_math_only:
@@ -328,6 +379,11 @@ def main():
             and source['smooth_terrain_samples'] > 0 and source['smooth_self_samples'] > 0
             and source['independent_geom_ids_equal'] and source['independent_max_range_error'] <= 2e-4
             and all(row.get('passed') is not False for row in source['rows']))
+    if 'failure_packet' in result:
+        packet = result['failure_packet']
+        passed = (passed and packet['ranges_bitwise'] and packet['geom_ids_equal']
+            and packet['primary_triangle_ids_equal'] and packet['finite_gradients']
+            and all(row['passed'] for row in packet['comparisons']))
     result['passed'] = bool(passed)
     (args.out/'report.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result, indent=2), flush=True)

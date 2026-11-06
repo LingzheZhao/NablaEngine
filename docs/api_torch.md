@@ -122,21 +122,23 @@ when observation derivatives are required. This opt-in method requires the nativ
 mesh/plane geometry. The default `raycast` method keeps its stop-gradient behavior. Geometry construction and
 its GPU triangle storage are shared by both methods.
 
-The forward ranges and model geom IDs come from the existing range kernel. A no-gradient query recovers the
-accepted triangle in that selected geom. Torch then differentiates its plane intersection against the original
-world ray, including surfaces reached after near-hit skipping. Camera ray origins/directions and dynamic body
-positions/WXYZ quaternions receive gradients. World body zero and packed model geometry stay fixed. Physical
+The primary traversal records the accepted triangle alongside its range and model geom ID, including the
+surface reached after near-hit skipping. Range arithmetic and candidate order match the original no-gradient
+kernel. Torch differentiates that recorded plane against the original world ray. Camera ray origins/directions
+and dynamic body positions/WXYZ quaternions receive gradients. World body zero and packed model geometry stay fixed. Physical
 quaternion and unit-ray perturbations use their normalized tangents.
 
 Misses and ranges beyond `max_distance` have zero derivatives. Clipped optical-depth derivatives follow the
 consumer's clamp. At face/near/far switches the selected plane supplies a one-sided derivative. The derivative
-at a zero or forward-degenerate plane denominator is defined as zero. An accepted hit whose surface cannot be
-recovered raises an asynchronous device assertion. The method preserves fixed-shape Torch composition for
-full-graph compilation and CUDA Graph capture. CUDA surface-query libraries use ABI version 2.
+at a zero or forward-degenerate plane denominator is defined as zero. An accepted hit without a recorded
+surface raises an asynchronous device assertion. The method preserves fixed-shape Torch composition for
+full-graph compilation and CUDA Graph capture. CUDA surface-query libraries use ABI version 3.
 
 `scripts/check_depth_pose_gradients.py --cpu-math-only` checks the runtime plane formula with generated
 independent geometry. Its CUDA mode additionally consumes a model, matching states and `rays.npz` written by
 `check_depth_geometry.py`, checking source-camera finite differences, forward bits and captured derivatives.
+Add `--packet` to replay a packet from `diagnose_depth_surface_selection.py` and compare the recorded failing rays against primary
+face selection without changing the original ray ranges.
 
 ## Diagnostics
 

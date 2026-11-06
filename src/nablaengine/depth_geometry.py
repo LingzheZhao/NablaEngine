@@ -161,6 +161,13 @@ class DepthGeometry:
             native = None
         return cls(tuple(geoms), int(model.nbody), native)
 
+    def _validate_shapes(self, body_positions, body_quaternions, ray_origins, ray_directions):
+        if (body_positions.shape[1:] != (self.body_count, 3)
+                or body_quaternions.shape != (*body_positions.shape[:2], 4)
+                or ray_origins.shape != ray_directions.shape or ray_origins.ndim != 3
+                or ray_origins.shape[-1] != 3 or ray_origins.shape[0] != body_positions.shape[0]):
+            raise ValueError('Body poses and rays require matching batch and model dimensions')
+
     @torch.no_grad()
     def raycast(self, body_positions, body_quaternions, ray_origins, ray_directions,
                 *, max_distance=1e6, min_distance=.05, max_hops=24,
@@ -171,11 +178,7 @@ class DepthGeometry:
         Hits closer than min_distance are skipped by advancing the ray beyond
         that surface and continuing, retaining source camera near-hit behavior.
         """
-        if (body_positions.shape[1:] != (self.body_count, 3)
-                or body_quaternions.shape != (*body_positions.shape[:2], 4)
-                or ray_origins.shape != ray_directions.shape or ray_origins.ndim != 3
-                or ray_origins.shape[-1] != 3 or ray_origins.shape[0] != body_positions.shape[0]):
-            raise ValueError('Body poses and rays require matching batch and model dimensions')
+        self._validate_shapes(body_positions, body_quaternions, ray_origins, ray_directions)
         if self.cuda_backend is not None:
             return self.cuda_backend.raycast(body_positions, body_quaternions, ray_origins, ray_directions,
                 max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
@@ -226,17 +229,17 @@ class DepthGeometry:
         native = self.cuda_backend
         if native is None or not self.geoms or not native.pose_gradients_supported:
             raise ValueError('Depth pose gradients require native CUDA mesh/plane geometry')
-        ranges, geom_ids = self.raycast(body_positions, body_quaternions, ray_origins, ray_directions,
+        self._validate_shapes(body_positions, body_quaternions, ray_origins, ray_directions)
+        ranges, geom_ids, packed_ids, triangle_ids = native.raycast_with_hits(
+            body_positions, body_quaternions, ray_origins, ray_directions,
             max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
             surface_epsilon=surface_epsilon)
-        packed_ids, triangle_ids = native.pose_hits(body_positions, body_quaternions,
-            ray_origins, ray_directions, ranges, geom_ids)
         geom = packed_ids.clamp_min(0)
         info, poses = native.geometry[geom], native.poses[geom]
         plane = info[..., 1] == 0
         hit = geom_ids >= 0
         recognized = (packed_ids >= 0) & (plane | (triangle_ids >= 0))
-        torch._assert_async((~hit | recognized).all(), 'Accepted depth hit has no recoverable surface')
+        torch._assert_async((~hit | recognized).all(), 'Accepted depth hit has no recorded primary surface')
         body = info[..., 0].long()
         batch = torch.arange(body_positions.shape[0], device=body.device)[:, None]
         position, quaternion = body_positions[batch, body], body_quaternions[batch, body]

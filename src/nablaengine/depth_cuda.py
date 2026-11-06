@@ -139,9 +139,8 @@ extern "C" int depth_rays(int batch,int ray_count,int geom_count,int body_count,
 '''
 
 
-# The original range kernel above remains the sole forward-value producer. This
-# query recovers the accepted surface on that already selected geom, including
-# an exit surface reached after skipping nearer intersections.
+# Secondary recovery is retained for diagnosing its numerical difference from
+# the primary accepted-hop triangle. Pose gradients use primary face recording.
 POSE_SOURCE = r'''
 #define DEPTH_POSE_ABI_VERSION 2
 extern "C" int depth_pose_abi_version(){return DEPTH_POSE_ABI_VERSION;}
@@ -344,6 +343,20 @@ class CudaDepthGeometry:
             return origins.new_empty(origins.shape[:-1]), origins.new_empty(origins.shape[:-1], dtype=torch.long)
 
         self.operation = operation
+        @torch.library.custom_op(f'nablaengine::depth_rays_surface_{next(_OPERATOR_IDS)}', mutates_args=())
+        def primary_operation(bp: torch.Tensor, bq: torch.Tensor, origins: torch.Tensor,
+                              directions: torch.Tensor, maximum: float, minimum: float,
+                              hops: int, epsilon: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            return self._primary_raycast_impl(bp, bq, origins, directions, max_distance=maximum,
+                min_distance=minimum, max_hops=hops, surface_epsilon=epsilon)
+
+        @primary_operation.register_fake
+        def primary_fake(bp, bq, origins, directions, maximum, minimum, hops, epsilon):
+            shape = origins.shape[:-1]
+            return (origins.new_empty(shape), origins.new_empty(shape, dtype=torch.long),
+                    origins.new_empty(shape, dtype=torch.long), origins.new_empty(shape, dtype=torch.long))
+
+        self.primary_operation = primary_operation
         @torch.library.custom_op(f'nablaengine::depth_pose_hits_{next(_OPERATOR_IDS)}', mutates_args=())
         def pose_operation(bp: torch.Tensor, bq: torch.Tensor, origins: torch.Tensor,
                            directions: torch.Tensor, ranges: torch.Tensor,
@@ -357,9 +370,26 @@ class CudaDepthGeometry:
         self.pose_operation = pose_operation
 
     @torch.no_grad()
+    def raycast_with_hits(self, body_positions, body_quaternions, origins, directions,
+                          *, max_distance=1e6, min_distance=.05, max_hops=24, surface_epsilon=1e-5):
+        """Record the triangle selected by the primary accepted-hop traversal."""
+        if torch.compiler.is_compiling():
+            return self.primary_operation(body_positions, body_quaternions, origins, directions,
+                                          max_distance, min_distance, max_hops, surface_epsilon)
+        return self._primary_raycast_impl(body_positions, body_quaternions, origins, directions,
+            max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+            surface_epsilon=surface_epsilon)
+
+    @torch.no_grad()
     def trace_primary_hits(self, body_positions, body_quaternions, origins, directions,
                            *, max_distance=1e6, min_distance=.05, max_hops=24, surface_epsilon=1e-5):
         """Eager diagnostic of primary face IDs and accepted-hop coordinates."""
+        return self._primary_raycast_impl(body_positions, body_quaternions, origins, directions,
+            max_distance=max_distance, min_distance=min_distance, max_hops=max_hops,
+            surface_epsilon=surface_epsilon, collect_trace=True)
+
+    def _primary_raycast_impl(self, body_positions, body_quaternions, origins, directions,
+                              *, max_distance, min_distance, max_hops, surface_epsilon, collect_trace=False):
         inputs = [body_positions, body_quaternions, origins, directions]
         if any(value.dtype != torch.float32 or value.device != self.device for value in inputs):
             raise ValueError('CUDA depth rays and body poses require float32 on the packed device')
@@ -367,19 +397,19 @@ class CudaDepthGeometry:
         ranges = torch.empty(origins.shape[:-1], device=self.device, dtype=torch.float32)
         ids = torch.empty_like(ranges, dtype=torch.long)
         packed_ids, triangle_ids = torch.empty_like(ids), torch.empty_like(ids)
-        trace = torch.empty((*ranges.shape, 5), device=self.device, dtype=torch.float32)
+        trace = torch.empty((*ranges.shape, 5), device=self.device, dtype=torch.float32) if collect_trace else None
         arrays = [self.geometry, self.poses, self.sizes, self.bounds, self.nodes, self.triangles,
                   bp, bq, origin, direction]
-        outputs = [ranges, ids, packed_ids, triangle_ids, trace]
+        outputs = [ranges, ids, packed_ids, triangle_ids]
         with torch.cuda.device(self.device):
             stream = torch.cuda.current_stream(self.device)
             error = self.primary_launch(origins.shape[0], origins.shape[1], len(self.geometry), self.body_count,
                 *[ctypes.c_void_p(value.data_ptr()) for value in arrays], max_distance, min_distance,
                 max_hops, surface_epsilon, *[ctypes.c_void_p(value.data_ptr()) for value in outputs],
-                ctypes.c_void_p(stream.cuda_stream))
+                ctypes.c_void_p(trace.data_ptr()) if trace is not None else None, ctypes.c_void_p(stream.cuda_stream))
         if error:
             raise RuntimeError(f'CUDA primary depth surface query failed with error {error}')
-        return tuple(outputs)
+        return (*outputs, trace) if collect_trace else tuple(outputs)
 
     @torch.no_grad()
     def pose_hits(self, body_positions, body_quaternions, origins, directions, ranges, geom_ids):
