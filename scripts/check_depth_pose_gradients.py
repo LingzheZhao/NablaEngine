@@ -303,9 +303,34 @@ def check_failure_packet(args, geometry):
 
     packet = np.load(args.packet, allow_pickle=False)
     native = geometry.cuda_backend
-    for name in ('geometry', 'poses', 'sizes', 'bounds', 'nodes', 'triangles'):
-        if not np.array_equal(getattr(native, name).cpu().numpy(), packet[name]):
-            raise ValueError(f'Failure packet {name} differs from the loaded model packing')
+    current = {name: getattr(native, name).cpu().numpy() for name in
+               ('geometry', 'poses', 'sizes', 'bounds', 'nodes', 'triangles')}
+    packing_rows = []
+    for name, array in current.items():
+        recorded = packet[name]
+        same_shape = array.shape == recorded.shape
+        equal = np.array_equal(array, recorded)
+        row = dict(array=name, equal=equal, current_shape=list(array.shape),
+            recorded_shape=list(recorded.shape), current_dtype=str(array.dtype),
+            recorded_dtype=str(recorded.dtype), current_nonfinite=int((~np.isfinite(array)).sum()),
+            recorded_nonfinite=int((~np.isfinite(recorded)).sum()))
+        if same_shape:
+            different = np.argwhere(array != recorded)
+            row['different_elements'] = len(different)
+            row['max_absolute_difference'] = float(np.max(np.abs(array.astype(float)-recorded.astype(float)), initial=0.))
+            row['first_differences'] = [dict(index=index.tolist(), current=array[tuple(index)].item(),
+                recorded=recorded[tuple(index)].item()) for index in different[:12]]
+            if array.dtype == np.float32 and recorded.dtype == np.float32:
+                row['different_float32_bits'] = int((array.view(np.uint32) != recorded.view(np.uint32)).sum())
+                for index, entry in zip(different[:12], row['first_differences']):
+                    entry['current_bits'] = int(array.view(np.uint32)[tuple(index)])
+                    entry['recorded_bits'] = int(recorded.view(np.uint32)[tuple(index)])
+        packing_rows.append(row)
+    (args.out/'packing_comparison.json').write_text(json.dumps(packing_rows, indent=2)+'\n')
+    mismatches = [row['array'] for row in packing_rows if not row['equal']]
+    if mismatches:
+        np.savez_compressed(args.out/'current_packing.npz', **current)
+        raise ValueError(f'Failure packet packing differs in {mismatches}. See packing_comparison.json and current_packing.npz')
     inputs = [torch.tensor(packet[name], device=args.device).requires_grad_() for name in
               ('body_positions', 'body_quaternions', 'origins', 'directions')]
     ranges, ids = geometry.raycast_with_pose_gradients(*inputs)
@@ -369,7 +394,12 @@ def main():
         geometry = DepthGeometry.from_model(model, device=args.device)
         result['source'] = check_source(args, model, geometry)
         if args.packet is not None:
-            result['failure_packet'] = check_failure_packet(args, geometry)
+            try:
+                result['failure_packet'] = check_failure_packet(args, geometry)
+            except Exception as error:
+                result.update(passed=False, failure_stage='failure_packet', error=repr(error))
+                (args.out/'report.json').write_text(json.dumps(result, indent=2)+'\n')
+                raise
         result['gpu'] = torch.cuda.get_device_name(args.device)
     passed = all(row['passed'] for row in result['math'])
     if not args.cpu_math_only:
