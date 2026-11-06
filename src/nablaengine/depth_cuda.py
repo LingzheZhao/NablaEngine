@@ -198,6 +198,48 @@ extern "C" int depth_pose_hits_v2(int batch,int ray_count,int body_count,const i
 '''
 
 
+
+def _primary_surface_source():
+    """Instrument the same traversal with the face selected at the accepted hop.
+
+    Range arithmetic and fminf reduction remain in their original order. The
+    additional integer witness follows each strictly improving candidate.
+    """
+    source = SOURCE[SOURCE.index('__device__ float first_hit'):]
+    source = source.replace('first_hit(', 'first_hit_surface(')
+    source = source.replace('void rays(', 'void rays_surface(').replace('rays<<<', 'rays_surface<<<')
+    source = source.replace('int depth_rays(', 'int depth_rays_surface_v3(')
+    source = source.replace('int&geom_id)', 'int&geom_id,int&packed_id,int&triangle_id)')
+    source = source.replace('float best=INFINITY;geom_id=-1;',
+                            'float best=INFINITY;geom_id=-1;packed_id=-1;triangle_id=-1;')
+    source = source.replace('const float*size=sizes+3*g;float distance=INFINITY;',
+                            'const float*size=sizes+3*g;float distance=INFINITY;int face=-1;')
+    source = source.replace('distance=fminf(distance,triangle_hit(triangles+9*(entry[0]+i),o,d));',
+        '{float candidate=triangle_hit(triangles+9*(entry[0]+i),o,d);'
+        'if(candidate<distance)face=entry[0]+i;distance=fminf(distance,candidate);}')
+    source = source.replace('best=distance;geom_id=info[4];',
+                            'best=distance;geom_id=info[4];packed_id=g;triangle_id=face;')
+    source = source.replace('float*distances,long long*ids',
+        'float*distances,long long*ids,long long*packed_ids,long long*triangle_ids,float*surface_trace')
+    source = source.replace('int id=-1;', 'int id=-1,packed=-1,triangle=-1,accepted_hop=-1;')
+    source = source.replace('int hit_id;float hit=first_hit_surface(',
+                            'int hit_id,hit_packed,hit_triangle;float hit=first_hit_surface(')
+    source = source.replace('origin,direction,hit_id);', 'origin,direction,hit_id,hit_packed,hit_triangle);')
+    source = source.replace('result=hit+traveled;id=hit_id;break;',
+        'result=hit+traveled;id=hit_id;packed=hit_packed;triangle=hit_triangle;accepted_hop=hop;break;')
+    source = source.replace('distances[ray]=result;ids[ray]=id;',
+        'distances[ray]=result;ids[ray]=id;packed_ids[ray]=packed;triangle_ids[ray]=triangle;'
+        'if(surface_trace){surface_trace[5*ray]=origin.x;surface_trace[5*ray+1]=origin.y;'
+        'surface_trace[5*ray+2]=origin.z;surface_trace[5*ray+3]=traveled;'
+        'surface_trace[5*ray+4]=float(accepted_hop);}')
+    source = source.replace('epsilon,distances,ids);',
+                            'epsilon,distances,ids,packed_ids,triangle_ids,surface_trace);')
+    return 'extern "C" int depth_surface_abi_version(){return 3;}\n'+source
+
+
+PRIMARY_SOURCE = _primary_surface_source()
+
+
 def _mesh_bvh(triangles, bounds, nodes, ordered):
     """Preorder tree with subtree escape links, leaves contain at most 8 faces."""
     first_node = len(nodes)
@@ -258,16 +300,16 @@ class CudaDepthGeometry:
             Path(parent).mkdir(parents=True, exist_ok=True)
         self.build_directory = Path(tempfile.mkdtemp(prefix='depth-rays-', dir=parent))
         source = self.build_directory/'depth.cu'
-        source.write_text(SOURCE+POSE_SOURCE)
+        source.write_text(SOURCE+POSE_SOURCE+PRIMARY_SOURCE)
         capability = torch.cuda.get_device_capability(device)
         command = [nvcc(), '-std=c++17', '-O3', '-shared', '-Xcompiler=-fPIC',
                    f'-arch=sm_{capability[0]}{capability[1]}', str(source),
-                   '-o', str(self.build_directory/'depth_v2.so')]
+                   '-o', str(self.build_directory/'depth_v3.so')]
         result = subprocess.run(command, capture_output=True, text=True)
         (self.build_directory/'build.log').write_text(result.stdout+result.stderr)
         if result.returncode:
             raise RuntimeError(f'Depth CUDA build failed, see {self.build_directory / "build.log"}')
-        self.library = ctypes.CDLL(str(self.build_directory/'depth_v2.so'))
+        self.library = ctypes.CDLL(str(self.build_directory/'depth_v3.so'))
         self.launch = self.library.depth_rays
         self.launch.restype = ctypes.c_int
         self.launch.argtypes = ([ctypes.c_int]*4+[ctypes.c_void_p]*10+
@@ -279,6 +321,14 @@ class CudaDepthGeometry:
         self.pose_launch = self.library.depth_pose_hits_v2
         self.pose_launch.restype = ctypes.c_int
         self.pose_launch.argtypes = [ctypes.c_int]*3+[ctypes.c_void_p]*15
+        primary_version = self.library.depth_surface_abi_version
+        primary_version.restype = ctypes.c_int
+        if primary_version() != 3:
+            raise RuntimeError('Depth primary-surface ABI version 3 required')
+        self.primary_launch = self.library.depth_rays_surface_v3
+        self.primary_launch.restype = ctypes.c_int
+        self.primary_launch.argtypes = ([ctypes.c_int]*4+[ctypes.c_void_p]*10+
+            [ctypes.c_float]*2+[ctypes.c_int, ctypes.c_float]+[ctypes.c_void_p]*6)
         # Register outside a compile trace. The closure owns this fixed model's
         # library and packed arrays, with no mutable global model registry.
         name = f'nablaengine::depth_rays_{next(_OPERATOR_IDS)}'
@@ -305,6 +355,31 @@ class CudaDepthGeometry:
             return torch.empty_like(geom_ids), torch.empty_like(geom_ids)
 
         self.pose_operation = pose_operation
+
+    @torch.no_grad()
+    def trace_primary_hits(self, body_positions, body_quaternions, origins, directions,
+                           *, max_distance=1e6, min_distance=.05, max_hops=24, surface_epsilon=1e-5):
+        """Eager diagnostic of primary face IDs and accepted-hop coordinates."""
+        inputs = [body_positions, body_quaternions, origins, directions]
+        if any(value.dtype != torch.float32 or value.device != self.device for value in inputs):
+            raise ValueError('CUDA depth rays and body poses require float32 on the packed device')
+        bp, bq, origin, direction = [value.contiguous() for value in inputs]
+        ranges = torch.empty(origins.shape[:-1], device=self.device, dtype=torch.float32)
+        ids = torch.empty_like(ranges, dtype=torch.long)
+        packed_ids, triangle_ids = torch.empty_like(ids), torch.empty_like(ids)
+        trace = torch.empty((*ranges.shape, 5), device=self.device, dtype=torch.float32)
+        arrays = [self.geometry, self.poses, self.sizes, self.bounds, self.nodes, self.triangles,
+                  bp, bq, origin, direction]
+        outputs = [ranges, ids, packed_ids, triangle_ids, trace]
+        with torch.cuda.device(self.device):
+            stream = torch.cuda.current_stream(self.device)
+            error = self.primary_launch(origins.shape[0], origins.shape[1], len(self.geometry), self.body_count,
+                *[ctypes.c_void_p(value.data_ptr()) for value in arrays], max_distance, min_distance,
+                max_hops, surface_epsilon, *[ctypes.c_void_p(value.data_ptr()) for value in outputs],
+                ctypes.c_void_p(stream.cuda_stream))
+        if error:
+            raise RuntimeError(f'CUDA primary depth surface query failed with error {error}')
+        return tuple(outputs)
 
     @torch.no_grad()
     def pose_hits(self, body_positions, body_quaternions, origins, directions, ranges, geom_ids):
